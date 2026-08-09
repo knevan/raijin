@@ -1,0 +1,17 @@
+[unstable]
+profile-rustflags = true
+
+[profile.test]
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.dev]
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.deployment]
+rustflags = [
+    "-C", "target-cpu=native",
+    #"-C", "target-feature=+crt-static"
+]
+
+[build]
+incremental = true

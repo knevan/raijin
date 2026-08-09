@@ -1,0 +1,11 @@
+[settings]
+auto_install = false
+
+[tasks.hot]
+description = "Run with hot reload"
+dir = "."
+run = "dx serve --features dev"
+
+[tasks.dev]
+dir = "."
+run = "cargo run --features dev"

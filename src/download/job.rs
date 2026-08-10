@@ -1,6 +1,6 @@
 use std::io::SeekFrom;
 use std::num::NonZeroU16;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::StatusCode;
@@ -15,7 +15,7 @@ use crate::db::{DbError, DownloadRepository, PartRepository};
 use crate::download::{
     Bytes, DownloadFailure, DownloadItem, DownloadPart, DownloadStatus, FailureKind, PartId,
     PartStatus, ProbeRequest, ReqwestHttpClient, ResumeSupport, ResumeValidation, probe_http,
-    split_fixed_ranges, validate_resume_metadata,
+    split_fixed_ranges_with_min_part_size, validate_resume_metadata,
 };
 
 const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
@@ -72,6 +72,9 @@ pub enum HttpDownloadJobError {
     /// Ranged worker received invalid content range.
     #[error("part `{index}` received invalid content range `{actual}`")]
     InvalidPartContentRange { index: u32, actual: String },
+    /// Destination file already exists and could not be disambiguated.
+    #[error("destination file conflict for `{0}`")]
+    DestinationConflict(String),
 }
 
 impl HttpDownloadJobError {
@@ -81,6 +84,18 @@ impl HttpDownloadJobError {
         DownloadFailure {
             kind: failure_kind(self),
             message: self.to_string(),
+        }
+    }
+
+    /// Returns true when the error should pause for manual validation/recovery instead of retrying.
+    #[must_use]
+    pub fn requires_manual_action(&self) -> bool {
+        match self {
+            Self::Probe(error) => probe_error_requires_manual_action(error),
+            Self::ResumeUnsupported | Self::RangeIgnored | Self::InvalidPartContentRange { .. } => {
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -100,14 +115,17 @@ struct HttpDownloadJobConfig {
     incomplete_extension: String,
     progress_interval: Duration,
     max_retries: u32,
+    min_part_size: Bytes,
 }
 
 impl Default for HttpDownloadJobConfig {
     fn default() -> Self {
+        let download_config = crate::download::DownloadConfig::default();
         Self {
-            incomplete_extension: crate::download::DownloadConfig::default().incomplete_extension,
+            incomplete_extension: download_config.incomplete_extension,
             progress_interval: DEFAULT_PROGRESS_INTERVAL,
-            max_retries: crate::download::DownloadConfig::default().max_retries.get(),
+            max_retries: download_config.max_retries.get(),
+            min_part_size: download_config.min_part_size,
         }
     }
 }
@@ -146,6 +164,10 @@ impl HttpDownloadJob {
                 self.persist_paused().await?;
                 Ok(self.item)
             }
+            Err(error) if error.requires_manual_action() => {
+                self.persist_paused_with_failure(&error).await?;
+                Ok(self.item)
+            }
             Err(error) => {
                 self.persist_error(&error).await?;
                 Err(error)
@@ -157,9 +179,12 @@ impl HttpDownloadJob {
         &mut self,
         cancellation: &CancellationToken,
     ) -> HttpDownloadJobResult<DownloadItem> {
-        let final_path = self.final_path();
+        let mut final_path = self.final_path();
         let incomplete_path = self.incomplete_path();
         fs::create_dir_all(&self.item.folder).await?;
+        if existing_len(&incomplete_path).await? == 0 {
+            final_path = self.reserve_unique_destination(&final_path).await?;
+        }
 
         let resume_from = existing_len(&incomplete_path).await?;
         let metadata = self.probe(resume_from).await?;
@@ -243,7 +268,8 @@ impl HttpDownloadJob {
             ));
         }
 
-        fs::rename(&incomplete_path, &final_path).await?;
+        self.finalize_destination(&incomplete_path, &final_path)
+            .await?;
         self.persist_completed(&mut part, downloaded).await?;
         Ok(self.item.clone())
     }
@@ -261,7 +287,13 @@ impl HttpDownloadJob {
             .ok_or(HttpDownloadJobError::ResumeUnsupported)?;
         let mut parts = if existing_parts.is_empty() || existing_parts.len() == 1 {
             let desired_parts = self.preferred_connections().get();
-            split_fixed_ranges(self.item.id, Some(total), desired_parts, now_ms()?)?
+            split_fixed_ranges_with_min_part_size(
+                self.item.id,
+                Some(total),
+                desired_parts,
+                self.config.min_part_size,
+                now_ms()?,
+            )?
         } else {
             existing_parts
         };
@@ -321,7 +353,11 @@ impl HttpDownloadJob {
                     return Ok(self.item.clone());
                 }
                 PartWorkerOutcome::Failed(mut part, error) => {
-                    if part.retry_count < self.config.max_retries {
+                    if error.requires_manual_action() {
+                        first_error = Some(error);
+                        workers.abort_all();
+                        break;
+                    } else if part.retry_count < self.config.max_retries {
                         part.retry_count += 1;
                         part.status = PartStatus::Idle;
                         part.updated_at = now_ms()?;
@@ -356,7 +392,8 @@ impl HttpDownloadJob {
         file.sync_all().await?;
         drop(file);
         self.persist_preparing(total.get()).await?;
-        fs::rename(incomplete_path, final_path).await?;
+        self.finalize_destination(incomplete_path, final_path)
+            .await?;
         self.persist_ranged_completed(total.get()).await?;
         Ok(self.item.clone())
     }
@@ -493,6 +530,18 @@ impl HttpDownloadJob {
         Ok(())
     }
 
+    async fn persist_paused_with_failure(
+        &mut self,
+        error: &HttpDownloadJobError,
+    ) -> HttpDownloadJobResult<()> {
+        let now = now_ms()?;
+        self.item.status = DownloadStatus::Paused;
+        self.item.failure = Some(error.to_failure());
+        self.item.updated_at = now;
+        self.download_repo.update(&self.item).await?;
+        Ok(())
+    }
+
     async fn persist_completed(
         &mut self,
         part: &mut DownloadPart,
@@ -590,6 +639,61 @@ impl HttpDownloadJob {
         self.item.folder.join(&self.item.file_name)
     }
 
+    async fn reserve_unique_destination(
+        &mut self,
+        requested: &PathBuf,
+    ) -> HttpDownloadJobResult<PathBuf> {
+        let unique = unique_destination_path(requested, &self.config.incomplete_extension).await?;
+        if unique != *requested {
+            if let Some(file_name) = unique.file_name().and_then(|name| name.to_str()) {
+                self.item.file_name = file_name.to_owned();
+                self.item.updated_at = now_ms()?;
+                self.download_repo.update(&self.item).await?;
+            } else {
+                return Err(HttpDownloadJobError::DestinationConflict(
+                    unique.display().to_string(),
+                ));
+            }
+        }
+        Ok(unique)
+    }
+
+    async fn finalize_destination(
+        &mut self,
+        incomplete_path: &PathBuf,
+        final_path: &PathBuf,
+    ) -> HttpDownloadJobResult<()> {
+        let final_path = self.reserve_unique_final_destination(final_path).await?;
+        match fs::rename(incomplete_path, &final_path).await {
+            Ok(()) => Ok(()),
+            Err(error) if is_cross_device_error(&error) => {
+                fs::copy(incomplete_path, &final_path).await?;
+                fs::remove_file(incomplete_path).await?;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn reserve_unique_final_destination(
+        &mut self,
+        requested: &PathBuf,
+    ) -> HttpDownloadJobResult<PathBuf> {
+        let unique = unique_final_destination_path(requested).await?;
+        if unique != *requested {
+            if let Some(file_name) = unique.file_name().and_then(|name| name.to_str()) {
+                self.item.file_name = file_name.to_owned();
+                self.item.updated_at = now_ms()?;
+                self.download_repo.update(&self.item).await?;
+            } else {
+                return Err(HttpDownloadJobError::DestinationConflict(
+                    unique.display().to_string(),
+                ));
+            }
+        }
+        Ok(unique)
+    }
+
     fn incomplete_path(&self) -> PathBuf {
         self.item.folder.join(format!(
             "{}{}",
@@ -642,7 +746,111 @@ fn failure_kind(error: &HttpDownloadJobError) -> FailureKind {
         | HttpDownloadJobError::RangeSplit(_)
         | HttpDownloadJobError::WorkerJoin(_) => FailureKind::Disk,
         HttpDownloadJobError::InvalidPartContentRange { .. } => FailureKind::Validation,
+        HttpDownloadJobError::DestinationConflict(_) => FailureKind::Disk,
     }
+}
+
+fn probe_error_requires_manual_action(error: &crate::download::HttpProbeError) -> bool {
+    matches!(
+        error,
+        crate::download::HttpProbeError::ContentLengthChanged { .. }
+            | crate::download::HttpProbeError::EtagChanged { .. }
+            | crate::download::HttpProbeError::RangeSupportDisappeared
+            | crate::download::HttpProbeError::WebpageMismatch { .. }
+            | crate::download::HttpProbeError::ContentRangeMismatch { .. }
+            | crate::download::HttpProbeError::MissingContentRange
+            | crate::download::HttpProbeError::InvalidContentRange(_)
+    )
+}
+
+pub(crate) async fn unique_destination_path(
+    requested: &PathBuf,
+    incomplete_extension: &str,
+) -> HttpDownloadJobResult<PathBuf> {
+    if !path_exists(requested).await?
+        && !path_exists(&incomplete_path_for(requested, incomplete_extension)).await?
+    {
+        return Ok(requested.clone());
+    }
+
+    let parent = requested.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = requested
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            HttpDownloadJobError::DestinationConflict(requested.display().to_string())
+        })?;
+    let extension = requested.extension().and_then(|value| value.to_str());
+    for suffix in 1_u32..=9_999 {
+        let file_name = match extension {
+            Some(extension) => format!("{stem} ({suffix}).{extension}"),
+            None => format!("{stem} ({suffix})"),
+        };
+        let candidate = parent.join(file_name);
+        if !path_exists(&candidate).await?
+            && !path_exists(&incomplete_path_for(&candidate, incomplete_extension)).await?
+        {
+            return Ok(candidate);
+        }
+    }
+
+    Err(HttpDownloadJobError::DestinationConflict(
+        requested.display().to_string(),
+    ))
+}
+
+async fn unique_final_destination_path(requested: &PathBuf) -> HttpDownloadJobResult<PathBuf> {
+    if !path_exists(requested).await? {
+        return Ok(requested.clone());
+    }
+
+    let parent = requested.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = requested
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            HttpDownloadJobError::DestinationConflict(requested.display().to_string())
+        })?;
+    let extension = requested.extension().and_then(|value| value.to_str());
+    for suffix in 1_u32..=9_999 {
+        let file_name = match extension {
+            Some(extension) => format!("{stem} ({suffix}).{extension}"),
+            None => format!("{stem} ({suffix})"),
+        };
+        let candidate = parent.join(file_name);
+        if !path_exists(&candidate).await? {
+            return Ok(candidate);
+        }
+    }
+
+    Err(HttpDownloadJobError::DestinationConflict(
+        requested.display().to_string(),
+    ))
+}
+
+fn incomplete_path_for(path: &Path, incomplete_extension: &str) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| format!("{value}{incomplete_extension}"))
+        .unwrap_or_else(|| incomplete_extension.to_owned());
+    path.with_file_name(file_name)
+}
+
+async fn path_exists(path: &PathBuf) -> HttpDownloadJobResult<bool> {
+    match fs::metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_cross_device_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(18) | Some(17))
+        || error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("cross-device")
 }
 
 #[derive(Debug)]
@@ -711,9 +919,14 @@ async fn part_worker_inner(
         .await
         .map_err(|error| worker_failure(&request.part, error.into()))?;
     if response.status() != StatusCode::PARTIAL_CONTENT {
+        let error = if response.status() == StatusCode::OK {
+            HttpDownloadJobError::RangeIgnored
+        } else {
+            HttpDownloadJobError::UnexpectedStatus(response.status().as_u16())
+        };
         return Err(Box::new(PartWorkerFailure {
             part: request.part,
-            error: HttpDownloadJobError::UnexpectedStatus(response.status().as_u16()),
+            error,
         }));
     }
     validate_part_content_range(&request.part, response.headers())
@@ -846,7 +1059,7 @@ mod tests {
 
     use super::*;
     use crate::db;
-    use crate::download::DownloadKind;
+    use crate::download::{DownloadKind, split_fixed_ranges};
 
     struct TestDb {
         _dir: TempDir,
@@ -1148,7 +1361,10 @@ mod tests {
 
     #[tokio::test]
     async fn ranged_job_should_download_with_multiple_parts() -> HttpDownloadJobResult<()> {
-        let body = (0..=255).cycle().take(1024).collect::<Vec<u8>>();
+        let body = (0..=255)
+            .cycle()
+            .take(16 * 1024 * 1024)
+            .collect::<Vec<u8>>();
         let server = TestServer::spawn(body.clone(), true, false).await?;
         let db = test_db().await?;
         let folder = tempfile::tempdir()?;
@@ -1229,6 +1445,46 @@ mod tests {
 
         assert_eq!(paused.status, DownloadStatus::Paused);
         assert!(paused.failure.is_some());
+        let persisted_parts = db.part_repo.list_for_download(item.id).await?;
+        assert!(persisted_parts.iter().all(|part| part.retry_count == 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_should_choose_unique_final_name_when_destination_exists()
+    -> HttpDownloadJobResult<()> {
+        let body = vec![b'd'; 1024];
+        let server = TestServer::spawn(body.clone(), true, false).await?;
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        fs::write(folder.path().join("file.bin"), b"existing").await?;
+        let item = sample_item(server.url(), folder.path().to_path_buf(), 0);
+
+        let completed = run_job(&db, item, CancellationToken::new()).await?;
+        let final_bytes = fs::read(folder.path().join("file (1).bin")).await?;
+
+        assert_eq!(completed.file_name, "file (1).bin");
+        assert_eq!(final_bytes, body);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn job_should_pause_resume_validation_failures_for_manual_action()
+    -> HttpDownloadJobResult<()> {
+        let body = vec![b'n'; 1024];
+        let server = TestServer::spawn(body.clone(), false, false).await?;
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let item = sample_item(server.url(), folder.path().to_path_buf(), 512);
+        fs::write(folder.path().join("file.bin.raijin-part"), &body[..512]).await?;
+
+        let paused = run_job(&db, item, CancellationToken::new()).await?;
+
+        assert_eq!(paused.status, DownloadStatus::Paused);
+        assert_eq!(
+            paused.failure.as_ref().map(|failure| failure.kind),
+            Some(FailureKind::Validation)
+        );
         Ok(())
     }
 }

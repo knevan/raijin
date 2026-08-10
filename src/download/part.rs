@@ -29,7 +29,13 @@ pub fn split_fixed_ranges(
     desired_parts: u16,
     now_ms: i64,
 ) -> Result<Vec<DownloadPart>, RangeSplitError> {
-    split_fixed_ranges_with_min_part_size(download_id, total_bytes, desired_parts, Bytes::new(1), now_ms)
+    split_fixed_ranges_with_min_part_size(
+        download_id,
+        total_bytes,
+        desired_parts,
+        Bytes::new(1),
+        now_ms,
+    )
 }
 
 /// Splits a known total byte count into fixed inclusive ranges while respecting a minimum part size.

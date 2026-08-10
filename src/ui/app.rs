@@ -2,11 +2,13 @@ use freya::icons;
 use freya::prelude::*;
 
 use super::downloads_table::DownloadsTable;
+use super::services::AppServices;
 use super::sidebar::Sidebar;
 use super::theme;
 
-pub(crate) fn root() -> impl IntoElement {
+pub(crate) fn root(services: AppServices) -> impl IntoElement {
     use_init_theme(theme::raijin_theme);
+    use_provide_context(|| services);
 
     rect()
         .expanded()

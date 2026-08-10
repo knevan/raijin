@@ -309,6 +309,18 @@ impl QueueRepository {
         Ok(queue.id)
     }
 
+    /// Returns next non-reserved queue id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite fails to read existing queue ids.
+    pub async fn next_queue_id(&self) -> DbResult<QueueId> {
+        let max_id: Option<i64> = sqlx::query_scalar("SELECT MAX(id) FROM queues WHERE id > 0")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(QueueId::new(max_id.unwrap_or(0).saturating_add(1)))
+    }
+
     /// Inserts or updates a queue.
     ///
     /// # Errors
@@ -371,6 +383,22 @@ impl QueueRepository {
         rows.into_iter().map(queue_from_row).collect()
     }
 
+    /// Deletes one non-default queue. Queue items are removed by cascade.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite fails to execute the delete.
+    pub async fn delete_queue(&self, id: QueueId) -> DbResult<bool> {
+        let rows = sqlx::query("DELETE FROM queues WHERE id = ? AND id != ?")
+            .bind(id.get())
+            .bind(QueueId::MAIN.get())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+
+        Ok(rows > 0)
+    }
+
     /// Adds or updates one queue item.
     ///
     /// # Errors
@@ -421,6 +449,22 @@ impl QueueRepository {
         .await?;
 
         rows.into_iter().map(queue_item_from_row).collect()
+    }
+
+    /// Lists queues that contain one download.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when row decoding fails.
+    pub async fn queue_ids_for_download(&self, download_id: DownloadId) -> DbResult<Vec<QueueId>> {
+        let ids = sqlx::query_scalar(
+            "SELECT queue_id FROM queue_items WHERE download_id = ? ORDER BY queue_id",
+        )
+        .bind(download_id.get())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(ids.into_iter().map(QueueId::new).collect())
     }
 
     /// Removes one item from one queue.

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-freya = { git = "https://github.com/marc2332/freya.git", optional = true, rev = "e4d1b0df75db17206717fc697652c134fff59365", features = [
+freya = { git = "https://github.com/marc2332/freya.git", optional = true, branch = "main", features = [
     "sdk-tokio",
     "icons-lucide",
     "tray"

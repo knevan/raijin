@@ -1,7 +1,16 @@
 use freya::icons;
 use freya::prelude::*;
 
+use super::services::AppServices;
 use super::theme;
+use crate::download::QueueId;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueueSummary {
+    id: QueueId,
+    name: String,
+    item_count: usize,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IconKind {
@@ -80,7 +89,22 @@ struct QueuesCard;
 
 impl Component for QueuesCard {
     fn render(&self) -> impl IntoElement {
+        let services = use_consume::<AppServices>();
         let queues_expanded = use_state(|| true);
+        let summaries = use_state(Vec::<QueueSummary>::new);
+
+        use_hook(move || {
+            let services = services.clone();
+            spawn(async move {
+                refresh_queues(&services, summaries).await;
+                let mut events = services.queues.subscribe();
+                while events.recv().await.is_ok() {
+                    refresh_queues(&services, summaries).await;
+                }
+            });
+        });
+
+        let queues = summaries.read().clone();
 
         sidebar_card()
             .child(section_header(
@@ -89,8 +113,40 @@ impl Component for QueuesCard {
                 queues_expanded,
                 false,
             ))
-            .maybe(queues_expanded(), |el| el.child(queue_row()))
+            .maybe(queues_expanded(), |el| {
+                el.children(
+                    queues
+                        .into_iter()
+                        .map(|queue| queue_row(queue).into_element()),
+                )
+            })
     }
+}
+
+async fn refresh_queues(services: &AppServices, mut summaries: State<Vec<QueueSummary>>) {
+    let queues = match services.queues.list_queues().await {
+        Ok(queues) => queues,
+        Err(error) => {
+            tracing::warn!(?error, "queue list refresh failed");
+            return;
+        }
+    };
+    let mut next = Vec::with_capacity(queues.len());
+    for queue in queues {
+        let item_count = match services.queues.list_items(queue.id).await {
+            Ok(items) => items.len(),
+            Err(error) => {
+                tracing::warn!(queue_id = %queue.id, ?error, "queue item refresh failed");
+                0
+            }
+        };
+        next.push(QueueSummary {
+            id: queue.id,
+            name: queue.name,
+            item_count,
+        });
+    }
+    summaries.set_if_modified(next);
 }
 
 fn sidebar_card() -> Rect {
@@ -173,8 +229,9 @@ fn indent_row(title: &'static str, icon: IconKind) -> impl IntoElement {
         .child(label().text(title).font_size(14.).color(theme::TEXT_SUBTLE))
 }
 
-fn queue_row() -> impl IntoElement {
+fn queue_row(queue: QueueSummary) -> impl IntoElement {
     rect()
+        .key(queue.id.get())
         .height(Size::px(42.))
         .width(Size::fill())
         .horizontal()
@@ -184,12 +241,17 @@ fn queue_row() -> impl IntoElement {
         .child(icon_view(IconKind::Folder, theme::TEXT_SUBTLE, 17.))
         .child(
             label()
-                .text("Main")
+                .text(queue.name)
                 .font_size(14.)
                 .color(theme::TEXT_SUBTLE)
                 .width(Size::fill()),
         )
-        .child(label().text("0").font_size(13.).color(theme::TEXT_SUBTLE))
+        .child(
+            label()
+                .text(queue.item_count.to_string())
+                .font_size(13.)
+                .color(theme::TEXT_SUBTLE),
+        )
 }
 
 fn card_border() -> Border {

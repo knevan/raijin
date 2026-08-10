@@ -4,7 +4,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::download::DownloadEvent;
+use crate::download::{DownloadEvent, DownloadItem};
 use crate::monitor::{MonitorState, Projection};
 
 /// Result type returned by monitor APIs.
@@ -40,11 +40,28 @@ impl DownloadMonitorHandle {
         events: broadcast::Receiver<DownloadEvent>,
         speed_window_ms: Option<u64>,
     ) -> (Self, JoinHandle<DownloadMonitorResult<()>>) {
+        Self::spawn_with_downloads(events, speed_window_ms, Vec::new())
+    }
+
+    /// Spawns a monitor actor seeded with existing downloads.
+    #[must_use]
+    pub fn spawn_with_downloads(
+        events: broadcast::Receiver<DownloadEvent>,
+        speed_window_ms: Option<u64>,
+        downloads: Vec<DownloadItem>,
+    ) -> (Self, JoinHandle<DownloadMonitorResult<()>>) {
+        let mut projection = Projection::new(speed_window_ms);
+        if let Ok(now) = now_ms() {
+            for item in &downloads {
+                projection.apply_item(item, now);
+            }
+        }
         let (state_tx, state_rx) = watch::channel(MonitorState::default());
+        let _sent = state_tx.send(projection.state().clone());
         let monitor = DownloadMonitor {
             events,
             state: state_tx,
-            projection: Projection::new(speed_window_ms),
+            projection,
         };
         let task = tokio::spawn(monitor.run());
         (Self { state: state_rx }, task)
@@ -103,7 +120,9 @@ impl DownloadMonitor {
             | DownloadEvent::DownloadResumed { item } => self.projection.apply_item(&item, now),
             DownloadEvent::DownloadRemoved { id } => self.projection.remove(id),
             DownloadEvent::DownloadFailed { id, failure } => {
-                self.projection.apply_failure(id, failure, now);
+                let updated_at =
+                    i64::try_from(now).map_err(|_| DownloadMonitorError::ClockOutOfRange)?;
+                self.projection.apply_failure(id, failure, updated_at);
             }
             DownloadEvent::DownloadProgress { id, progress } => {
                 self.projection.apply_progress(id, progress, now);

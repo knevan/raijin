@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -9,9 +9,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{DbError, DownloadRepository, PartRepository};
+use crate::download::job::unique_destination_path;
 use crate::download::{
-    Bytes, BytesPerSecond, DownloadFailure, DownloadId, DownloadItem, DownloadKind,
-    DownloadProgress, DownloadStatus, HttpDownloadJob, ReqwestHttpClient,
+    Bytes, BytesPerSecond, DownloadFailure, DownloadId, DownloadItem, DownloadKind, DownloadPart,
+    DownloadProgress, DownloadStatus, HttpDownloadJob, PartStatus, ReqwestHttpClient,
 };
 
 const JOB_PROGRESS_TICK: Duration = Duration::from_millis(250);
@@ -416,14 +417,16 @@ impl DownloadManager {
 
     async fn add_download(&mut self, request: NewDownload) -> DownloadManagerResult<DownloadItem> {
         let now_ms = now_ms()?;
+        let folder = request.folder;
+        let file_name = unique_file_name(&folder, &request.file_name).await?;
         let item = DownloadItem {
             id: self.repository.next_id().await?,
             kind: DownloadKind::Http,
             url: request.url,
             download_page: request.download_page,
             headers: request.headers,
-            file_name: request.file_name,
-            folder: request.folder,
+            file_name,
+            folder,
             status: DownloadStatus::Added,
             total_bytes: None,
             downloaded_bytes: Bytes::ZERO,
@@ -588,31 +591,32 @@ async fn run_http_job_task_inner(
     let job_future = job.run(context.cancellation.clone());
     tokio::pin!(job_future);
     let mut ticker = tokio::time::interval(JOB_PROGRESS_TICK);
+    let mut last_progress = None;
     loop {
         tokio::select! {
             result = &mut job_future => return result,
-            _ = ticker.tick() => publish_progress_snapshot(context).await,
+            _ = ticker.tick() => publish_progress_snapshot(context, &mut last_progress).await,
         }
     }
 }
 
-async fn publish_progress_snapshot(context: &JobTaskContext) {
+async fn publish_progress_snapshot(
+    context: &JobTaskContext,
+    last_progress: &mut Option<DownloadProgress>,
+) {
     match context.download_repo.get(context.item.id).await {
         Ok(Some(item)) => {
-            publish_event(
-                &context.events,
-                DownloadEvent::DownloadProgress {
-                    id: item.id,
-                    progress: DownloadProgress {
-                        downloaded_bytes: item.downloaded_bytes,
-                        total_bytes: item.total_bytes,
-                        speed: BytesPerSecond::ZERO,
-                        eta_seconds: None,
-                        active_part_count: u16::from(item.status == DownloadStatus::Downloading),
+            let progress = progress_from_item(context, &item).await;
+            if last_progress.as_ref() != Some(&progress) {
+                *last_progress = Some(progress);
+                publish_event(
+                    &context.events,
+                    DownloadEvent::DownloadProgress {
+                        id: item.id,
+                        progress,
                     },
-                },
-            );
-            publish_event(&context.events, DownloadEvent::DownloadChanged { item });
+                );
+            }
         }
         Ok(None) => {}
         Err(error) => tracing::warn!(
@@ -621,6 +625,55 @@ async fn publish_progress_snapshot(context: &JobTaskContext) {
             "failed to publish download progress snapshot"
         ),
     }
+}
+
+async fn progress_from_item(context: &JobTaskContext, item: &DownloadItem) -> DownloadProgress {
+    let parts = match context.part_repo.list_for_download(item.id).await {
+        Ok(parts) => parts,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                download_id = item.id.get(),
+                "failed to load download parts for progress snapshot"
+            );
+            Vec::new()
+        }
+    };
+
+    let downloaded_bytes = if parts.is_empty() {
+        item.downloaded_bytes
+    } else {
+        Bytes::new(downloaded_from_parts(&parts))
+    };
+
+    DownloadProgress {
+        downloaded_bytes,
+        total_bytes: item.total_bytes,
+        speed: BytesPerSecond::ZERO,
+        eta_seconds: None,
+        active_part_count: active_part_count(&parts, item.status),
+    }
+}
+
+fn downloaded_from_parts(parts: &[DownloadPart]) -> u64 {
+    parts
+        .iter()
+        .map(|part| {
+            part.current_byte
+                .get()
+                .saturating_sub(part.start_byte.get())
+        })
+        .sum()
+}
+
+fn active_part_count(parts: &[DownloadPart], status: DownloadStatus) -> u16 {
+    let count = parts
+        .iter()
+        .filter(|part| matches!(part.status, PartStatus::Connecting | PartStatus::Receiving))
+        .count();
+    u16::try_from(count).unwrap_or(u16::MAX).max(u16::from(
+        parts.is_empty() && status == DownloadStatus::Downloading,
+    ))
 }
 
 fn publish_terminal_item(events: &broadcast::Sender<DownloadEvent>, item: DownloadItem) {
@@ -637,6 +690,30 @@ fn publish_event(events: &broadcast::Sender<DownloadEvent>, event: DownloadEvent
     match events.send(event) {
         Ok(_) => {}
         Err(error) => tracing::trace!(?error, "download event had no subscribers"),
+    }
+}
+
+async fn unique_file_name(folder: &Path, file_name: &str) -> DownloadManagerResult<String> {
+    let requested = folder.join(file_name);
+    let unique = unique_destination_path(
+        &requested,
+        &crate::download::DownloadConfig::default().incomplete_extension,
+    )
+    .await
+    .map_err(|error| {
+        DownloadManagerError::Db(DbError::Sqlx(sqlx::Error::Io(error_to_io(error))))
+    })?;
+    unique
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+        .ok_or(DownloadManagerError::ClockOutOfRange)
+}
+
+fn error_to_io(error: crate::download::HttpDownloadJobError) -> std::io::Error {
+    match error {
+        crate::download::HttpDownloadJobError::Io(error) => error,
+        other => std::io::Error::other(other.to_string()),
     }
 }
 
@@ -792,6 +869,38 @@ mod tests {
         assert_eq!(paused.status, DownloadStatus::Paused);
         assert_eq!(resumed.status, DownloadStatus::Queued);
         assert!(removed);
+        stop_manager(&handle, task).await
+    }
+
+    #[tokio::test]
+    async fn add_should_choose_unique_file_name_when_destination_exists()
+    -> DownloadManagerResult<()> {
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()
+            .map_err(sqlx::Error::Io)
+            .map_err(DbError::from)?;
+        tokio::fs::write(folder.path().join("file.bin"), b"existing")
+            .await
+            .map_err(sqlx::Error::Io)
+            .map_err(DbError::from)?;
+        let (handle, task) = DownloadManagerHandle::spawn(
+            db.repository,
+            db.part_repository,
+            DownloadManagerOptions {
+                command_buffer: 8,
+                event_buffer: 8,
+            },
+        );
+
+        let added = handle
+            .add(NewDownload::http(
+                "https://example.com/file.bin",
+                "file.bin",
+                folder.path().to_path_buf(),
+            ))
+            .await?;
+
+        assert_eq!(added.file_name, "file (1).bin");
         stop_manager(&handle, task).await
     }
 

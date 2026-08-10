@@ -1,14 +1,15 @@
 mod app;
 mod downloads_table;
+mod services;
 mod sidebar;
 mod theme;
 
 pub(crate) use app::root;
-use downloads_table::new_download_window_config;
 use freya::prelude::*;
+pub(crate) use services::AppServices;
 
 /// Runs the desktop UI shell.
-pub fn run() {
+pub(crate) fn run(services: AppServices) {
     use freya::tray::menu::{Menu, MenuEvent, MenuItem};
     use freya::tray::{TrayEvent, TrayIconBuilder};
 
@@ -29,7 +30,8 @@ pub fn run() {
             .expect("failed to build tray icon")
     };
 
-    let tray_handler = |event, mut context: RendererContext| match event {
+    let tray_services = services.clone();
+    let tray_handler = move |event, mut context: RendererContext| match event {
         TrayEvent::Menu(MenuEvent { id }) if id == "show" => {
             for window in context.windows_mut().values_mut() {
                 window.window_mut().set_visible(true);
@@ -37,7 +39,9 @@ pub fn run() {
             }
         }
         TrayEvent::Menu(MenuEvent { id }) if id == "new-download" => {
-            context.launch_window(new_download_window_config());
+            context.launch_window(downloads_table::new_download_window_config(
+                tray_services.clone(),
+            ));
         }
         TrayEvent::Menu(MenuEvent { id }) if id == "exit" => {
             context.exit();
@@ -48,7 +52,7 @@ pub fn run() {
     launch(
         LaunchConfig::new()
             .with_window(
-                WindowConfig::new(root)
+                WindowConfig::new(move || root(services.clone()))
                     .with_title("Raijin")
                     .with_size(900., 620.)
                     .with_min_size(560., 420.)

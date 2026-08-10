@@ -29,6 +29,8 @@ pub struct DownloadView {
     pub active_part_count: u16,
     /// Last failure shown to UI.
     pub failure: Option<DownloadFailure>,
+    /// Creation timestamp.
+    pub created_at: i64,
     /// Last update timestamp.
     pub updated_at: i64,
 }
@@ -46,16 +48,37 @@ impl DownloadView {
             eta_seconds: None,
             active_part_count: 0,
             failure: item.failure.clone(),
+            created_at: item.created_at,
             updated_at: item.updated_at,
         }
     }
 
     fn apply_progress(&mut self, progress: DownloadProgress) {
+        if progress.active_part_count > 0 {
+            self.status = DownloadStatus::Downloading;
+        }
         self.downloaded_bytes = progress.downloaded_bytes;
         self.total_bytes = progress.total_bytes.or(self.total_bytes);
         self.speed = progress.speed;
         self.eta_seconds = progress.eta_seconds;
         self.active_part_count = progress.active_part_count;
+    }
+
+    fn from_failure(id: DownloadId, failure: DownloadFailure, updated_at: i64) -> Self {
+        Self {
+            id,
+            url: String::new(),
+            file_name: String::new(),
+            status: DownloadStatus::Error,
+            downloaded_bytes: Bytes::ZERO,
+            total_bytes: None,
+            speed: BytesPerSecond::ZERO,
+            eta_seconds: None,
+            active_part_count: 0,
+            failure: Some(failure),
+            created_at: updated_at,
+            updated_at,
+        }
     }
 }
 
@@ -125,13 +148,24 @@ impl Projection {
     }
 
     /// Moves one download to completed/error projection with failure detail when present.
-    pub fn apply_failure(&mut self, id: DownloadId, failure: DownloadFailure, now_ms: u64) {
+    pub fn apply_failure(&mut self, id: DownloadId, failure: DownloadFailure, updated_at: i64) {
         if let Some(mut view) = self.state.active.remove(&id) {
             view.status = DownloadStatus::Error;
             view.failure = Some(failure);
-            view.updated_at = i64::try_from(now_ms).unwrap_or(i64::MAX);
+            view.updated_at = updated_at;
             self.state.completed.insert(id, view);
+            return;
         }
+        if let Some(mut view) = self.state.completed.remove(&id) {
+            view.status = DownloadStatus::Error;
+            view.failure = Some(failure);
+            view.updated_at = updated_at;
+            self.state.completed.insert(id, view);
+            return;
+        }
+        self.state
+            .completed
+            .insert(id, DownloadView::from_failure(id, failure, updated_at));
     }
 
     /// Removes one download from all projections.
@@ -224,6 +258,25 @@ mod tests {
         projection.remove(active.id);
 
         assert!(!projection.state().active.contains_key(&active.id));
+    }
+
+    #[test]
+    fn projection_should_record_failure_for_unknown_download() {
+        let mut projection = Projection::new(None);
+        let id = DownloadId::new(42);
+
+        projection.apply_failure(
+            id,
+            DownloadFailure {
+                kind: FailureKind::Network,
+                message: "network error".to_owned(),
+            },
+            1_234,
+        );
+
+        let view = projection.state().completed.get(&id);
+        assert_eq!(view.map(|view| view.status), Some(DownloadStatus::Error));
+        assert_eq!(view.map(|view| view.updated_at), Some(1_234));
     }
 
     fn item(id: i64, status: DownloadStatus, downloaded_bytes: Bytes) -> DownloadItem {

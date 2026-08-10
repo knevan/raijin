@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::num::NonZeroU16;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -35,6 +36,9 @@ pub enum QueueManagerError {
     /// Requested queue does not exist.
     #[error("queue `{0}` not found")]
     QueueNotFound(QueueId),
+    /// Default queue cannot be deleted.
+    #[error("default queue cannot be deleted")]
+    CannotDeleteDefaultQueue,
     /// Requested download is not in the queue.
     #[error("download `{download_id}` not found in queue `{queue_id}`")]
     QueueItemNotFound {
@@ -57,6 +61,22 @@ pub enum QueueManagerError {
 /// Commands handled by the queue manager actor.
 #[derive(Debug)]
 pub enum QueueCommand {
+    /// Create a queue.
+    CreateQueue {
+        /// Queue name.
+        name: String,
+        /// Maximum active downloads.
+        max_concurrent: NonZeroU16,
+        /// Reply channel.
+        reply: oneshot::Sender<QueueManagerResult<Queue>>,
+    },
+    /// Delete a queue.
+    DeleteQueue {
+        /// Queue id.
+        queue_id: QueueId,
+        /// Reply channel.
+        reply: oneshot::Sender<QueueManagerResult<()>>,
+    },
     /// Add one download to a queue at the tail.
     Enqueue {
         /// Target queue id.
@@ -75,10 +95,55 @@ pub enum QueueCommand {
         /// Reply channel.
         reply: oneshot::Sender<QueueManagerResult<Vec<QueueItem>>>,
     },
+    /// Remove one download from a queue.
+    Remove {
+        /// Target queue id.
+        queue_id: QueueId,
+        /// Download id to remove.
+        download_id: DownloadId,
+        /// Reply channel.
+        reply: oneshot::Sender<QueueManagerResult<Vec<QueueItem>>>,
+    },
+    /// Move one queued item one position up.
+    MoveUp {
+        /// Target queue id.
+        queue_id: QueueId,
+        /// Download id to move.
+        download_id: DownloadId,
+        /// Reply channel.
+        reply: oneshot::Sender<QueueManagerResult<Vec<QueueItem>>>,
+    },
+    /// Move one queued item one position down.
+    MoveDown {
+        /// Target queue id.
+        queue_id: QueueId,
+        /// Download id to move.
+        download_id: DownloadId,
+        /// Reply channel.
+        reply: oneshot::Sender<QueueManagerResult<Vec<QueueItem>>>,
+    },
     /// Update queue settings.
     SetQueue {
         /// Queue settings to persist.
         queue: Queue,
+        /// Reply channel.
+        reply: oneshot::Sender<QueueManagerResult<Queue>>,
+    },
+    /// Update queue max concurrency.
+    SetMaxConcurrent {
+        /// Queue id.
+        queue_id: QueueId,
+        /// Maximum active downloads.
+        max_concurrent: NonZeroU16,
+        /// Reply channel.
+        reply: oneshot::Sender<QueueManagerResult<Queue>>,
+    },
+    /// Update queue schedule JSON.
+    SetSchedule {
+        /// Queue id.
+        queue_id: QueueId,
+        /// Opaque schedule JSON.
+        schedule_json: Option<String>,
         /// Reply channel.
         reply: oneshot::Sender<QueueManagerResult<Queue>>,
     },
@@ -103,6 +168,11 @@ pub enum QueueCommand {
         /// Reply channel.
         reply: oneshot::Sender<QueueManagerResult<Vec<QueueItem>>>,
     },
+    /// List queues.
+    ListQueues {
+        /// Reply channel.
+        reply: oneshot::Sender<QueueManagerResult<Vec<Queue>>>,
+    },
     /// Stop the queue manager actor.
     Shutdown {
         /// Reply channel.
@@ -115,6 +185,8 @@ pub enum QueueCommand {
 pub enum QueueEvent {
     /// Default main queue was ensured during boot.
     Booted { queue_id: QueueId },
+    /// Queue list changed.
+    QueuesChanged { queues: Vec<Queue> },
     /// Queue items changed.
     ItemsChanged {
         queue_id: QueueId,
@@ -204,6 +276,46 @@ impl QueueManagerHandle {
         self.events.subscribe()
     }
 
+    /// Creates a queue with persisted settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistence fails or manager stops.
+    pub async fn create_queue(
+        &self,
+        name: String,
+        max_concurrent: NonZeroU16,
+    ) -> QueueManagerResult<Queue> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(QueueCommand::CreateQueue {
+                name,
+                max_concurrent,
+                reply,
+            })
+            .await
+            .map_err(|_| QueueManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| QueueManagerError::ResponseDropped)?
+    }
+
+    /// Deletes a non-default queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queue is missing, default, or persistence fails.
+    pub async fn delete_queue(&self, queue_id: QueueId) -> QueueManagerResult<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(QueueCommand::DeleteQueue { queue_id, reply })
+            .await
+            .map_err(|_| QueueManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| QueueManagerError::ResponseDropped)?
+    }
+
     /// Adds one download to a queue.
     ///
     /// # Errors
@@ -252,6 +364,78 @@ impl QueueManagerHandle {
             .map_err(|_| QueueManagerError::ResponseDropped)?
     }
 
+    /// Removes one download from a queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when item does not exist or persistence fails.
+    pub async fn remove(
+        &self,
+        queue_id: QueueId,
+        download_id: DownloadId,
+    ) -> QueueManagerResult<Vec<QueueItem>> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(QueueCommand::Remove {
+                queue_id,
+                download_id,
+                reply,
+            })
+            .await
+            .map_err(|_| QueueManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| QueueManagerError::ResponseDropped)?
+    }
+
+    /// Moves one queued item one slot toward the front.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when item does not exist or persistence fails.
+    pub async fn move_up(
+        &self,
+        queue_id: QueueId,
+        download_id: DownloadId,
+    ) -> QueueManagerResult<Vec<QueueItem>> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(QueueCommand::MoveUp {
+                queue_id,
+                download_id,
+                reply,
+            })
+            .await
+            .map_err(|_| QueueManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| QueueManagerError::ResponseDropped)?
+    }
+
+    /// Moves one queued item one slot toward the back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when item does not exist or persistence fails.
+    pub async fn move_down(
+        &self,
+        queue_id: QueueId,
+        download_id: DownloadId,
+    ) -> QueueManagerResult<Vec<QueueItem>> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(QueueCommand::MoveDown {
+                queue_id,
+                download_id,
+                reply,
+            })
+            .await
+            .map_err(|_| QueueManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| QueueManagerError::ResponseDropped)?
+    }
+
     /// Persists queue settings.
     ///
     /// # Errors
@@ -261,6 +445,54 @@ impl QueueManagerHandle {
         let (reply, receiver) = oneshot::channel();
         self.commands
             .send(QueueCommand::SetQueue { queue, reply })
+            .await
+            .map_err(|_| QueueManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| QueueManagerError::ResponseDropped)?
+    }
+
+    /// Updates queue max concurrency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queue does not exist or persistence fails.
+    pub async fn set_max_concurrent(
+        &self,
+        queue_id: QueueId,
+        max_concurrent: NonZeroU16,
+    ) -> QueueManagerResult<Queue> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(QueueCommand::SetMaxConcurrent {
+                queue_id,
+                max_concurrent,
+                reply,
+            })
+            .await
+            .map_err(|_| QueueManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| QueueManagerError::ResponseDropped)?
+    }
+
+    /// Updates queue schedule JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queue does not exist or persistence fails.
+    pub async fn set_schedule(
+        &self,
+        queue_id: QueueId,
+        schedule_json: Option<String>,
+    ) -> QueueManagerResult<Queue> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(QueueCommand::SetSchedule {
+                queue_id,
+                schedule_json,
+                reply,
+            })
             .await
             .map_err(|_| QueueManagerError::Stopped)?;
         receiver
@@ -316,6 +548,22 @@ impl QueueManagerHandle {
             .map_err(|_| QueueManagerError::ResponseDropped)?
     }
 
+    /// Lists queues.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistence read fails.
+    pub async fn list_queues(&self) -> QueueManagerResult<Vec<Queue>> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(QueueCommand::ListQueues { reply })
+            .await
+            .map_err(|_| QueueManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| QueueManagerError::ResponseDropped)?
+    }
+
     /// Requests graceful shutdown.
     ///
     /// # Errors
@@ -339,6 +587,12 @@ struct QueueRuntime {
     active: HashSet<DownloadId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveDirection {
+    Up,
+    Down,
+}
+
 impl QueueRuntime {
     fn new() -> Self {
         Self {
@@ -354,7 +608,7 @@ struct QueueManager {
     download_events: broadcast::Receiver<DownloadEvent>,
     commands: mpsc::Receiver<QueueCommand>,
     events: broadcast::Sender<QueueEvent>,
-    main: QueueRuntime,
+    runtimes: BTreeMap<QueueId, QueueRuntime>,
 }
 
 impl QueueManager {
@@ -371,7 +625,7 @@ impl QueueManager {
             download_events,
             commands,
             events,
-            main: QueueRuntime::new(),
+            runtimes: BTreeMap::new(),
         }
     }
 
@@ -400,6 +654,9 @@ impl QueueManager {
 
     async fn boot(&mut self) -> QueueManagerResult<()> {
         self.repository.ensure_default_queue(now_ms()?).await?;
+        for queue in self.repository.list_queues().await? {
+            self.ensure_runtime(queue.id);
+        }
         self.publish(QueueEvent::Booted {
             queue_id: QueueId::MAIN,
         });
@@ -408,6 +665,20 @@ impl QueueManager {
 
     async fn handle_command(&mut self, command: QueueCommand) -> QueueManagerResult<bool> {
         match command {
+            QueueCommand::CreateQueue {
+                name,
+                max_concurrent,
+                reply,
+            } => {
+                let result = self.create_queue(name, max_concurrent).await;
+                send_reply(reply, result);
+                Ok(false)
+            }
+            QueueCommand::DeleteQueue { queue_id, reply } => {
+                let result = self.delete_queue(queue_id).await;
+                send_reply(reply, result);
+                Ok(false)
+            }
             QueueCommand::Enqueue {
                 queue_id,
                 download_id,
@@ -426,8 +697,57 @@ impl QueueManager {
                 send_reply(reply, result);
                 Ok(false)
             }
+            QueueCommand::Remove {
+                queue_id,
+                download_id,
+                reply,
+            } => {
+                let result = self.remove(queue_id, download_id).await;
+                send_reply(reply, result);
+                Ok(false)
+            }
+            QueueCommand::MoveUp {
+                queue_id,
+                download_id,
+                reply,
+            } => {
+                let result = self
+                    .move_item(queue_id, download_id, MoveDirection::Up)
+                    .await;
+                send_reply(reply, result);
+                Ok(false)
+            }
+            QueueCommand::MoveDown {
+                queue_id,
+                download_id,
+                reply,
+            } => {
+                let result = self
+                    .move_item(queue_id, download_id, MoveDirection::Down)
+                    .await;
+                send_reply(reply, result);
+                Ok(false)
+            }
             QueueCommand::SetQueue { queue, reply } => {
                 let result = self.set_queue(queue).await;
+                send_reply(reply, result);
+                Ok(false)
+            }
+            QueueCommand::SetMaxConcurrent {
+                queue_id,
+                max_concurrent,
+                reply,
+            } => {
+                let result = self.set_max_concurrent(queue_id, max_concurrent).await;
+                send_reply(reply, result);
+                Ok(false)
+            }
+            QueueCommand::SetSchedule {
+                queue_id,
+                schedule_json,
+                reply,
+            } => {
+                let result = self.set_schedule(queue_id, schedule_json).await;
                 send_reply(reply, result);
                 Ok(false)
             }
@@ -451,6 +771,13 @@ impl QueueManager {
                 );
                 Ok(false)
             }
+            QueueCommand::ListQueues { reply } => {
+                send_reply(
+                    reply,
+                    self.repository.list_queues().await.map_err(Into::into),
+                );
+                Ok(false)
+            }
             QueueCommand::Shutdown { reply } => {
                 send_reply(reply, Ok(()));
                 Ok(true)
@@ -464,6 +791,7 @@ impl QueueManager {
         download_id: DownloadId,
     ) -> QueueManagerResult<Vec<QueueItem>> {
         self.queue(queue_id).await?;
+        self.ensure_runtime(queue_id);
         let mut items = self.repository.list_items(queue_id).await?;
         if items.iter().any(|item| item.download_id == download_id) {
             return Ok(items);
@@ -485,11 +813,56 @@ impl QueueManager {
         Ok(items)
     }
 
+    async fn create_queue(
+        &mut self,
+        name: String,
+        max_concurrent: NonZeroU16,
+    ) -> QueueManagerResult<Queue> {
+        let now = now_ms()?;
+        let queue = Queue {
+            id: self.repository.next_queue_id().await?,
+            name,
+            max_concurrent,
+            stop_on_empty: false,
+            schedule_json: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.repository.create_queue(&queue).await?;
+        self.ensure_runtime(queue.id);
+        self.publish_queues_changed().await?;
+        Ok(queue)
+    }
+
+    async fn delete_queue(&mut self, queue_id: QueueId) -> QueueManagerResult<()> {
+        if queue_id == QueueId::MAIN {
+            return Err(QueueManagerError::CannotDeleteDefaultQueue);
+        }
+        self.queue(queue_id).await?;
+        let active = self
+            .runtime(queue_id)?
+            .active
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for download_id in active {
+            let _item = self.downloads.pause(download_id).await?;
+        }
+        if !self.repository.delete_queue(queue_id).await? {
+            return Err(QueueManagerError::QueueNotFound(queue_id));
+        }
+        self.runtimes.remove(&queue_id);
+        self.publish_queues_changed().await?;
+        Ok(())
+    }
+
     async fn reorder(
         &mut self,
         queue_id: QueueId,
         download_ids: Vec<DownloadId>,
     ) -> QueueManagerResult<Vec<QueueItem>> {
+        self.queue(queue_id).await?;
+        self.ensure_runtime(queue_id);
         let existing = self.repository.list_items(queue_id).await?;
         validate_reorder(&existing, &download_ids)?;
         let items = download_ids
@@ -513,17 +886,102 @@ impl QueueManager {
         Ok(items)
     }
 
+    async fn remove(
+        &mut self,
+        queue_id: QueueId,
+        download_id: DownloadId,
+    ) -> QueueManagerResult<Vec<QueueItem>> {
+        self.queue(queue_id).await?;
+        self.ensure_runtime(queue_id);
+        if !self.repository.remove_item(queue_id, download_id).await? {
+            return Err(QueueManagerError::QueueItemNotFound {
+                queue_id,
+                download_id,
+            });
+        }
+        self.runtime_mut(queue_id)?.active.remove(&download_id);
+        self.compact_positions(queue_id).await?;
+        let items = self.repository.list_items(queue_id).await?;
+        if self.runtime(queue_id)?.running {
+            self.schedule(queue_id).await?;
+        }
+        Ok(items)
+    }
+
+    async fn move_item(
+        &mut self,
+        queue_id: QueueId,
+        download_id: DownloadId,
+        direction: MoveDirection,
+    ) -> QueueManagerResult<Vec<QueueItem>> {
+        self.queue(queue_id).await?;
+        self.ensure_runtime(queue_id);
+        let mut items = self.repository.list_items(queue_id).await?;
+        let Some(index) = items
+            .iter()
+            .position(|item| item.download_id == download_id)
+        else {
+            return Err(QueueManagerError::QueueItemNotFound {
+                queue_id,
+                download_id,
+            });
+        };
+        match direction {
+            MoveDirection::Up if index > 0 => items.swap(index, index - 1),
+            MoveDirection::Down if index + 1 < items.len() => items.swap(index, index + 1),
+            MoveDirection::Up | MoveDirection::Down => return Ok(items),
+        }
+        let reordered = items
+            .into_iter()
+            .enumerate()
+            .map(|(position, item)| {
+                u32::try_from(position)
+                    .map(|position| QueueItem { position, ..item })
+                    .map_err(|_| QueueManagerError::InvalidReorder)
+            })
+            .collect::<QueueManagerResult<Vec<_>>>()?;
+        self.repository.set_items(queue_id, &reordered).await?;
+        self.publish(QueueEvent::ItemsChanged {
+            queue_id,
+            items: reordered.clone(),
+        });
+        Ok(reordered)
+    }
+
     async fn set_queue(&mut self, mut queue: Queue) -> QueueManagerResult<Queue> {
         queue.updated_at = now_ms()?;
         self.repository.set_queue(&queue).await?;
+        self.ensure_runtime(queue.id);
+        self.publish_queues_changed().await?;
         if self.runtime(queue.id)?.running {
             self.schedule(queue.id).await?;
         }
         Ok(queue)
     }
 
+    async fn set_max_concurrent(
+        &mut self,
+        queue_id: QueueId,
+        max_concurrent: NonZeroU16,
+    ) -> QueueManagerResult<Queue> {
+        let mut queue = self.queue(queue_id).await?;
+        queue.max_concurrent = max_concurrent;
+        self.set_queue(queue).await
+    }
+
+    async fn set_schedule(
+        &mut self,
+        queue_id: QueueId,
+        schedule_json: Option<String>,
+    ) -> QueueManagerResult<Queue> {
+        let mut queue = self.queue(queue_id).await?;
+        queue.schedule_json = schedule_json;
+        self.set_queue(queue).await
+    }
+
     async fn start_queue(&mut self, queue_id: QueueId) -> QueueManagerResult<()> {
         self.queue(queue_id).await?;
+        self.ensure_runtime(queue_id);
         self.runtime_mut(queue_id)?.running = true;
         self.publish(QueueEvent::Started { queue_id });
         self.schedule(queue_id).await
@@ -531,6 +989,7 @@ impl QueueManager {
 
     async fn stop_queue(&mut self, queue_id: QueueId) -> QueueManagerResult<()> {
         self.queue(queue_id).await?;
+        self.ensure_runtime(queue_id);
         self.runtime_mut(queue_id)?.running = false;
         let active = self
             .runtime(queue_id)?
@@ -553,17 +1012,20 @@ impl QueueManager {
         if !terminal {
             return Ok(());
         }
-        let queue_id = QueueId::MAIN;
-        self.runtime_mut(queue_id)?.active.remove(&download_id);
-        if self.repository.remove_item(queue_id, download_id).await? {
-            self.compact_positions(queue_id).await?;
-            self.publish(QueueEvent::DownloadFinished {
-                queue_id,
-                download_id,
-            });
-        }
-        if self.runtime(queue_id)?.running {
-            self.schedule(queue_id).await?;
+        let queue_ids = self.repository.queue_ids_for_download(download_id).await?;
+        for queue_id in queue_ids {
+            self.ensure_runtime(queue_id);
+            self.runtime_mut(queue_id)?.active.remove(&download_id);
+            if self.repository.remove_item(queue_id, download_id).await? {
+                self.compact_positions(queue_id).await?;
+                self.publish(QueueEvent::DownloadFinished {
+                    queue_id,
+                    download_id,
+                });
+            }
+            if self.runtime(queue_id)?.running {
+                self.schedule(queue_id).await?;
+            }
         }
         Ok(())
     }
@@ -600,7 +1062,15 @@ impl QueueManager {
             .list_items(queue_id)
             .await?
             .into_iter()
-            .find(|item| !active.contains(&item.download_id)))
+            .find(|item| {
+                !active.contains(&item.download_id) && !self.is_active_anywhere(item.download_id)
+            }))
+    }
+
+    fn is_active_anywhere(&self, download_id: DownloadId) -> bool {
+        self.runtimes
+            .values()
+            .any(|runtime| runtime.active.contains(&download_id))
     }
 
     async fn compact_positions(&self, queue_id: QueueId) -> QueueManagerResult<()> {
@@ -630,19 +1100,28 @@ impl QueueManager {
     }
 
     fn runtime(&self, queue_id: QueueId) -> QueueManagerResult<&QueueRuntime> {
-        if queue_id == QueueId::MAIN {
-            Ok(&self.main)
-        } else {
-            Err(QueueManagerError::QueueNotFound(queue_id))
-        }
+        self.runtimes
+            .get(&queue_id)
+            .ok_or(QueueManagerError::QueueNotFound(queue_id))
     }
 
     fn runtime_mut(&mut self, queue_id: QueueId) -> QueueManagerResult<&mut QueueRuntime> {
-        if queue_id == QueueId::MAIN {
-            Ok(&mut self.main)
-        } else {
-            Err(QueueManagerError::QueueNotFound(queue_id))
-        }
+        self.runtimes
+            .get_mut(&queue_id)
+            .ok_or(QueueManagerError::QueueNotFound(queue_id))
+    }
+
+    fn ensure_runtime(&mut self, queue_id: QueueId) {
+        self.runtimes
+            .entry(queue_id)
+            .or_insert_with(QueueRuntime::new);
+    }
+
+    async fn publish_queues_changed(&self) -> QueueManagerResult<()> {
+        self.publish(QueueEvent::QueuesChanged {
+            queues: self.repository.list_queues().await?,
+        });
+        Ok(())
     }
 
     fn publish(&self, event: QueueEvent) {
@@ -665,6 +1144,7 @@ fn terminal_download(event: &DownloadEvent) -> Option<(DownloadId, bool)> {
             ),
         )),
         DownloadEvent::DownloadRemoved { id } => Some((*id, true)),
+        DownloadEvent::DownloadFailed { id, .. } => Some((*id, true)),
         _ => None,
     }
 }
@@ -824,6 +1304,10 @@ mod tests {
         item.status = DownloadStatus::Completed;
         item.downloaded_bytes = item.total_bytes.unwrap_or(Bytes::ZERO);
         DownloadEvent::DownloadChanged { item }
+    }
+
+    fn order_ids(items: Vec<QueueItem>) -> Vec<DownloadId> {
+        items.into_iter().map(|item| item.download_id).collect()
     }
 
     #[derive(Debug)]
@@ -1022,6 +1506,107 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(actual, expected);
+        harness.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn queue_operations_should_update_persisted_state() -> QueueManagerResult<()> {
+        let harness = TestHarness::spawn().await?;
+        let queue = harness
+            .queue_handle
+            .create_queue("Media".to_owned(), non_zero_u16(3))
+            .await?;
+        let item = harness
+            .download_handle
+            .add(crate::download::NewDownload::http(
+                "https://example.com/media.bin",
+                "media.bin",
+                PathBuf::from("C:/Downloads"),
+            ))
+            .await?;
+
+        harness.queue_handle.enqueue(queue.id, item.id).await?;
+        let updated = harness
+            .queue_handle
+            .set_max_concurrent(queue.id, non_zero_u16(1))
+            .await?;
+        let scheduled = harness
+            .queue_handle
+            .set_schedule(queue.id, Some("{\"start\":\"09:00\"}".to_owned()))
+            .await?;
+        let removed = harness.queue_handle.remove(queue.id, item.id).await?;
+        harness.queue_handle.delete_queue(queue.id).await?;
+        let queues = harness.queue_handle.list_queues().await?;
+
+        assert_eq!(updated.max_concurrent.get(), 1);
+        assert_eq!(
+            scheduled.schedule_json.as_deref(),
+            Some("{\"start\":\"09:00\"}")
+        );
+        assert!(removed.is_empty());
+        assert!(!queues.iter().any(|candidate| candidate.id == queue.id));
+        harness.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn move_up_and_down_should_reorder_one_item() -> QueueManagerResult<()> {
+        let harness = TestHarness::spawn().await?;
+        let items = add_downloads(&harness, 3).await?;
+
+        let moved_up = harness
+            .queue_handle
+            .move_up(QueueId::MAIN, items[2].id)
+            .await?;
+        let moved_down = harness
+            .queue_handle
+            .move_down(QueueId::MAIN, items[2].id)
+            .await?;
+
+        assert_eq!(
+            order_ids(moved_up),
+            vec![items[0].id, items[2].id, items[1].id]
+        );
+        assert_eq!(
+            order_ids(moved_down),
+            vec![items[0].id, items[1].id, items[2].id]
+        );
+        harness.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn completion_should_route_to_non_main_queue() -> QueueManagerResult<()> {
+        let harness = TestHarness::spawn().await?;
+        let queue = harness
+            .queue_handle
+            .create_queue("Secondary".to_owned(), non_zero_u16(1))
+            .await?;
+        let item = harness
+            .download_handle
+            .add(crate::download::NewDownload::http(
+                "https://example.com/secondary.bin",
+                "secondary.bin",
+                PathBuf::from("C:/Downloads"),
+            ))
+            .await?;
+        let mut events = harness.queue_handle.subscribe();
+        harness.queue_handle.enqueue(queue.id, item.id).await?;
+        harness.queue_handle.start(queue.id).await?;
+
+        let _sent = harness.download_events.send(completed_event(item.clone()));
+        let saw_finished = timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(events.recv().await, Ok(QueueEvent::DownloadFinished { queue_id, download_id }) if queue_id == queue.id && download_id == item.id)
+                {
+                    break true;
+                }
+            }
+        })
+        .await
+        .map_err(|_| QueueManagerError::Stopped)?;
+        let persisted = harness.queue_repo.list_items(queue.id).await?;
+
+        assert!(saw_finished);
+        assert!(persisted.is_empty());
         harness.shutdown().await
     }
 

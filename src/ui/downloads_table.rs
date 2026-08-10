@@ -1,79 +1,32 @@
 use std::cmp::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use freya::animation::*;
 use freya::icons;
 use freya::prelude::*;
 
+use super::services::AppServices;
 use super::theme;
+use crate::download::{Bytes, DownloadId, DownloadStatus, NewDownload, QueueId};
+use crate::monitor::{DownloadView, MonitorState};
 
 const COLUMN_COUNT: usize = 6;
 const SELECTION_COLUMN_WIDTH: f32 = 44.;
 const ROW_HEIGHT: f32 = 52.;
 const ROW_DETAILS_HEIGHT: f32 = 48.;
 
-const MOCK_DOWNLOADS: [DownloadRowData; 3] = [
-    DownloadRowData {
-        id: 1,
-        file_name: "ABDownloadManager_1.9.2_windows_x64.exe",
-        kind: "Programs",
-        size_mib: 66.93,
-        status: DownloadStatus::Finished,
-        speed: "-",
-        time_left: "-",
-        date_added: "1 months ago",
-        progress: 1.0,
-        connections: 8,
-    },
-    DownloadRowData {
-        id: 2,
-        file_name: "ABDownloadManager_1.9.2_windows_x64.zip",
-        kind: "Compressed",
-        size_mib: 80.77,
-        status: DownloadStatus::Finished,
-        speed: "-",
-        time_left: "-",
-        date_added: "1 months ago",
-        progress: 1.0,
-        connections: 6,
-    },
-    DownloadRowData {
-        id: 3,
-        file_name: "ubuntu-26.04-desktop-amd64.iso",
-        kind: "Documents",
-        size_mib: 5420.0,
-        status: DownloadStatus::Downloading,
-        speed: "5.8 MiB/s",
-        time_left: "12 min",
-        date_added: "today",
-        progress: 0.47,
-        connections: 12,
-    },
-];
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[expect(
-    dead_code,
-    reason = "mock table keeps paused/cancelled states ready for production monitor wiring"
-)]
-enum DownloadStatus {
-    Cancelled,
-    Downloading,
-    Finished,
-    Paused,
-}
-
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct DownloadRowData {
-    id: u64,
-    file_name: &'static str,
-    kind: &'static str,
-    size_mib: f32,
+    id: DownloadId,
+    file_name: String,
+    kind: String,
+    size_bytes: Option<Bytes>,
     status: DownloadStatus,
-    speed: &'static str,
-    time_left: &'static str,
-    date_added: &'static str,
+    speed_bps: u64,
+    time_left: Option<u64>,
+    date_added: String,
     progress: f32,
-    connections: u8,
+    connections: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -169,8 +122,8 @@ impl ColumnWidths {
 struct VirtualRowsData {
     rows: Vec<DownloadRowData>,
     widths: ColumnWidths,
-    expanded_ids: State<Vec<u64>>,
-    selected_ids: State<Vec<u64>>,
+    expanded_ids: State<Vec<DownloadId>>,
+    selected_ids: State<Vec<DownloadId>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -218,12 +171,15 @@ impl SortState {
 
     fn compare(self, a: &DownloadRowData, b: &DownloadRowData) -> Ordering {
         let ordering = match self.column {
-            TableColumn::Name => a.file_name.cmp(b.file_name),
-            TableColumn::Size => a.size_mib.total_cmp(&b.size_mib),
+            TableColumn::Name => a.file_name.cmp(&b.file_name),
+            TableColumn::Size => byte_sort_value(a.size_bytes).cmp(&byte_sort_value(b.size_bytes)),
             TableColumn::Status => status_order(a.status).cmp(&status_order(b.status)),
-            TableColumn::Speed => a.speed.cmp(b.speed),
-            TableColumn::TimeLeft => a.time_left.cmp(b.time_left),
-            TableColumn::DateAdded => a.date_added.cmp(b.date_added),
+            TableColumn::Speed => a.speed_bps.cmp(&b.speed_bps),
+            TableColumn::TimeLeft => a
+                .time_left
+                .unwrap_or(u64::MAX)
+                .cmp(&b.time_left.unwrap_or(u64::MAX)),
+            TableColumn::DateAdded => a.date_added.cmp(&b.date_added),
         };
 
         match self.direction {
@@ -238,6 +194,19 @@ pub(crate) struct DownloadsTable;
 
 impl Component for DownloadsTable {
     fn render(&self) -> impl IntoElement {
+        let services = use_consume::<AppServices>();
+        let mut monitor_state = use_state(MonitorState::default);
+        let monitor_services = services.clone();
+        use_hook(move || {
+            let mut receiver = monitor_services.monitor.subscribe();
+            spawn(async move {
+                monitor_state.set(receiver.borrow().clone());
+                while receiver.changed().await.is_ok() {
+                    monitor_state.set(receiver.borrow().clone());
+                }
+            });
+        });
+
         let column_widths = ColumnWidths {
             name: use_state(|| TableColumn::Name.default_width()),
             size: use_state(|| TableColumn::Size.default_width()),
@@ -251,19 +220,18 @@ impl Component for DownloadsTable {
             direction: SortDirection::Ascending,
         });
         let sorted_rows = use_memo(move || {
-            let mut rows = MOCK_DOWNLOADS.to_vec();
+            let mut rows = rows_from_state(&monitor_state.read());
             rows.sort_by(|a, b| sort().compare(a, b));
             rows
         });
         let rows = sorted_rows.read().clone();
         let expanded_ids = use_state(|| {
-            MOCK_DOWNLOADS
-                .iter()
+            rows.iter()
                 .filter(|item| item.status == DownloadStatus::Downloading)
                 .map(|item| item.id)
                 .collect::<Vec<_>>()
         });
-        let selected_ids = use_state(Vec::<u64>::new);
+        let selected_ids = use_state(Vec::<DownloadId>::new);
         let selected_count = selected_ids.read().len();
 
         rect()
@@ -273,7 +241,12 @@ impl Component for DownloadsTable {
             .padding(Gaps::new(10., 10., 12., 10.))
             .vertical()
             .spacing(8.)
-            .child(DownloadsToolbar { selected_count })
+            .child(DownloadsToolbar {
+                services,
+                selected_ids,
+                selected_count,
+                snapshot: monitor_state.read().clone(),
+            })
             .child(
                 ScrollView::new()
                     .direction(Direction::Horizontal)
@@ -289,15 +262,26 @@ impl Component for DownloadsTable {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone)]
 struct DownloadsToolbar {
+    services: AppServices,
+    selected_ids: State<Vec<DownloadId>>,
     selected_count: usize,
+    snapshot: MonitorState,
+}
+
+impl PartialEq for DownloadsToolbar {
+    fn eq(&self, other: &Self) -> bool {
+        self.selected_count == other.selected_count && self.snapshot == other.snapshot
+    }
 }
 
 impl Component for DownloadsToolbar {
     fn render(&self) -> impl IntoElement {
         let has_selection = self.selected_count > 0;
-        let open_new_download = move |_| open_new_download_window();
+        let services = self.services.clone();
+        let open_services = self.services.clone();
+        let stop_snapshot = self.snapshot.clone();
 
         rect()
             .width(Size::fill())
@@ -312,7 +296,7 @@ impl Component for DownloadsToolbar {
                 icons::lucide::link_2(),
                 true,
                 true,
-                open_new_download.into(),
+                (move |()| open_new_download_window(open_services.clone())).into(),
             ))
             .child(toolbar_divider())
             .child(toolbar_button(
@@ -320,28 +304,61 @@ impl Component for DownloadsToolbar {
                 icons::lucide::play(),
                 has_selection,
                 false,
-                noop_toolbar_action(),
+                {
+                    let selected_ids = self.selected_ids;
+                    (move |()| {
+                        run_for_selected(
+                            services.clone(),
+                            selected_ids.read().clone(),
+                            DownloadAction::Resume,
+                        )
+                    })
+                    .into()
+                },
             ))
             .child(toolbar_button(
                 "Pause",
                 icons::lucide::pause(),
                 has_selection,
                 false,
-                noop_toolbar_action(),
+                {
+                    let services = self.services.clone();
+                    let selected_ids = self.selected_ids;
+                    (move |()| {
+                        run_for_selected(
+                            services.clone(),
+                            selected_ids.read().clone(),
+                            DownloadAction::Pause,
+                        )
+                    })
+                    .into()
+                },
             ))
             .child(toolbar_button(
                 "Stop All",
                 icons::lucide::square_stop(),
                 true,
                 false,
-                noop_toolbar_action(),
+                {
+                    let services = self.services.clone();
+                    (move |()| stop_all_active(services.clone(), stop_snapshot.clone())).into()
+                },
             ))
             .child(toolbar_button(
                 "Delete",
                 icons::lucide::trash_2(),
                 has_selection,
                 false,
-                noop_toolbar_action(),
+                {
+                    let services = self.services.clone();
+                    let mut selected_ids = self.selected_ids;
+                    (move |()| {
+                        let selected = selected_ids.read().clone();
+                        selected_ids.set(Vec::new());
+                        run_for_selected(services.clone(), selected, DownloadAction::Remove);
+                    })
+                    .into()
+                },
             ))
             .child(toolbar_divider())
             .child(toolbar_button(
@@ -354,99 +371,12 @@ impl Component for DownloadsToolbar {
     }
 }
 
-fn open_new_download_window() {
-    spawn(async move {
-        Platform::get()
-            .launch_window(new_download_window_config())
-            .await;
-    });
-}
-
-pub(crate) fn new_download_window_config() -> WindowConfig {
-    WindowConfig::new(|| NewDownloadWindow)
-        .with_title("New Download")
-        .with_size(430., 145.)
-        .with_min_size(430., 145.)
-        .with_resizable(true)
-        .with_background(theme::RAIJIN_BACKGROUND)
-}
-
-#[derive(PartialEq)]
-struct NewDownloadWindow;
-
-impl Component for NewDownloadWindow {
-    fn render(&self) -> impl IntoElement {
-        use_init_theme(theme::raijin_theme);
-
-        let link = use_state(String::new);
-        let has_link = !link.read().trim().is_empty();
-
-        rect()
-            .expanded()
-            .background(theme::RAIJIN_BACKGROUND)
-            .color(theme::TEXT_PRIMARY)
-            .vertical()
-            .child(
-                rect()
-                    .expanded()
-                    .padding(Gaps::new(40., 20., 0., 20.))
-                    .spacing(12.)
-                    .vertical()
-                    .child(
-                        Input::new(link)
-                            .placeholder("Download link")
-                            .width(Size::fill())
-                            .theme_colors(dialog_input_colors())
-                            .theme_layout(InputLayoutThemePartial {
-                                corner_radius: Some(CornerRadius::new_all(8.).into()),
-                                inner_margin: Some(Gaps::new(10., 12., 10., 12.).into()),
-                            })
-                            .leading(
-                                SvgViewer::new(icons::lucide::link_2())
-                                    .width(Size::px(18.))
-                                    .height(Size::px(18.))
-                                    .color(theme::TEXT_SUBTLE),
-                            )
-                            .trailing(
-                                SvgViewer::new(icons::lucide::clipboard())
-                                    .width(Size::px(18.))
-                                    .height(Size::px(18.))
-                                    .color(theme::TEXT_MUTED),
-                            ),
-                    )
-                    .child(
-                        rect()
-                            .horizontal()
-                            .main_align(Alignment::SpaceBetween)
-                            .cross_align(Alignment::Center)
-                            .width(Size::fill())
-                            .child(dropdown_button("Auto"))
-                            .child(
-                                rect()
-                                    .horizontal()
-                                    .spacing(10.)
-                                    .child(dialog_button(
-                                        "OK",
-                                        has_link,
-                                        close_current_window_action(),
-                                    ))
-                                    .child(dialog_button(
-                                        "Cancel",
-                                        true,
-                                        close_current_window_action(),
-                                    )),
-                            ),
-                    ),
-            )
-    }
-}
-
 #[derive(PartialEq)]
 struct TableSurface {
     rows: Vec<DownloadRowData>,
     widths: ColumnWidths,
-    expanded_ids: State<Vec<u64>>,
-    selected_ids: State<Vec<u64>>,
+    expanded_ids: State<Vec<DownloadId>>,
+    selected_ids: State<Vec<DownloadId>>,
     sort: SortState,
     on_sort: EventHandler<TableColumn>,
 }
@@ -480,12 +410,12 @@ impl Component for TableSurface {
             .child(
                 VirtualScrollView::new_with_data(data, move |item, data: &VirtualRowsData| {
                     DownloadTableRow::new(
-                        data.rows[item.index],
+                        data.rows[item.index].clone(),
                         data.widths,
                         data.expanded_ids,
                         data.selected_ids,
                     )
-                    .key(data.rows[item.index].id)
+                    .key(data.rows[item.index].id.get())
                     .into_element()
                 })
                 .length(rows.len())
@@ -506,7 +436,7 @@ impl Component for TableSurface {
 struct TableHeader {
     column_widths: ColumnWidths,
     rows: Vec<DownloadRowData>,
-    selected_ids: State<Vec<u64>>,
+    selected_ids: State<Vec<DownloadId>>,
     sort: SortState,
     on_sort: EventHandler<TableColumn>,
 }
@@ -640,8 +570,8 @@ impl Component for HeaderCell {
 struct DownloadTableRow {
     item: DownloadRowData,
     column_widths: ColumnWidths,
-    expanded_ids: State<Vec<u64>>,
-    selected_ids: State<Vec<u64>>,
+    expanded_ids: State<Vec<DownloadId>>,
+    selected_ids: State<Vec<DownloadId>>,
     key: DiffKey,
 }
 
@@ -649,8 +579,8 @@ impl DownloadTableRow {
     fn new(
         item: DownloadRowData,
         column_widths: ColumnWidths,
-        expanded_ids: State<Vec<u64>>,
-        selected_ids: State<Vec<u64>>,
+        expanded_ids: State<Vec<DownloadId>>,
+        selected_ids: State<Vec<DownloadId>>,
     ) -> Self {
         Self {
             item,
@@ -711,7 +641,7 @@ impl Component for DownloadTableRow {
                         RowCell {
                             column: *column,
                             widths: self.column_widths,
-                            item: self.item,
+                            item: self.item.clone(),
                             expanded_ids: self.expanded_ids,
                         }
                         .into_element()
@@ -719,7 +649,7 @@ impl Component for DownloadTableRow {
             )
             .maybe(expanded, |el| {
                 el.child(RowDetails {
-                    item: self.item,
+                    item: self.item.clone(),
                     widths: self.column_widths,
                 })
             })
@@ -794,19 +724,19 @@ struct RowCell {
     column: TableColumn,
     widths: ColumnWidths,
     item: DownloadRowData,
-    expanded_ids: State<Vec<u64>>,
+    expanded_ids: State<Vec<DownloadId>>,
 }
 
 impl Component for RowCell {
     fn render(&self) -> impl IntoElement {
         let width = (self.widths.width_for(self.column))();
         let content = match self.column {
-            TableColumn::Name => name_cell(self.item, self.expanded_ids).into_element(),
-            TableColumn::Size => plain_cell(format_size(self.item.size_mib)).into_element(),
-            TableColumn::Status => status_cell(self.item).into_element(),
-            TableColumn::Speed => plain_cell(self.item.speed).into_element(),
-            TableColumn::TimeLeft => plain_cell(self.item.time_left).into_element(),
-            TableColumn::DateAdded => plain_cell(self.item.date_added).into_element(),
+            TableColumn::Name => name_cell(self.item.clone(), self.expanded_ids).into_element(),
+            TableColumn::Size => plain_cell(format_size(self.item.size_bytes)).into_element(),
+            TableColumn::Status => status_cell(&self.item).into_element(),
+            TableColumn::Speed => plain_cell(format_speed(self.item.speed_bps)).into_element(),
+            TableColumn::TimeLeft => plain_cell(format_eta(self.item.time_left)).into_element(),
+            TableColumn::DateAdded => plain_cell(self.item.date_added.clone()).into_element(),
         };
 
         rect()
@@ -819,6 +749,196 @@ impl Component for RowCell {
             .overflow(Overflow::Clip)
             .child(content)
     }
+}
+
+#[derive(Clone)]
+struct NewDownloadWindow {
+    services: AppServices,
+}
+
+impl PartialEq for NewDownloadWindow {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Component for NewDownloadWindow {
+    fn render(&self) -> impl IntoElement {
+        use_init_theme(theme::raijin_theme);
+
+        let link = use_state(String::new);
+        let has_link = !link.read().trim().is_empty();
+        let services = self.services.clone();
+
+        rect()
+            .expanded()
+            .background(theme::RAIJIN_BACKGROUND)
+            .color(theme::TEXT_PRIMARY)
+            .vertical()
+            .child(
+                rect()
+                    .expanded()
+                    .padding(Gaps::new(40., 20., 0., 20.))
+                    .spacing(12.)
+                    .vertical()
+                    .child(
+                        Input::new(link)
+                            .placeholder("Download link")
+                            .width(Size::fill())
+                            .theme_colors(dialog_input_colors())
+                            .theme_layout(InputLayoutThemePartial {
+                                corner_radius: Some(CornerRadius::new_all(8.).into()),
+                                inner_margin: Some(Gaps::new(10., 12., 10., 12.).into()),
+                            })
+                            .leading(
+                                SvgViewer::new(icons::lucide::link_2())
+                                    .width(Size::px(18.))
+                                    .height(Size::px(18.))
+                                    .color(theme::TEXT_SUBTLE),
+                            )
+                            .trailing(
+                                SvgViewer::new(icons::lucide::clipboard())
+                                    .width(Size::px(18.))
+                                    .height(Size::px(18.))
+                                    .color(theme::TEXT_MUTED),
+                            ),
+                    )
+                    .child(
+                        rect()
+                            .horizontal()
+                            .main_align(Alignment::SpaceBetween)
+                            .cross_align(Alignment::Center)
+                            .width(Size::fill())
+                            .child(dropdown_button("Auto"))
+                            .child(
+                                rect()
+                                    .horizontal()
+                                    .spacing(10.)
+                                    .child(dialog_button(
+                                        "OK",
+                                        has_link,
+                                        add_download_action(
+                                            services,
+                                            link.read().trim().to_owned(),
+                                        ),
+                                    ))
+                                    .child(dialog_button(
+                                        "Cancel",
+                                        true,
+                                        close_current_window_action(),
+                                    )),
+                            ),
+                    ),
+            )
+    }
+}
+
+pub(crate) fn new_download_window_config(services: AppServices) -> WindowConfig {
+    WindowConfig::new(move || NewDownloadWindow {
+        services: services.clone(),
+    })
+    .with_title("New Download")
+    .with_size(430., 145.)
+    .with_min_size(430., 145.)
+    .with_resizable(true)
+    .with_background(theme::RAIJIN_BACKGROUND)
+}
+
+#[derive(Clone, Copy)]
+enum DownloadAction {
+    Pause,
+    Resume,
+    Remove,
+}
+
+fn rows_from_state(state: &MonitorState) -> Vec<DownloadRowData> {
+    state
+        .active
+        .values()
+        .chain(state.completed.values())
+        .map(row_from_view)
+        .collect()
+}
+
+fn row_from_view(view: &DownloadView) -> DownloadRowData {
+    DownloadRowData {
+        id: view.id,
+        file_name: display_name(view),
+        kind: kind_from_name(&view.file_name).to_owned(),
+        size_bytes: view.total_bytes,
+        status: view.status,
+        speed_bps: view.speed.get(),
+        time_left: view.eta_seconds,
+        date_added: format_date_added(view.created_at),
+        progress: progress_ratio(view),
+        connections: view.active_part_count.max(1),
+    }
+}
+
+fn run_for_selected(services: AppServices, ids: Vec<DownloadId>, action: DownloadAction) {
+    spawn(async move {
+        for id in ids {
+            let result = match action {
+                DownloadAction::Pause => services.downloads.pause(id).await.map(|_| ()),
+                DownloadAction::Resume => services.downloads.resume(id).await.map(|_| ()),
+                DownloadAction::Remove => services.downloads.remove(id).await.map(|_| ()),
+            };
+            if let Err(error) = result {
+                tracing::warn!(%id, ?error, "download command from UI failed");
+            }
+        }
+    });
+}
+
+fn stop_all_active(services: AppServices, snapshot: MonitorState) {
+    let ids = snapshot.active.keys().copied().collect::<Vec<_>>();
+    run_for_selected(services, ids, DownloadAction::Pause);
+}
+
+fn add_download_action(services: AppServices, url: String) -> EventHandler<()> {
+    (move |()| {
+        let services = services.clone();
+        let url = url.clone();
+        spawn(async move {
+            if url.trim().is_empty() {
+                return;
+            }
+            let file_name = file_name_from_url(&url);
+            let request = NewDownload::http(url, file_name, services.default_folder.clone());
+            match services.downloads.add(request).await {
+                Ok(item) => {
+                    if let Err(error) = services.queues.enqueue(QueueId::MAIN, item.id).await {
+                        tracing::warn!(%error, "enqueue from UI failed");
+                    }
+                    if let Err(error) = services.queues.start(QueueId::MAIN).await {
+                        tracing::warn!(%error, "queue start from UI failed");
+                    }
+                    close_current_window();
+                }
+                Err(error) => tracing::warn!(?error, "add download from UI failed"),
+            }
+        });
+    })
+    .into()
+}
+
+fn open_new_download_window(services: AppServices) {
+    spawn(async move {
+        Platform::get()
+            .launch_window(new_download_window_config(services))
+            .await;
+    });
+}
+
+fn close_current_window_action() -> EventHandler<()> {
+    (|()| close_current_window()).into()
+}
+
+fn close_current_window() {
+    let platform = Platform::get();
+    Platform::get().with_window(None, move |window| {
+        platform.close_window(window.id());
+    });
 }
 
 fn column_width(column: TableColumn, width: f32) -> Size {
@@ -837,7 +957,7 @@ fn column_min_width(column: TableColumn, width: f32) -> f32 {
     }
 }
 
-fn name_cell(item: DownloadRowData, mut expanded_ids: State<Vec<u64>>) -> impl IntoElement {
+fn name_cell(item: DownloadRowData, mut expanded_ids: State<Vec<DownloadId>>) -> impl IntoElement {
     let expanded = expanded_ids.read().contains(&item.id);
 
     rect()
@@ -860,7 +980,7 @@ fn name_cell(item: DownloadRowData, mut expanded_ids: State<Vec<u64>>) -> impl I
         } else {
             icons::lucide::chevron_right()
         }))
-        .child(row_kind_icon(item.kind))
+        .child(row_kind_icon(&item.kind))
         .child(
             rect()
                 .vertical()
@@ -891,45 +1011,31 @@ fn plain_cell(text: impl Into<String>) -> impl IntoElement {
         .color(theme::TEXT_PRIMARY)
 }
 
-fn status_cell(item: DownloadRowData) -> impl IntoElement {
+fn status_cell(item: &DownloadRowData) -> impl IntoElement {
     rect()
         .width(Size::fill())
         .height(Size::fill())
         .center()
-        .maybe(
-            matches!(
-                item.status,
-                DownloadStatus::Downloading | DownloadStatus::Paused
-            ),
-            |el| {
-                el.child(ProgressBar {
-                    progress: item.progress,
-                    color: match item.status {
-                        DownloadStatus::Downloading => theme::ACCENT,
-                        DownloadStatus::Paused => Color::from_rgb(100, 105, 116),
-                        DownloadStatus::Cancelled | DownloadStatus::Finished => theme::ACCENT,
-                    },
-                })
-            },
-        )
-        .maybe(
-            matches!(
-                item.status,
-                DownloadStatus::Cancelled | DownloadStatus::Finished
-            ),
-            |el| {
-                el.child(
-                    label()
-                        .text(status_label(item.status))
-                        .font_size(14.)
-                        .color(match item.status {
-                            DownloadStatus::Cancelled => Color::from_rgb(235, 112, 112),
-                            DownloadStatus::Finished => Color::from_rgb(71, 210, 128),
-                            DownloadStatus::Downloading | DownloadStatus::Paused => theme::ACCENT,
-                        }),
-                )
-            },
-        )
+        .maybe(status_uses_progress(item.status), |el| {
+            el.child(ProgressBar {
+                progress: item.progress,
+                color: match item.status {
+                    DownloadStatus::Downloading
+                    | DownloadStatus::Queued
+                    | DownloadStatus::PreparingFile => theme::ACCENT,
+                    DownloadStatus::Paused => Color::from_rgb(100, 105, 116),
+                    _ => theme::ACCENT,
+                },
+            })
+        })
+        .maybe(!status_uses_progress(item.status), |el| {
+            el.child(
+                label()
+                    .text(status_label(item.status))
+                    .font_size(14.)
+                    .color(status_color(item.status)),
+            )
+        })
 }
 
 fn selection_box(state: SelectBoxState, on_toggle: EventHandler<()>) -> impl IntoElement {
@@ -1049,16 +1155,6 @@ fn noop_toolbar_action() -> EventHandler<()> {
     (|()| {}).into()
 }
 
-fn close_current_window_action() -> EventHandler<()> {
-    (|()| {
-        let platform = Platform::get();
-        Platform::get().with_window(None, move |window| {
-            platform.close_window(window.id());
-        });
-    })
-    .into()
-}
-
 fn dialog_input_colors() -> InputColorsThemePartial {
     InputColorsThemePartial {
         background: Some(theme::SURFACE.into()),
@@ -1068,25 +1164,6 @@ fn dialog_input_colors() -> InputColorsThemePartial {
         color: Some(theme::TEXT_PRIMARY.into()),
         placeholder_color: Some(theme::TEXT_SUBTLE.into()),
     }
-}
-
-fn dropdown_button(text: &'static str) -> impl IntoElement {
-    rect()
-        .width(Size::px(112.))
-        .height(Size::px(36.))
-        .horizontal()
-        .center()
-        .spacing(8.)
-        .corner_radius(8.)
-        .background(theme::SURFACE)
-        .border(Border::new().width(1.).fill(theme::BORDER))
-        .child(label().text(text).font_size(14.).color(theme::TEXT_PRIMARY))
-        .child(
-            SvgViewer::new(icons::lucide::chevron_down())
-                .width(Size::px(14.))
-                .height(Size::px(14.))
-                .color(theme::TEXT_MUTED),
-        )
 }
 
 fn dialog_button(
@@ -1107,6 +1184,25 @@ fn dialog_button(
         } else {
             theme::TEXT_SUBTLE
         }))
+}
+
+fn dropdown_button(text: &'static str) -> impl IntoElement {
+    rect()
+        .width(Size::px(112.))
+        .height(Size::px(36.))
+        .horizontal()
+        .center()
+        .spacing(8.)
+        .corner_radius(8.)
+        .background(theme::SURFACE)
+        .border(Border::new().width(1.).fill(theme::BORDER))
+        .child(label().text(text).font_size(14.).color(theme::TEXT_PRIMARY))
+        .child(
+            SvgViewer::new(icons::lucide::chevron_down())
+                .width(Size::px(14.))
+                .height(Size::px(14.))
+                .color(theme::TEXT_MUTED),
+        )
 }
 
 fn toolbar_divider() -> impl IntoElement {
@@ -1141,6 +1237,9 @@ fn row_kind_icon(kind: &str) -> impl IntoElement {
     let icon = match kind {
         "Compressed" => icons::lucide::file_archive(),
         "Programs" => icons::lucide::boxes(),
+        "Videos" => icons::lucide::video(),
+        "Music" => icons::lucide::music(),
+        "Pictures" => icons::lucide::image(),
         _ => icons::lucide::file_text(),
     };
 
@@ -1152,28 +1251,173 @@ fn row_kind_icon(kind: &str) -> impl IntoElement {
 
 fn status_label(status: DownloadStatus) -> &'static str {
     match status {
-        DownloadStatus::Cancelled => "Cancelled",
+        DownloadStatus::Added => "Added",
+        DownloadStatus::Queued => "Queued",
         DownloadStatus::Downloading => "Downloading",
-        DownloadStatus::Finished => "Finished",
         DownloadStatus::Paused => "Paused",
+        DownloadStatus::Retrying => "Retrying",
+        DownloadStatus::PreparingFile => "Preparing",
+        DownloadStatus::Completed => "Finished",
+        DownloadStatus::Error => "Error",
+        DownloadStatus::Removed => "Removed",
     }
 }
 
 const fn status_order(status: DownloadStatus) -> u8 {
     match status {
         DownloadStatus::Downloading => 0,
-        DownloadStatus::Paused => 1,
-        DownloadStatus::Finished => 2,
-        DownloadStatus::Cancelled => 3,
+        DownloadStatus::Queued => 1,
+        DownloadStatus::Retrying => 2,
+        DownloadStatus::PreparingFile => 3,
+        DownloadStatus::Paused => 4,
+        DownloadStatus::Completed => 5,
+        DownloadStatus::Error => 6,
+        DownloadStatus::Added => 7,
+        DownloadStatus::Removed => 8,
     }
 }
 
-fn format_size(size_mib: f32) -> String {
-    if size_mib >= 1024. {
-        format!("{:.2} GiB", size_mib / 1024.)
-    } else {
-        format!("{size_mib:.2} MiB")
+fn status_uses_progress(status: DownloadStatus) -> bool {
+    matches!(
+        status,
+        DownloadStatus::Downloading
+            | DownloadStatus::Queued
+            | DownloadStatus::Paused
+            | DownloadStatus::Retrying
+            | DownloadStatus::PreparingFile
+    )
+}
+
+fn status_color(status: DownloadStatus) -> Color {
+    match status {
+        DownloadStatus::Completed => Color::from_rgb(71, 210, 128),
+        DownloadStatus::Error => Color::from_rgb(235, 112, 112),
+        DownloadStatus::Paused => Color::from_rgb(255, 190, 100),
+        DownloadStatus::Downloading | DownloadStatus::Queued | DownloadStatus::PreparingFile => {
+            theme::ACCENT
+        }
+        _ => theme::TEXT_PRIMARY,
     }
+}
+
+fn format_size(size: Option<Bytes>) -> String {
+    size.map(|value| human_bytes(value.get()))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_speed(bytes_per_second: u64) -> String {
+    if bytes_per_second == 0 {
+        "-".to_owned()
+    } else {
+        format!("{}/s", human_bytes(bytes_per_second))
+    }
+}
+
+fn format_eta(eta_seconds: Option<u64>) -> String {
+    let Some(seconds) = eta_seconds else {
+        return "-".to_owned();
+    };
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn format_date_added(created_at: i64) -> String {
+    if created_at <= 0 {
+        return "-".to_owned();
+    }
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return "-".to_owned();
+    };
+    let Ok(now_ms) = i64::try_from(duration.as_millis()) else {
+        return "-".to_owned();
+    };
+    let days = now_ms.saturating_sub(created_at) / 86_400_000;
+    if days <= 0 {
+        "today".to_owned()
+    } else if days == 1 {
+        "1 day ago".to_owned()
+    } else if days < 30 {
+        format!("{days} days ago")
+    } else {
+        format!("{} months ago", days / 30)
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024. && unit + 1 < UNITS.len() {
+        value /= 1024.;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
+fn byte_sort_value(size: Option<Bytes>) -> u64 {
+    size.map(Bytes::get).unwrap_or(0)
+}
+
+fn display_name(view: &DownloadView) -> String {
+    if view.file_name.is_empty() {
+        format!("Download {}", view.id.get())
+    } else {
+        view.file_name.clone()
+    }
+}
+
+fn progress_ratio(view: &DownloadView) -> f32 {
+    let Some(total) = view.total_bytes else {
+        return 0.;
+    };
+    if total == Bytes::ZERO {
+        return 0.;
+    }
+    view.downloaded_bytes.get() as f32 / total.get() as f32
+}
+
+fn kind_from_name(file_name: &str) -> &'static str {
+    let extension = file_name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "zip" | "7z" | "rar" | "tar" | "gz" => "Compressed",
+        "exe" | "msi" | "appimage" | "dmg" | "deb" | "rpm" => "Programs",
+        "mp4" | "mkv" | "webm" | "avi" => "Videos",
+        "mp3" | "flac" | "wav" | "ogg" => "Music",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => "Pictures",
+        _ => "Documents",
+    }
+}
+
+fn file_name_from_url(url: &str) -> String {
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    without_query
+        .rsplit('/')
+        .find(|part| !part.trim().is_empty())
+        .map(sanitize_file_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "download.bin".to_owned())
+}
+
+fn sanitize_file_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect()
 }
 
 fn left_border() -> Border {

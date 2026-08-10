@@ -44,3 +44,16 @@ dev = [
     "freya/devtools",
     "freya/hotreload"
 ]
+
+[profile.small]
+inherits = "release"
+debug = false
+opt-level = 3
+strip = "none"
+overflow-checks = false
+debug-assertions = false
+rpath = false
+lto = "thin"
+panic = "abort"
+codegen-units = 1
+incremental = false

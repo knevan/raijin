@@ -9,3 +9,7 @@ run = "dx serve --features dev"
 [tasks.dev]
 dir = "."
 run = "cargo run --features dev"
+
+[tasks.release]
+dir = "."
+run = "cargo build --profile small"

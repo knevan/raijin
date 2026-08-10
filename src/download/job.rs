@@ -10,6 +10,7 @@ use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 use thiserror::Error;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -23,6 +24,8 @@ use crate::download::{
 };
 
 const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+const SPLIT_REPLY_TIMEOUT: Duration = Duration::from_millis(25);
+const SPLIT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const SINGLE_PART_INDEX: u32 = 0;
 
 /// Result type returned by single-connection HTTP jobs.
@@ -440,52 +443,80 @@ impl HttpDownloadJob {
             .filter(|part| !part_is_complete(part))
             .collect::<std::collections::VecDeque<_>>();
         let mut workers = JoinSet::new();
+        let mut worker_controls = std::collections::HashMap::new();
         let limit = usize::from(self.preferred_connections().get());
         let speed_limiter = self.item.speed_limit.and_then(SpeedLimiter::new);
         let mut first_error = None;
 
         loop {
             while workers.len() < limit {
-                if workers.len() + pending.len() < limit
-                    && let Some((parent, child)) = split_largest_pending_part(
-                        &mut pending,
+                if let Some(part) = pending.pop_front() {
+                    let part_index = part.index;
+                    let (control_tx, control_rx) = mpsc::channel(1);
+                    let active_state = Arc::new(ActivePartState::new(&part));
+                    worker_controls.insert(
+                        part_index,
+                        ActivePartControl {
+                            tx: control_tx,
+                            state: Arc::clone(&active_state),
+                        },
+                    );
+                    let request = PartWorkerRequest {
+                        part_repo: self.part_repo.clone(),
+                        client: self.client.clone(),
+                        url: self.item.url.clone(),
+                        headers: self.item.headers.clone(),
+                        path: incomplete_path.clone(),
+                        part,
+                        cancellation: cancellation.clone(),
+                        progress_interval: self.config.progress_interval,
+                        speed_limiter: speed_limiter.clone(),
+                        live_progress: self.live_progress.clone(),
+                        control_rx,
+                        active_state,
+                    };
+                    workers.spawn(async move {
+                        let outcome = part_worker(request).await;
+                        (part_index, outcome)
+                    });
+                    continue;
+                }
+
+                if workers.len() < limit {
+                    let child = request_inflight_split(
+                        &worker_controls,
+                        &self.part_repo,
                         &mut next_part_index,
                         self.config.min_part_size,
                         now_ms()?,
-                    )?
-                {
-                    self.part_repo
-                        .set_many(&[parent.clone(), child.clone()])
-                        .await?;
-                    pending.push_back(parent);
-                    pending.push_back(child);
-                    continue;
+                        cancellation,
+                    )
+                    .await?;
+                    if let Some(child) = child {
+                        pending.push_back(child);
+                        continue;
+                    }
                 }
-                let Some(part) = pending.pop_front() else {
-                    break;
-                };
-                workers.spawn(part_worker(PartWorkerRequest {
-                    part_repo: self.part_repo.clone(),
-                    client: self.client.clone(),
-                    url: self.item.url.clone(),
-                    headers: self.item.headers.clone(),
-                    path: incomplete_path.clone(),
-                    part,
-                    cancellation: cancellation.clone(),
-                    progress_interval: self.config.progress_interval,
-                    speed_limiter: speed_limiter.clone(),
-                    live_progress: self.live_progress.clone(),
-                }));
+
+                break;
             }
 
             if workers.is_empty() {
                 break;
             }
 
-            let outcome = workers
-                .join_next()
-                .await
-                .ok_or(HttpDownloadJobError::ResumeUnsupported)???;
+            let joined =
+                if workers.len() < limit && pending.is_empty() && !worker_controls.is_empty() {
+                    tokio::select! {
+                        () = tokio::time::sleep(SPLIT_RETRY_INTERVAL) => continue,
+                        joined = workers.join_next() => joined,
+                    }
+                } else {
+                    workers.join_next().await
+                };
+            let (part_index, outcome) = joined.ok_or(HttpDownloadJobError::ResumeUnsupported)??;
+            let outcome = outcome?;
+            worker_controls.remove(&part_index);
             match outcome {
                 PartWorkerOutcome::Completed => {}
                 PartWorkerOutcome::Canceled => {
@@ -916,42 +947,70 @@ fn next_part_index(parts: &[DownloadPart]) -> u32 {
         .saturating_add(1)
 }
 
-fn split_largest_pending_part(
-    pending: &mut std::collections::VecDeque<DownloadPart>,
+async fn request_inflight_split(
+    worker_controls: &std::collections::HashMap<u32, ActivePartControl>,
+    part_repo: &PartRepository,
     next_part_index: &mut u32,
     min_part_size: Bytes,
     now_ms: i64,
-) -> HttpDownloadJobResult<Option<(DownloadPart, DownloadPart)>> {
-    let min_split_size = min_part_size.get().max(1).saturating_mul(2);
-    let Some((position, remaining)) = pending
-        .iter()
-        .enumerate()
-        .filter_map(|(position, part)| {
-            remaining_part_bytes(part).map(|remaining| (position, remaining))
-        })
-        .filter(|(_, remaining)| *remaining >= min_split_size)
-        .max_by_key(|(_, remaining)| *remaining)
-    else {
-        return Ok(None);
-    };
-    let Some(part) = pending.remove(position) else {
-        return Ok(None);
-    };
-    let split_start = part
-        .current_byte
-        .get()
-        .checked_add(remaining / 2)
-        .map(Bytes::new)
-        .ok_or(HttpDownloadJobError::ByteCountOverflow)?;
-    let (parent, child) = split_part_at(&part, *next_part_index, split_start, now_ms)?;
-    *next_part_index = next_part_index.saturating_add(1);
-    Ok(Some((parent, child)))
-}
+    cancellation: &CancellationToken,
+) -> HttpDownloadJobResult<Option<DownloadPart>> {
+    let mut candidates = worker_controls.values().collect::<Vec<_>>();
+    candidates.sort_by_key(|control| std::cmp::Reverse(control.state.snapshot().remaining));
 
-fn remaining_part_bytes(part: &DownloadPart) -> Option<u64> {
-    let end = part.end_byte?;
-    let exclusive_end = end.get().checked_add(1)?;
-    exclusive_end.checked_sub(part.current_byte.get())
+    for control in candidates {
+        if control.state.snapshot().remaining < min_part_size.get().max(1).saturating_mul(2) {
+            continue;
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if control
+            .tx
+            .try_send(PartWorkerControl::RequestSplit {
+                child_index: *next_part_index,
+                min_part_size,
+                now_ms,
+                reply_tx,
+            })
+            .is_err()
+        {
+            continue;
+        }
+
+        let proposal = tokio::select! {
+            _ = cancellation.cancelled() => return Ok(None),
+            () = tokio::time::sleep(SPLIT_REPLY_TIMEOUT) => continue,
+            proposal = reply_rx => proposal,
+        };
+        let PartSplitResponse::Proposed {
+            parent,
+            child,
+            commit_tx,
+        } = (match proposal {
+            Ok(response) => response,
+            Err(_) => continue,
+        })
+        else {
+            continue;
+        };
+
+        if let Err(error) = part_repo.set_many(&[parent.clone(), child.clone()]).await {
+            let _ = commit_tx.send(false);
+            return Err(error.into());
+        }
+        *next_part_index = next_part_index.saturating_add(1);
+
+        if commit_tx.send(true).is_err() {
+            tracing::warn!(
+                part_index = parent.index,
+                child_index = child.index,
+                "in-flight split committed but worker ack failed; child left persisted for resume"
+            );
+            return Ok(None);
+        }
+        return Ok(Some(child));
+    }
+
+    Ok(None)
 }
 
 fn probe_error_requires_manual_action(error: &crate::download::HttpProbeError) -> bool {
@@ -1057,6 +1116,52 @@ fn is_cross_device_error(error: &std::io::Error) -> bool {
             .contains("cross-device")
 }
 
+#[derive(Debug, Clone)]
+struct ActivePartControl {
+    tx: mpsc::Sender<PartWorkerControl>,
+    state: Arc<ActivePartState>,
+}
+
+#[derive(Debug)]
+struct ActivePartState {
+    current_byte: AtomicU64,
+    target_end: AtomicU64,
+}
+
+impl ActivePartState {
+    fn new(part: &DownloadPart) -> Self {
+        Self {
+            current_byte: AtomicU64::new(part.current_byte.get()),
+            target_end: AtomicU64::new(part.end_byte.map(Bytes::get).unwrap_or(0)),
+        }
+    }
+
+    fn set_current(&self, current_byte: Bytes) {
+        self.current_byte
+            .store(current_byte.get(), Ordering::Relaxed);
+    }
+
+    fn set_target_end(&self, target_end: Bytes) {
+        self.target_end.store(target_end.get(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ActivePartSnapshot {
+        let current = self.current_byte.load(Ordering::Relaxed);
+        let target_end = self.target_end.load(Ordering::Relaxed);
+        ActivePartSnapshot {
+            remaining: target_end
+                .checked_add(1)
+                .and_then(|exclusive_end| exclusive_end.checked_sub(current))
+                .unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActivePartSnapshot {
+    remaining: u64,
+}
+
 #[derive(Debug)]
 struct PartWorkerRequest {
     part_repo: PartRepository,
@@ -1069,6 +1174,28 @@ struct PartWorkerRequest {
     progress_interval: Duration,
     speed_limiter: Option<Arc<SpeedLimiter>>,
     live_progress: Option<Arc<LiveDownloadProgress>>,
+    control_rx: mpsc::Receiver<PartWorkerControl>,
+    active_state: Arc<ActivePartState>,
+}
+
+#[derive(Debug)]
+enum PartWorkerControl {
+    RequestSplit {
+        child_index: u32,
+        min_part_size: Bytes,
+        now_ms: i64,
+        reply_tx: oneshot::Sender<PartSplitResponse>,
+    },
+}
+
+#[derive(Debug)]
+enum PartSplitResponse {
+    Proposed {
+        parent: DownloadPart,
+        child: DownloadPart,
+        commit_tx: oneshot::Sender<bool>,
+    },
+    Rejected,
 }
 
 #[derive(Debug)]
@@ -1111,11 +1238,13 @@ async fn part_worker_inner(
         .map_err(|error| worker_failure(&request.part, error.into()))?;
 
     let start = request.part.current_byte.get();
-    let end = request
+    let mut target_end = request
         .part
         .end_byte
         .ok_or_else(|| worker_failure(&request.part, HttpDownloadJobError::ResumeUnsupported))?
         .get();
+    request.active_state.set_current(request.part.current_byte);
+    request.active_state.set_target_end(Bytes::new(target_end));
     let mut response = request
         .client
         .client()
@@ -1124,7 +1253,7 @@ async fn part_worker_inner(
             request_headers(&request.headers)
                 .map_err(|error| worker_failure(&request.part, error))?,
         )
-        .header(header::RANGE, format!("bytes={start}-{end}"))
+        .header(header::RANGE, format!("bytes={start}-{target_end}"))
         .send()
         .await
         .map_err(|error| worker_failure(&request.part, error.into()))?;
@@ -1167,21 +1296,37 @@ async fn part_worker_inner(
                 request.part_repo.set(&request.part).await.map_err(|error| worker_failure(&request.part, error.into()))?;
                 return Ok(PartWorkerOutcome::Canceled);
             }
+            control = request.control_rx.recv() => {
+                if let Some(control) = control {
+                    handle_part_worker_control(&mut request.part, &mut target_end, control, &request.cancellation).await;
+                    request.active_state.set_target_end(Bytes::new(target_end));
+                }
+            }
             chunk = response.chunk() => {
                 let Some(chunk) = chunk.map_err(|error| worker_failure(&request.part, error.into()))? else {
                     break;
                 };
                 let chunk_len = u64::try_from(chunk.len()).map_err(|_| worker_failure(&request.part, HttpDownloadJobError::ByteCountOverflow))?;
-                if let Some(limiter) = &request.speed_limiter {
-                    limiter.acquire(chunk_len).await;
+                let writable_len = writable_chunk_len(request.part.current_byte.get(), target_end, chunk_len)
+                    .map_err(|error| worker_failure(&request.part, error))?;
+                if writable_len == 0 {
+                    break;
                 }
-                file.write_all(&chunk).await.map_err(|error| worker_failure(&request.part, error.into()))?;
+                if let Some(limiter) = &request.speed_limiter {
+                    limiter.acquire(writable_len).await;
+                }
+                let writable_len = usize::try_from(writable_len).map_err(|_| worker_failure(&request.part, HttpDownloadJobError::ByteCountOverflow))?;
+                file.write_all(&chunk[..writable_len]).await.map_err(|error| worker_failure(&request.part, error.into()))?;
                 let current = request.part.current_byte.get()
-                    .checked_add(chunk_len)
+                    .checked_add(u64::try_from(writable_len).map_err(|_| worker_failure(&request.part, HttpDownloadJobError::ByteCountOverflow))?)
                     .ok_or_else(|| worker_failure(&request.part, HttpDownloadJobError::ByteCountOverflow))?;
                 request.part.current_byte = Bytes::new(current);
+                request.active_state.set_current(request.part.current_byte);
                 if let Some(live_progress) = &request.live_progress {
-                    live_progress.add_downloaded(chunk_len);
+                    live_progress.add_downloaded(u64::try_from(writable_len).map_err(|_| worker_failure(&request.part, HttpDownloadJobError::ByteCountOverflow))?);
+                }
+                if current == target_end.saturating_add(1) {
+                    break;
                 }
                 if last_persisted.elapsed() >= request.progress_interval {
                     request.part.updated_at = now_ms().map_err(|error| worker_failure(&request.part, error))?;
@@ -1203,6 +1348,86 @@ async fn part_worker_inner(
         .await
         .map_err(|error| worker_failure(&request.part, error.into()))?;
     Ok(PartWorkerOutcome::Completed)
+}
+
+async fn handle_part_worker_control(
+    part: &mut DownloadPart,
+    target_end: &mut u64,
+    control: PartWorkerControl,
+    cancellation: &CancellationToken,
+) {
+    let PartWorkerControl::RequestSplit {
+        child_index,
+        min_part_size,
+        now_ms,
+        reply_tx,
+    } = control;
+
+    let Some(split_start) =
+        valid_inflight_split_start(part.current_byte, *target_end, min_part_size)
+    else {
+        let _ = reply_tx.send(PartSplitResponse::Rejected);
+        return;
+    };
+
+    let Ok((mut parent, child)) = split_part_at(part, child_index, split_start, now_ms) else {
+        let _ = reply_tx.send(PartSplitResponse::Rejected);
+        return;
+    };
+    parent.status = PartStatus::Receiving;
+    let Some(parent_end) = parent.end_byte else {
+        let _ = reply_tx.send(PartSplitResponse::Rejected);
+        return;
+    };
+    let (commit_tx, commit_rx) = oneshot::channel();
+    if reply_tx
+        .send(PartSplitResponse::Proposed {
+            parent,
+            child,
+            commit_tx,
+        })
+        .is_err()
+    {
+        return;
+    }
+
+    let committed = tokio::select! {
+        _ = cancellation.cancelled() => false,
+        committed = commit_rx => committed.unwrap_or(false),
+    };
+    if committed {
+        part.end_byte = Some(parent_end);
+        part.updated_at = now_ms;
+        *target_end = parent_end.get();
+    }
+}
+
+fn valid_inflight_split_start(
+    current_byte: Bytes,
+    target_end: u64,
+    min_part_size: Bytes,
+) -> Option<Bytes> {
+    let exclusive_end = target_end.checked_add(1)?;
+    let remaining = exclusive_end.checked_sub(current_byte.get())?;
+    if remaining < min_part_size.get().max(1).saturating_mul(2) {
+        return None;
+    }
+    current_byte
+        .get()
+        .checked_add(remaining / 2)
+        .map(Bytes::new)
+}
+
+fn writable_chunk_len(
+    current_byte: u64,
+    target_end: u64,
+    chunk_len: u64,
+) -> HttpDownloadJobResult<u64> {
+    let exclusive_end = target_end
+        .checked_add(1)
+        .ok_or(HttpDownloadJobError::ByteCountOverflow)?;
+    let remaining = exclusive_end.saturating_sub(current_byte);
+    Ok(chunk_len.min(remaining))
 }
 
 fn worker_failure(part: &DownloadPart, error: HttpDownloadJobError) -> Box<PartWorkerFailure> {
@@ -1491,6 +1716,40 @@ mod tests {
         }
     }
 
+    fn assert_contiguous_completed_ranges(parts: &[DownloadPart], total_len: u64) {
+        let mut parts = parts.to_vec();
+        parts.sort_by_key(|part| part.start_byte);
+        let mut next_start = 0;
+        for part in &parts {
+            assert_eq!(part.start_byte, Bytes::new(next_start));
+            let end = match part.end_byte {
+                Some(end) => end,
+                None => panic!("test ranged part must have end byte"),
+            };
+            assert_eq!(part.current_byte, Bytes::new(end.get().saturating_add(1)));
+            assert_eq!(part.status, PartStatus::Completed);
+            next_start = end.get().saturating_add(1);
+        }
+        assert_eq!(next_start, total_len);
+    }
+
+    fn assert_contiguous_part_ranges(parts: &[DownloadPart], total_len: u64) {
+        let mut parts = parts.to_vec();
+        parts.sort_by_key(|part| part.start_byte);
+        let mut next_start = 0;
+        for part in &parts {
+            assert_eq!(part.start_byte, Bytes::new(next_start));
+            let end = match part.end_byte {
+                Some(end) => end,
+                None => panic!("test ranged part must have end byte"),
+            };
+            assert!(part.current_byte >= part.start_byte);
+            assert!(part.current_byte.get() <= end.get().saturating_add(1));
+            next_start = end.get().saturating_add(1);
+        }
+        assert_eq!(next_start, total_len);
+    }
+
     fn sample_item(url: String, folder: PathBuf, downloaded: u64) -> DownloadItem {
         DownloadItem {
             id: crate::download::DownloadId::new(1),
@@ -1750,6 +2009,338 @@ mod tests {
                 .all(|part| part.status == PartStatus::Completed)
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_job_should_split_active_worker_in_flight() -> HttpDownloadJobResult<()> {
+        let completed_len = 1024 * 1024;
+        let total_len = 8 * 1024 * 1024;
+        let body = (0..=255).cycle().take(total_len).collect::<Vec<u8>>();
+        let server = TestServer::spawn(body.clone(), true, true).await?;
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let mut item = sample_item(
+            server.url(),
+            folder.path().to_path_buf(),
+            completed_len as u64,
+        );
+        item.preferred_connections = Some(four_connections());
+        item.total_bytes = Some(Bytes::new(total_len as u64));
+        item.etag = Some("\"job-etag\"".to_owned());
+        db.download_repo.add(&item).await?;
+        let now = now_ms()?;
+        let parts = vec![
+            DownloadPart {
+                id: PartId::new(65_537),
+                download_id: item.id,
+                index: 0,
+                start_byte: Bytes::ZERO,
+                end_byte: Some(Bytes::new(completed_len as u64 - 1)),
+                current_byte: Bytes::new(completed_len as u64),
+                status: PartStatus::Completed,
+                retry_count: 0,
+                updated_at: now,
+            },
+            DownloadPart {
+                id: PartId::new(65_538),
+                download_id: item.id,
+                index: 1,
+                start_byte: Bytes::new(completed_len as u64),
+                end_byte: Some(Bytes::new(total_len as u64 - 1)),
+                current_byte: Bytes::new(completed_len as u64),
+                status: PartStatus::Idle,
+                retry_count: 0,
+                updated_at: now,
+            },
+        ];
+        db.part_repo.set_for_download(item.id, &parts).await?;
+        let mut partial = vec![0_u8; total_len];
+        partial[..completed_len].copy_from_slice(&body[..completed_len]);
+        fs::write(folder.path().join("file.bin.raijin-part"), partial).await?;
+        let mut job = HttpDownloadJob::new(
+            db.download_repo.clone(),
+            db.part_repo.clone(),
+            ReqwestHttpClient::new()?,
+            item.clone(),
+        );
+        job.config.min_part_size = Bytes::new(1024 * 1024);
+
+        let completed = job.run(CancellationToken::new()).await?;
+        let final_bytes = fs::read(folder.path().join("file.bin")).await?;
+        let persisted_parts = db.part_repo.list_for_download(item.id).await?;
+
+        assert_eq!(completed.status, DownloadStatus::Completed);
+        assert_eq!(final_bytes, body);
+        assert!(persisted_parts.len() > parts.len());
+        assert_contiguous_completed_ranges(&persisted_parts, total_len as u64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_job_should_pause_cleanly_after_inflight_split_cancellation()
+    -> HttpDownloadJobResult<()> {
+        let completed_len = 1024 * 1024;
+        let total_len = 8 * 1024 * 1024;
+        let body = (0..=255).cycle().take(total_len).collect::<Vec<u8>>();
+        let server = TestServer::spawn(body.clone(), true, true).await?;
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let mut item = sample_item(
+            server.url(),
+            folder.path().to_path_buf(),
+            completed_len as u64,
+        );
+        item.preferred_connections = Some(four_connections());
+        item.total_bytes = Some(Bytes::new(total_len as u64));
+        item.etag = Some("\"job-etag\"".to_owned());
+        db.download_repo.add(&item).await?;
+        let now = now_ms()?;
+        let parts = vec![
+            DownloadPart {
+                id: PartId::new(65_537),
+                download_id: item.id,
+                index: 0,
+                start_byte: Bytes::ZERO,
+                end_byte: Some(Bytes::new(completed_len as u64 - 1)),
+                current_byte: Bytes::new(completed_len as u64),
+                status: PartStatus::Completed,
+                retry_count: 0,
+                updated_at: now,
+            },
+            DownloadPart {
+                id: PartId::new(65_538),
+                download_id: item.id,
+                index: 1,
+                start_byte: Bytes::new(completed_len as u64),
+                end_byte: Some(Bytes::new(total_len as u64 - 1)),
+                current_byte: Bytes::new(completed_len as u64),
+                status: PartStatus::Idle,
+                retry_count: 0,
+                updated_at: now,
+            },
+        ];
+        db.part_repo.set_for_download(item.id, &parts).await?;
+        let mut partial = vec![0_u8; total_len];
+        partial[..completed_len].copy_from_slice(&body[..completed_len]);
+        fs::write(folder.path().join("file.bin.raijin-part"), partial).await?;
+        let cancellation = CancellationToken::new();
+        let mut job = HttpDownloadJob::new(
+            db.download_repo.clone(),
+            db.part_repo.clone(),
+            ReqwestHttpClient::new()?,
+            item.clone(),
+        );
+        job.config.min_part_size = Bytes::new(1024 * 1024);
+        let cancel_clone = cancellation.clone();
+
+        let task = tokio::spawn(async move { job.run(cancellation).await });
+        let mut saw_split = false;
+        for _ in 0..100 {
+            if db.part_repo.list_for_download(item.id).await?.len() > parts.len() {
+                saw_split = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(saw_split);
+        cancel_clone.cancel();
+        let paused = task.await.map_err(HttpDownloadJobError::WorkerJoin)??;
+        let persisted = db
+            .download_repo
+            .get(item.id)
+            .await?
+            .ok_or(DbError::NotFound {
+                entity: "download",
+                id: item.id.get(),
+            })?;
+        let persisted_parts = db.part_repo.list_for_download(item.id).await?;
+
+        assert_eq!(paused.status, DownloadStatus::Paused);
+        assert_eq!(persisted.status, DownloadStatus::Paused);
+        assert_contiguous_part_ranges(&persisted_parts, total_len as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn inflight_split_should_reject_when_remaining_is_too_small() {
+        let split = valid_inflight_split_start(Bytes::new(900), 999, Bytes::new(128));
+
+        assert_eq!(split, None);
+    }
+
+    #[test]
+    fn inflight_split_should_reject_stale_split_point() {
+        let part = DownloadPart {
+            id: PartId::new(65_538),
+            download_id: crate::download::DownloadId::new(1),
+            index: 1,
+            start_byte: Bytes::ZERO,
+            end_byte: Some(Bytes::new(999)),
+            current_byte: Bytes::new(700),
+            status: PartStatus::Receiving,
+            retry_count: 0,
+            updated_at: 1,
+        };
+
+        let split = split_part_at(&part, 2, Bytes::new(600), 2);
+
+        assert!(split.is_err());
+    }
+
+    #[tokio::test]
+    async fn split_commit_failure_should_leave_worker_target_unchanged() {
+        let mut part = DownloadPart {
+            id: PartId::new(65_538),
+            download_id: crate::download::DownloadId::new(1),
+            index: 1,
+            start_byte: Bytes::ZERO,
+            end_byte: Some(Bytes::new(999)),
+            current_byte: Bytes::new(100),
+            status: PartStatus::Receiving,
+            retry_count: 0,
+            updated_at: 1,
+        };
+        let mut target_end = 999;
+        let cancellation = CancellationToken::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let control = PartWorkerControl::RequestSplit {
+            child_index: 2,
+            min_part_size: Bytes::new(128),
+            now_ms: 2,
+            reply_tx,
+        };
+
+        let (_, proposed) = tokio::join!(
+            handle_part_worker_control(&mut part, &mut target_end, control, &cancellation),
+            async move {
+                if let Ok(PartSplitResponse::Proposed { commit_tx, .. }) = reply_rx.await {
+                    let _ = commit_tx.send(false);
+                    true
+                } else {
+                    false
+                }
+            }
+        );
+
+        assert!(proposed);
+        assert_eq!(part.end_byte, Some(Bytes::new(999)));
+        assert_eq!(target_end, 999);
+    }
+
+    #[tokio::test]
+    async fn split_ack_failure_should_not_return_live_child() -> HttpDownloadJobResult<()> {
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let item = sample_item(
+            "http://127.0.0.1/file.bin".to_owned(),
+            folder.path().to_path_buf(),
+            0,
+        );
+        db.download_repo.add(&item).await?;
+        let part = DownloadPart {
+            id: PartId::new(65_538),
+            download_id: item.id,
+            index: 1,
+            start_byte: Bytes::ZERO,
+            end_byte: Some(Bytes::new(999)),
+            current_byte: Bytes::ZERO,
+            status: PartStatus::Receiving,
+            retry_count: 0,
+            updated_at: 1,
+        };
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let mut controls = std::collections::HashMap::new();
+        controls.insert(
+            part.index,
+            ActivePartControl {
+                tx: control_tx,
+                state: Arc::new(ActivePartState::new(&part)),
+            },
+        );
+        let worker_part = part.clone();
+        let worker = tokio::spawn(async move {
+            let Some(PartWorkerControl::RequestSplit {
+                child_index,
+                min_part_size: _,
+                now_ms,
+                reply_tx,
+            }) = control_rx.recv().await
+            else {
+                return;
+            };
+            let (parent, child) =
+                match split_part_at(&worker_part, child_index, Bytes::new(500), now_ms) {
+                    Ok(parts) => parts,
+                    Err(_) => return,
+                };
+            let (commit_tx, commit_rx) = oneshot::channel();
+            let _ = reply_tx.send(PartSplitResponse::Proposed {
+                parent,
+                child,
+                commit_tx,
+            });
+            drop(commit_rx);
+        });
+        let mut next_part_index = 2;
+
+        let child = request_inflight_split(
+            &controls,
+            &db.part_repo,
+            &mut next_part_index,
+            Bytes::new(128),
+            2,
+            &CancellationToken::new(),
+        )
+        .await?;
+        worker.await.map_err(HttpDownloadJobError::WorkerJoin)?;
+        let persisted = db.part_repo.list_for_download(item.id).await?;
+
+        assert_eq!(child, None);
+        assert_eq!(next_part_index, 3);
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[0].start_byte, Bytes::ZERO);
+        assert_eq!(persisted[0].end_byte, Some(Bytes::new(499)));
+        assert_eq!(persisted[1].start_byte, Bytes::new(500));
+        assert_eq!(persisted[1].end_byte, Some(Bytes::new(999)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_split_negotiation_should_keep_target_unchanged() {
+        let mut part = DownloadPart {
+            id: PartId::new(65_538),
+            download_id: crate::download::DownloadId::new(1),
+            index: 1,
+            start_byte: Bytes::ZERO,
+            end_byte: Some(Bytes::new(999)),
+            current_byte: Bytes::new(100),
+            status: PartStatus::Receiving,
+            retry_count: 0,
+            updated_at: 1,
+        };
+        let mut target_end = 999;
+        let cancellation = CancellationToken::new();
+        let cancel_clone = cancellation.clone();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let control = PartWorkerControl::RequestSplit {
+            child_index: 2,
+            min_part_size: Bytes::new(128),
+            now_ms: 2,
+            reply_tx,
+        };
+
+        let (_, proposed) = tokio::join!(
+            handle_part_worker_control(&mut part, &mut target_end, control, &cancellation),
+            async move {
+                let proposed = matches!(reply_rx.await, Ok(PartSplitResponse::Proposed { .. }));
+                cancel_clone.cancel();
+                proposed
+            }
+        );
+
+        assert!(proposed);
+        assert_eq!(part.end_byte, Some(Bytes::new(999)));
+        assert_eq!(target_end, 999);
     }
 
     #[tokio::test]

@@ -1,6 +1,8 @@
 use std::io::SeekFrom;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::StatusCode;
@@ -12,6 +14,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{DbError, DownloadRepository, PartRepository};
+use crate::download::part::split_part_at;
+use crate::download::speed::SpeedLimiter;
 use crate::download::{
     Bytes, DownloadFailure, DownloadItem, DownloadPart, DownloadStatus, FailureKind, PartId,
     PartStatus, ProbeRequest, ReqwestHttpClient, ResumeSupport, ResumeValidation, probe_http,
@@ -23,6 +27,79 @@ const SINGLE_PART_INDEX: u32 = 0;
 
 /// Result type returned by single-connection HTTP jobs.
 pub type HttpDownloadJobResult<T> = Result<T, HttpDownloadJobError>;
+
+#[derive(Debug, Default)]
+pub(crate) struct LiveDownloadProgress {
+    downloaded_bytes: AtomicU64,
+    active_part_count: AtomicU16,
+}
+
+impl LiveDownloadProgress {
+    pub(crate) fn new(downloaded_bytes: Bytes) -> Self {
+        Self {
+            downloaded_bytes: AtomicU64::new(downloaded_bytes.get()),
+            active_part_count: AtomicU16::new(0),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> (Bytes, u16) {
+        (
+            Bytes::new(self.downloaded_bytes.load(Ordering::Relaxed)),
+            self.active_part_count.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn clear_active_parts(&self) {
+        self.active_part_count.store(0, Ordering::Relaxed);
+    }
+
+    fn set_downloaded(&self, downloaded_bytes: Bytes) {
+        self.downloaded_bytes
+            .store(downloaded_bytes.get(), Ordering::Relaxed);
+    }
+
+    fn add_downloaded(&self, bytes: u64) {
+        let _ = self
+            .downloaded_bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(bytes))
+            });
+    }
+
+    fn add_active_part(&self) {
+        let _ =
+            self.active_part_count
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_add(1))
+                });
+    }
+
+    fn remove_active_part(&self) {
+        let _ =
+            self.active_part_count
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(1))
+                });
+    }
+}
+
+#[derive(Debug)]
+struct ActivePartGuard {
+    live_progress: Arc<LiveDownloadProgress>,
+}
+
+impl ActivePartGuard {
+    fn new(live_progress: Arc<LiveDownloadProgress>) -> Self {
+        live_progress.add_active_part();
+        Self { live_progress }
+    }
+}
+
+impl Drop for ActivePartGuard {
+    fn drop(&mut self) {
+        self.live_progress.remove_active_part();
+    }
+}
 
 /// Errors returned by single-connection HTTP jobs.
 #[derive(Debug, Error)]
@@ -75,6 +152,9 @@ pub enum HttpDownloadJobError {
     /// Destination file already exists and could not be disambiguated.
     #[error("destination file conflict for `{0}`")]
     DestinationConflict(String),
+    /// Retry policy was exhausted.
+    #[error("too many retries: {0}")]
+    TooManyRetries(String),
 }
 
 impl HttpDownloadJobError {
@@ -108,6 +188,7 @@ pub struct HttpDownloadJob {
     client: ReqwestHttpClient,
     item: DownloadItem,
     config: HttpDownloadJobConfig,
+    live_progress: Option<Arc<LiveDownloadProgress>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +226,13 @@ impl HttpDownloadJob {
             client,
             item,
             config: HttpDownloadJobConfig::default(),
+            live_progress: None,
         }
+    }
+
+    pub(crate) fn with_live_progress(mut self, live_progress: Arc<LiveDownloadProgress>) -> Self {
+        self.live_progress = Some(live_progress);
+        self
     }
 
     /// Runs the job until completion, cancellation, or error.
@@ -157,7 +244,27 @@ impl HttpDownloadJob {
         mut self,
         cancellation: CancellationToken,
     ) -> HttpDownloadJobResult<DownloadItem> {
-        let result = self.run_inner(&cancellation).await;
+        let mut attempts = 0_u32;
+        let result = loop {
+            let result = self.run_inner(&cancellation).await;
+            match result {
+                Err(error)
+                    if !cancellation.is_cancelled()
+                        && !error.requires_manual_action()
+                        && attempts < self.config.max_retries =>
+                {
+                    attempts += 1;
+                    tracing::debug!(
+                        download_id = self.item.id.get(),
+                        attempts,
+                        ?error,
+                        "retrying failed download job"
+                    );
+                    sleep_retry_delay(attempts, &cancellation).await?;
+                }
+                result => break result,
+            }
+        };
         match result {
             Ok(item) => Ok(item),
             Err(_) if cancellation.is_cancelled() => {
@@ -212,6 +319,10 @@ impl HttpDownloadJob {
 
         let mut part = self.part_for_resume(resume_from).await?;
         self.persist_started(&mut part, resume_from).await?;
+        if let Some(live_progress) = &self.live_progress {
+            live_progress.set_downloaded(Bytes::new(resume_from));
+            live_progress.add_active_part();
+        }
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -225,6 +336,7 @@ impl HttpDownloadJob {
 
         let mut downloaded = resume_from;
         let mut last_persisted = tokio::time::Instant::now();
+        let speed_limiter = self.item.speed_limit.and_then(SpeedLimiter::new);
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => {
@@ -235,12 +347,19 @@ impl HttpDownloadJob {
                     let Some(chunk) = chunk? else {
                         break;
                     };
+                    let chunk_len = u64::try_from(chunk.len()).map_err(|_| HttpDownloadJobError::ByteCountOverflow)?;
+                    if let Some(limiter) = &speed_limiter {
+                        limiter.acquire(chunk_len).await;
+                    }
                     file.write_all(&chunk).await?;
                     downloaded = downloaded
-                        .checked_add(u64::try_from(chunk.len()).map_err(|_| HttpDownloadJobError::ByteCountOverflow)?)
+                        .checked_add(chunk_len)
                         .ok_or(HttpDownloadJobError::ByteCountOverflow)?;
                     self.item.downloaded_bytes = Bytes::new(downloaded);
                     part.current_byte = Bytes::new(downloaded);
+                    if let Some(live_progress) = &self.live_progress {
+                        live_progress.set_downloaded(Bytes::new(downloaded));
+                    }
                     if last_persisted.elapsed() >= self.config.progress_interval {
                         self.persist_progress(&mut part, downloaded, DownloadStatus::Downloading, PartStatus::Receiving).await?;
                         last_persisted = tokio::time::Instant::now();
@@ -300,6 +419,9 @@ impl HttpDownloadJob {
         self.part_repo
             .set_for_download(self.item.id, &parts)
             .await?;
+        if let Some(live_progress) = &self.live_progress {
+            live_progress.set_downloaded(Bytes::new(downloaded_from_parts(&parts)));
+        }
 
         let file = OpenOptions::new()
             .create(true)
@@ -312,16 +434,33 @@ impl HttpDownloadJob {
         drop(file);
         self.persist_ranged_started(&parts).await?;
 
+        let mut next_part_index = next_part_index(&parts);
         let mut pending = parts
             .drain(..)
             .filter(|part| !part_is_complete(part))
             .collect::<std::collections::VecDeque<_>>();
         let mut workers = JoinSet::new();
         let limit = usize::from(self.preferred_connections().get());
+        let speed_limiter = self.item.speed_limit.and_then(SpeedLimiter::new);
         let mut first_error = None;
 
         loop {
             while workers.len() < limit {
+                if workers.len() + pending.len() < limit
+                    && let Some((parent, child)) = split_largest_pending_part(
+                        &mut pending,
+                        &mut next_part_index,
+                        self.config.min_part_size,
+                        now_ms()?,
+                    )?
+                {
+                    self.part_repo
+                        .set_many(&[parent.clone(), child.clone()])
+                        .await?;
+                    pending.push_back(parent);
+                    pending.push_back(child);
+                    continue;
+                }
                 let Some(part) = pending.pop_front() else {
                     break;
                 };
@@ -334,6 +473,8 @@ impl HttpDownloadJob {
                     part,
                     cancellation: cancellation.clone(),
                     progress_interval: self.config.progress_interval,
+                    speed_limiter: speed_limiter.clone(),
+                    live_progress: self.live_progress.clone(),
                 }));
             }
 
@@ -364,7 +505,10 @@ impl HttpDownloadJob {
                         self.part_repo.set(&part).await?;
                         pending.push_back(part);
                     } else {
-                        first_error = Some(error);
+                        first_error = Some(HttpDownloadJobError::TooManyRetries(format!(
+                            "part `{}` failed after {} retries: {error}",
+                            part.index, self.config.max_retries
+                        )));
                         workers.abort_all();
                         break;
                     }
@@ -747,7 +891,67 @@ fn failure_kind(error: &HttpDownloadJobError) -> FailureKind {
         | HttpDownloadJobError::WorkerJoin(_) => FailureKind::Disk,
         HttpDownloadJobError::InvalidPartContentRange { .. } => FailureKind::Validation,
         HttpDownloadJobError::DestinationConflict(_) => FailureKind::Disk,
+        HttpDownloadJobError::TooManyRetries(_) => FailureKind::TooManyRetries,
     }
+}
+
+async fn sleep_retry_delay(
+    attempts: u32,
+    cancellation: &CancellationToken,
+) -> HttpDownloadJobResult<()> {
+    let capped = attempts.min(5);
+    let delay = Duration::from_millis(100 * 2_u64.pow(capped));
+    tokio::select! {
+        _ = cancellation.cancelled() => Ok(()),
+        () = tokio::time::sleep(delay) => Ok(()),
+    }
+}
+
+fn next_part_index(parts: &[DownloadPart]) -> u32 {
+    parts
+        .iter()
+        .map(|part| part.index)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+fn split_largest_pending_part(
+    pending: &mut std::collections::VecDeque<DownloadPart>,
+    next_part_index: &mut u32,
+    min_part_size: Bytes,
+    now_ms: i64,
+) -> HttpDownloadJobResult<Option<(DownloadPart, DownloadPart)>> {
+    let min_split_size = min_part_size.get().max(1).saturating_mul(2);
+    let Some((position, remaining)) = pending
+        .iter()
+        .enumerate()
+        .filter_map(|(position, part)| {
+            remaining_part_bytes(part).map(|remaining| (position, remaining))
+        })
+        .filter(|(_, remaining)| *remaining >= min_split_size)
+        .max_by_key(|(_, remaining)| *remaining)
+    else {
+        return Ok(None);
+    };
+    let Some(part) = pending.remove(position) else {
+        return Ok(None);
+    };
+    let split_start = part
+        .current_byte
+        .get()
+        .checked_add(remaining / 2)
+        .map(Bytes::new)
+        .ok_or(HttpDownloadJobError::ByteCountOverflow)?;
+    let (parent, child) = split_part_at(&part, *next_part_index, split_start, now_ms)?;
+    *next_part_index = next_part_index.saturating_add(1);
+    Ok(Some((parent, child)))
+}
+
+fn remaining_part_bytes(part: &DownloadPart) -> Option<u64> {
+    let end = part.end_byte?;
+    let exclusive_end = end.get().checked_add(1)?;
+    exclusive_end.checked_sub(part.current_byte.get())
 }
 
 fn probe_error_requires_manual_action(error: &crate::download::HttpProbeError) -> bool {
@@ -863,6 +1067,8 @@ struct PartWorkerRequest {
     part: DownloadPart,
     cancellation: CancellationToken,
     progress_interval: Duration,
+    speed_limiter: Option<Arc<SpeedLimiter>>,
+    live_progress: Option<Arc<LiveDownloadProgress>>,
 }
 
 #[derive(Debug)]
@@ -891,6 +1097,10 @@ async fn part_worker_inner(
     if part_is_complete(&request.part) {
         return Ok(PartWorkerOutcome::Completed);
     }
+    let _active_part_guard = request
+        .live_progress
+        .as_ref()
+        .map(|live_progress| ActivePartGuard::new(Arc::clone(live_progress)));
 
     request.part.status = PartStatus::Connecting;
     request.part.updated_at = now_ms().map_err(|error| worker_failure(&request.part, error))?;
@@ -961,11 +1171,18 @@ async fn part_worker_inner(
                 let Some(chunk) = chunk.map_err(|error| worker_failure(&request.part, error.into()))? else {
                     break;
                 };
+                let chunk_len = u64::try_from(chunk.len()).map_err(|_| worker_failure(&request.part, HttpDownloadJobError::ByteCountOverflow))?;
+                if let Some(limiter) = &request.speed_limiter {
+                    limiter.acquire(chunk_len).await;
+                }
                 file.write_all(&chunk).await.map_err(|error| worker_failure(&request.part, error.into()))?;
                 let current = request.part.current_byte.get()
-                    .checked_add(u64::try_from(chunk.len()).map_err(|_| worker_failure(&request.part, HttpDownloadJobError::ByteCountOverflow))?)
+                    .checked_add(chunk_len)
                     .ok_or_else(|| worker_failure(&request.part, HttpDownloadJobError::ByteCountOverflow))?;
                 request.part.current_byte = Bytes::new(current);
+                if let Some(live_progress) = &request.live_progress {
+                    live_progress.add_downloaded(chunk_len);
+                }
                 if last_persisted.elapsed() >= request.progress_interval {
                     request.part.updated_at = now_ms().map_err(|error| worker_failure(&request.part, error))?;
                     request.part_repo.set(&request.part).await.map_err(|error| worker_failure(&request.part, error.into()))?;
@@ -1051,6 +1268,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1078,6 +1296,7 @@ mod tests {
         body: Vec<u8>,
         range_supported: bool,
         slow_body: bool,
+        transient_range_failures: AtomicUsize,
     }
 
     impl TestServer {
@@ -1092,6 +1311,33 @@ mod tests {
                 body,
                 range_supported,
                 slow_body,
+                transient_range_failures: AtomicUsize::new(0),
+            });
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        let _ = handle_connection(stream, state).await;
+                    });
+                }
+            });
+            Ok(Self { addr, task })
+        }
+
+        async fn spawn_with_transient_range_failures(
+            body: Vec<u8>,
+            failures: usize,
+        ) -> std::io::Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let state = Arc::new(ServerState {
+                body,
+                range_supported: true,
+                slow_body: false,
+                transient_range_failures: AtomicUsize::new(failures),
             });
             let task = tokio::spawn(async move {
                 loop {
@@ -1199,6 +1445,18 @@ mod tests {
             && let Ok(start) = usize::try_from(range.start)
             && start < total
         {
+            if !is_probe_range(range)
+                && state
+                    .transient_range_failures
+                    .try_update(
+                        AtomicOrdering::Relaxed,
+                        AtomicOrdering::Relaxed,
+                        |current| current.checked_sub(1),
+                    )
+                    .is_ok()
+            {
+                return (500, "Internal Server Error", &[], None);
+            }
             let end = range
                 .end
                 .and_then(|end| usize::try_from(end).ok())
@@ -1213,6 +1471,10 @@ mod tests {
         }
 
         (200, "OK", &state.body, None)
+    }
+
+    fn is_probe_range(range: RequestedRange) -> bool {
+        range.start == 0 && range.end == Some(255)
     }
 
     fn one_connection() -> NonZeroU16 {
@@ -1417,6 +1679,95 @@ mod tests {
 
         assert_eq!(completed.status, DownloadStatus::Completed);
         assert_eq!(final_bytes, body);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_job_should_split_large_pending_parts_dynamically() -> HttpDownloadJobResult<()>
+    {
+        let completed_len = 1024 * 1024;
+        let total_len = 8 * 1024 * 1024;
+        let body = (0..=255).cycle().take(total_len).collect::<Vec<u8>>();
+        let server = TestServer::spawn(body.clone(), true, false).await?;
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let mut item = sample_item(
+            server.url(),
+            folder.path().to_path_buf(),
+            completed_len as u64,
+        );
+        item.preferred_connections = Some(four_connections());
+        item.total_bytes = Some(Bytes::new(total_len as u64));
+        item.etag = Some("\"job-etag\"".to_owned());
+        db.download_repo.add(&item).await?;
+        let now = now_ms()?;
+        let parts = vec![
+            DownloadPart {
+                id: PartId::new(65_537),
+                download_id: item.id,
+                index: 0,
+                start_byte: Bytes::ZERO,
+                end_byte: Some(Bytes::new(completed_len as u64 - 1)),
+                current_byte: Bytes::new(completed_len as u64),
+                status: PartStatus::Completed,
+                retry_count: 0,
+                updated_at: now,
+            },
+            DownloadPart {
+                id: PartId::new(65_538),
+                download_id: item.id,
+                index: 1,
+                start_byte: Bytes::new(completed_len as u64),
+                end_byte: Some(Bytes::new(total_len as u64 - 1)),
+                current_byte: Bytes::new(completed_len as u64),
+                status: PartStatus::Idle,
+                retry_count: 0,
+                updated_at: now,
+            },
+        ];
+        db.part_repo.set_for_download(item.id, &parts).await?;
+        let mut partial = vec![0_u8; total_len];
+        partial[..completed_len].copy_from_slice(&body[..completed_len]);
+        fs::write(folder.path().join("file.bin.raijin-part"), partial).await?;
+        let mut job = HttpDownloadJob::new(
+            db.download_repo.clone(),
+            db.part_repo.clone(),
+            ReqwestHttpClient::new()?,
+            item.clone(),
+        );
+        job.config.min_part_size = Bytes::new(1024 * 1024);
+
+        let completed = job.run(CancellationToken::new()).await?;
+        let final_bytes = fs::read(folder.path().join("file.bin")).await?;
+        let persisted_parts = db.part_repo.list_for_download(item.id).await?;
+
+        assert_eq!(completed.status, DownloadStatus::Completed);
+        assert_eq!(final_bytes, body);
+        assert!(persisted_parts.len() > parts.len());
+        assert!(
+            persisted_parts
+                .iter()
+                .all(|part| part.status == PartStatus::Completed)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_job_should_retry_transient_part_failures() -> HttpDownloadJobResult<()> {
+        let body = (0..=255).cycle().take(8 * 1024 * 1024).collect::<Vec<u8>>();
+        let server = TestServer::spawn_with_transient_range_failures(body.clone(), 2).await?;
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let mut item = sample_item(server.url(), folder.path().to_path_buf(), 0);
+        item.preferred_connections = Some(four_connections());
+
+        let completed = run_job(&db, item.clone(), CancellationToken::new()).await?;
+        let final_bytes = fs::read(folder.path().join("file.bin")).await?;
+        let parts = db.part_repo.list_for_download(item.id).await?;
+
+        assert_eq!(completed.status, DownloadStatus::Completed);
+        assert_eq!(final_bytes, body);
+        assert!(parts.iter().any(|part| part.retry_count > 0));
         Ok(())
     }
 

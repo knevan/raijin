@@ -3,12 +3,13 @@ use freya::prelude::*;
 
 use super::downloads_table::DownloadsTable;
 use super::services::AppServices;
-use super::sidebar::Sidebar;
+use super::sidebar::{Sidebar, SidebarFilter};
 use super::theme;
 
 pub(crate) fn root(services: AppServices) -> impl IntoElement {
     use_init_theme(theme::raijin_theme);
     use_provide_context(|| services);
+    let sidebar_filter = use_state(|| SidebarFilter::All);
 
     rect()
         .expanded()
@@ -22,12 +23,16 @@ pub(crate) fn root(services: AppServices) -> impl IntoElement {
                 .panel(
                     ResizablePanel::new(PanelSize::px(264.))
                         .min_size(230.)
-                        .child(Sidebar),
+                        .child(Sidebar {
+                            filter: sidebar_filter,
+                        }),
                 )
                 .panel(
                     ResizablePanel::new(PanelSize::percent(100.))
                         .min_size(25.)
-                        .child(DownloadsTable),
+                        .child(DownloadsTable {
+                            filter: sidebar_filter,
+                        }),
                 ),
         )
 }

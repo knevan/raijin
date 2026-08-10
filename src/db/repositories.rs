@@ -226,6 +226,20 @@ impl PartRepository {
         Ok(part.id)
     }
 
+    /// Inserts or updates several parts in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any row violates constraints.
+    pub async fn set_many(&self, parts: &[DownloadPart]) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        for part in parts {
+            upsert_part(&mut *tx, part).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Replaces every part for a download in one transaction.
     ///
     /// # Errors

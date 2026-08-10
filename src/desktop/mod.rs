@@ -12,5 +12,12 @@ pub fn run() {
     };
 
     let _runtime_guard = runtime.enter();
-    crate::ui::run();
+    let services = match runtime.block_on(crate::ui::AppServices::start()) {
+        Ok(services) => services,
+        Err(error) => {
+            eprintln!("failed to start app services: {error}");
+            return;
+        }
+    };
+    crate::ui::run(services);
 }

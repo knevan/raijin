@@ -1,19 +1,34 @@
 use std::cmp::Ordering;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use freya::animation::*;
 use freya::icons;
 use freya::prelude::*;
+use freya::winit::dpi::PhysicalPosition;
+use freya::winit::window::WindowId;
 
 use super::services::AppServices;
+use super::sidebar::SidebarFilter;
 use super::theme;
-use crate::download::{Bytes, DownloadId, DownloadStatus, NewDownload, QueueId};
+use crate::download::{
+    Bytes, DownloadId, DownloadStatus, NewDownload, ProbeRequest, QueueId, ReqwestHttpClient,
+    probe_http,
+};
 use crate::monitor::{DownloadView, MonitorState};
 
 const COLUMN_COUNT: usize = 6;
 const SELECTION_COLUMN_WIDTH: f32 = 44.;
 const ROW_HEIGHT: f32 = 52.;
 const ROW_DETAILS_HEIGHT: f32 = 48.;
+const DOWNLOAD_CATEGORIES: [DownloadCategory; 6] = [
+    DownloadCategory::Compressed,
+    DownloadCategory::Programs,
+    DownloadCategory::Videos,
+    DownloadCategory::Music,
+    DownloadCategory::Pictures,
+    DownloadCategory::Documents,
+];
 
 #[derive(Clone, PartialEq)]
 struct DownloadRowData {
@@ -25,6 +40,7 @@ struct DownloadRowData {
     speed_bps: u64,
     time_left: Option<u64>,
     date_added: String,
+    folder: PathBuf,
     progress: f32,
     connections: u16,
 }
@@ -190,7 +206,9 @@ impl SortState {
 }
 
 #[derive(PartialEq)]
-pub(crate) struct DownloadsTable;
+pub(crate) struct DownloadsTable {
+    pub(crate) filter: State<SidebarFilter>,
+}
 
 impl Component for DownloadsTable {
     fn render(&self) -> impl IntoElement {
@@ -219,8 +237,9 @@ impl Component for DownloadsTable {
             column: TableColumn::Name,
             direction: SortDirection::Ascending,
         });
+        let sidebar_filter = self.filter;
         let sorted_rows = use_memo(move || {
-            let mut rows = rows_from_state(&monitor_state.read());
+            let mut rows = filtered_rows_from_state(&monitor_state.read(), sidebar_filter());
             rows.sort_by(|a, b| sort().compare(a, b));
             rows
         });
@@ -756,10 +775,427 @@ struct NewDownloadWindow {
     services: AppServices,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadCategory {
+    Compressed,
+    Programs,
+    Videos,
+    Music,
+    Pictures,
+    Documents,
+}
+
+impl DownloadCategory {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Compressed => "Compressed",
+            Self::Programs => "Programs",
+            Self::Videos => "Videos",
+            Self::Music => "Music",
+            Self::Pictures => "Pictures",
+            Self::Documents => "Documents",
+        }
+    }
+
+    fn icon(self) -> freya::prelude::Bytes {
+        match self {
+            Self::Compressed => icons::lucide::file_archive(),
+            Self::Programs => icons::lucide::boxes(),
+            Self::Videos => icons::lucide::video(),
+            Self::Music => icons::lucide::music(),
+            Self::Pictures => icons::lucide::image(),
+            Self::Documents => icons::lucide::file_text(),
+        }
+    }
+}
+
 impl PartialEq for NewDownloadWindow {
     fn eq(&self, _other: &Self) -> bool {
         true
     }
+}
+
+fn category_toggle(
+    mut enabled: State<bool>,
+    selected_category: State<DownloadCategory>,
+    mut folder: State<String>,
+    mut dropdown_open: State<bool>,
+    mut popup_window: State<Option<WindowId>>,
+    default_folder: PathBuf,
+) -> impl IntoElement {
+    let checked = enabled();
+    rect()
+        .height(Size::px(38.))
+        .horizontal()
+        .cross_align(Alignment::Center)
+        .spacing(8.)
+        .on_press(move |_| {
+            let next = !enabled();
+            enabled.set(next);
+            dropdown_open.set(false);
+            if let Some(window_id) = popup_window() {
+                Platform::get().close_window(window_id);
+                popup_window.set(None);
+            }
+            let next_folder = if next {
+                category_folder(&default_folder, selected_category())
+            } else {
+                default_folder.clone()
+            };
+            folder.set(next_folder.to_string_lossy().into_owned());
+        })
+        .child(
+            rect()
+                .width(Size::px(18.))
+                .height(Size::px(18.))
+                .corner_radius(5.)
+                .center()
+                .background(if checked {
+                    theme::ACCENT
+                } else {
+                    Color::TRANSPARENT
+                })
+                .border(Border::new().width(1.3).fill(if checked {
+                    theme::ACCENT
+                } else {
+                    theme::BORDER
+                }))
+                .maybe(checked, |el| {
+                    el.child(
+                        SvgViewer::new(icons::lucide::check())
+                            .width(Size::px(13.))
+                            .height(Size::px(13.))
+                            .stroke_width(3.)
+                            .color(theme::RAIJIN_BACKGROUND),
+                    )
+                }),
+        )
+        .child(
+            label()
+                .text("Use Category")
+                .font_size(14.)
+                .color(theme::TEXT_PRIMARY),
+        )
+}
+
+fn category_dropdown(
+    selected_category: State<DownloadCategory>,
+    mut open: State<bool>,
+    mut popup_window: State<Option<WindowId>>,
+    use_category: State<bool>,
+    mut folder: State<String>,
+    default_folder: PathBuf,
+) -> impl IntoElement {
+    let category = selected_category();
+    let enabled = use_category();
+    rect()
+        .height(Size::px(38.))
+        .width(Size::px(235.))
+        .horizontal()
+        .cross_align(Alignment::Center)
+        .spacing(10.)
+        .padding(Gaps::new(0., 30., 0., 12.))
+        .corner_radius(8.)
+        .background(theme::SURFACE)
+        .border(Border::new().width(1.).fill(theme::BORDER))
+        .maybe(enabled, |el| {
+            el.on_press(move |_| {
+                if folder.read().trim().is_empty() {
+                    folder.set(
+                        category_folder(&default_folder, category)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                if let Some(window_id) = popup_window() {
+                    Platform::get().close_window(window_id);
+                    popup_window.set(None);
+                    open.set(false);
+                    return;
+                }
+                open.set(true);
+                open_category_menu_window(
+                    selected_category,
+                    open,
+                    popup_window,
+                    folder,
+                    default_folder.clone(),
+                );
+            })
+        })
+        .child(
+            SvgViewer::new(category.icon())
+                .width(Size::px(17.))
+                .height(Size::px(17.))
+                .color(if enabled {
+                    theme::TEXT_PRIMARY
+                } else {
+                    theme::TEXT_SUBTLE
+                }),
+        )
+        .child(
+            label()
+                .text(category.label())
+                .font_size(14.)
+                .color(if enabled {
+                    theme::TEXT_PRIMARY
+                } else {
+                    theme::TEXT_SUBTLE
+                })
+                .width(Size::fill()),
+        )
+        .child(
+            SvgViewer::new(icons::lucide::chevron_down())
+                .width(Size::px(16.))
+                .height(Size::px(16.))
+                .color(if enabled {
+                    theme::TEXT_MUTED
+                } else {
+                    theme::TEXT_SUBTLE
+                }),
+        )
+}
+
+fn category_dropdown_menu(
+    mut selected_category: State<DownloadCategory>,
+    mut open: State<bool>,
+    mut popup_window: State<Option<WindowId>>,
+    mut folder: State<String>,
+    default_folder: PathBuf,
+) -> impl IntoElement {
+    let selected = selected_category();
+    rect()
+        .width(Size::fill())
+        .padding(Gaps::new(8., 6., 8., 6.))
+        .vertical()
+        .spacing(2.)
+        .corner_radius(8.)
+        .background(theme::SURFACE_ELEVATED)
+        .border(Border::new().width(1.).fill(theme::BORDER))
+        .children(DOWNLOAD_CATEGORIES.iter().map(|category| {
+            let category = *category;
+            let selected_now = selected == category;
+            let default_folder = default_folder.clone();
+            rect()
+                .key(category.label())
+                .height(Size::px(36.))
+                .width(Size::fill())
+                .horizontal()
+                .cross_align(Alignment::Center)
+                .spacing(10.)
+                .padding(Gaps::new(0., 32., 0., 10.))
+                .corner_radius(6.)
+                .background(if selected_now {
+                    theme::SURFACE
+                } else {
+                    Color::TRANSPARENT
+                })
+                .on_press(move |_| {
+                    selected_category.set(category);
+                    folder.set(
+                        category_folder(&default_folder, category)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    open.set(false);
+                    popup_window.set(None);
+                    close_current_window();
+                })
+                .child(
+                    SvgViewer::new(category.icon())
+                        .width(Size::px(16.))
+                        .height(Size::px(16.))
+                        .color(theme::TEXT_SUBTLE),
+                )
+                .child(
+                    label()
+                        .text(category.label())
+                        .font_size(14.)
+                        .color(theme::TEXT_PRIMARY)
+                        .width(Size::fill()),
+                )
+                .maybe(selected_now, |el| {
+                    el.child(
+                        SvgViewer::new(icons::lucide::check())
+                            .width(Size::px(16.))
+                            .height(Size::px(16.))
+                            .color(theme::TEXT_PRIMARY),
+                    )
+                })
+                .child(rect().width(Size::px(12.)))
+                .into_element()
+        }))
+}
+
+fn download_size_badge(size: Option<Bytes>) -> impl IntoElement {
+    rect()
+        .height(Size::px(38.))
+        .width(Size::px(96.))
+        .horizontal()
+        .cross_align(Alignment::Center)
+        .spacing(8.)
+        .padding(Gaps::new(0., 10., 0., 10.))
+        .child(
+            SvgViewer::new(icons::lucide::binary())
+                .width(Size::px(18.))
+                .height(Size::px(18.))
+                .color(theme::TEXT_SUBTLE),
+        )
+        .child(
+            label()
+                .text(format_size(size))
+                .font_size(12.)
+                .color(theme::TEXT_PRIMARY),
+        )
+}
+
+fn folder_input(folder: State<String>) -> impl IntoElement {
+    rect()
+        .height(Size::px(52.))
+        .width(Size::fill())
+        .child(
+            Input::new(folder)
+                .placeholder("Download folder")
+                .width(Size::fill())
+                .theme_colors(dialog_input_colors())
+                .theme_layout(InputLayoutThemePartial {
+                    corner_radius: Some(CornerRadius::new_all(8.).into()),
+                    inner_margin: Some(Gaps::new(10., 50., 10., 12.).into()),
+                })
+                .leading(
+                    SvgViewer::new(icons::lucide::folder())
+                        .width(Size::px(18.))
+                        .height(Size::px(18.))
+                        .color(theme::TEXT_SUBTLE),
+                ),
+        )
+        .child(folder_picker_overlay(folder))
+}
+
+fn folder_picker_overlay(mut folder: State<String>) -> impl IntoElement {
+    rect()
+        .position(Position::new_absolute().right(9.).top(6.))
+        .layer(10)
+        .height(Size::px(32.))
+        .width(Size::px(32.))
+        .center()
+        .corner_radius(6.)
+        .background(Color::TRANSPARENT)
+        .on_pointer_enter(|_| Cursor::set(CursorIcon::Pointer))
+        .on_pointer_leave(|_| Cursor::set(CursorIcon::default()))
+        .on_mouse_up(move |_| {
+            Cursor::set(CursorIcon::default());
+            spawn(async move {
+                let Some(handle) = rfd::AsyncFileDialog::new().pick_folder().await else {
+                    return;
+                };
+                folder.set(handle.path().to_string_lossy().into_owned());
+            });
+        })
+        .child(
+            SvgViewer::new(icons::lucide::folder_open())
+                .width(Size::px(18.))
+                .height(Size::px(18.))
+                .color(theme::TEXT_PRIMARY),
+        )
+}
+
+#[derive(Clone, PartialEq)]
+struct CategoryPopupWindow {
+    selected_category: State<DownloadCategory>,
+    open: State<bool>,
+    popup_window: State<Option<WindowId>>,
+    folder: State<String>,
+    default_folder: PathBuf,
+}
+
+impl ComponentOwned for CategoryPopupWindow {
+    fn render(self) -> impl IntoElement {
+        use_init_theme(theme::raijin_theme);
+
+        rect()
+            .expanded()
+            .background(theme::SURFACE_ELEVATED)
+            .child(category_dropdown_menu(
+                self.selected_category,
+                self.open,
+                self.popup_window,
+                self.folder,
+                self.default_folder,
+            ))
+    }
+}
+
+fn open_category_menu_window(
+    selected_category: State<DownloadCategory>,
+    open: State<bool>,
+    mut popup_window: State<Option<WindowId>>,
+    folder: State<String>,
+    default_folder: PathBuf,
+) {
+    spawn(async move {
+        let platform = Platform::get();
+        let position = platform
+            .post_callback(|window_id, context| {
+                let window = context.windows.get(&window_id)?.window();
+                let origin = window.outer_position().ok()?;
+                let scale = window.scale_factor();
+                Some(PhysicalPosition::new(
+                    origin.x + (380. * scale) as i32,
+                    origin.y + (112. * scale) as i32,
+                ))
+            })
+            .await
+            .ok()
+            .flatten();
+
+        let window_id = platform
+            .launch_window(category_popup_window_config(
+                selected_category,
+                open,
+                popup_window,
+                folder,
+                default_folder,
+                position,
+            ))
+            .await;
+        popup_window.set(Some(window_id));
+    });
+}
+
+fn category_popup_window_config(
+    selected_category: State<DownloadCategory>,
+    open: State<bool>,
+    popup_window: State<Option<WindowId>>,
+    folder: State<String>,
+    default_folder: PathBuf,
+    position: Option<PhysicalPosition<i32>>,
+) -> WindowConfig {
+    WindowConfig::new(move || CategoryPopupWindow {
+        selected_category,
+        open,
+        popup_window,
+        folder,
+        default_folder: default_folder.clone(),
+    })
+    .with_title("Raijin Category")
+    .with_size(275., 242.)
+    .with_min_size(275., 242.)
+    .with_max_size(275., 242.)
+    .with_resizable(false)
+    .with_decorations(false)
+    .with_background(theme::SURFACE_ELEVATED)
+    .with_window_attributes(move |attributes, _| {
+        if let Some(position) = position {
+            attributes.with_position(position)
+        } else {
+            attributes
+        }
+    })
+}
+
+fn category_folder(default_folder: &std::path::Path, category: DownloadCategory) -> PathBuf {
+    default_folder.join(category.label())
 }
 
 impl Component for NewDownloadWindow {
@@ -767,8 +1203,43 @@ impl Component for NewDownloadWindow {
         use_init_theme(theme::raijin_theme);
 
         let link = use_state(String::new);
+        let use_category = use_state(|| true);
+        let selected_category = use_state(|| DownloadCategory::Programs);
+        let category_dropdown_open = use_state(|| false);
+        let category_popup_window = use_state(|| Option::<WindowId>::None);
+        let file_name = use_state(String::new);
+        let mut remote_size = use_state(|| Option::<Bytes>::None);
+        let mut remote_size_url = use_state(String::new);
+        let initial_folder = category_folder(&self.services.default_folder, selected_category());
+        let folder = use_state(|| initial_folder.to_string_lossy().into_owned());
         let has_link = !link.read().trim().is_empty();
         let services = self.services.clone();
+        let default_file_name = file_name_from_url(link.read().trim());
+        let resolved_file_name = resolved_download_file_name(&file_name.read(), &default_file_name);
+        let can_download =
+            has_link && !resolved_file_name.trim().is_empty() && !folder.read().trim().is_empty();
+
+        use_side_effect(move || {
+            let url = link.read().trim().to_owned();
+            if url == *remote_size_url.read() {
+                return;
+            }
+            remote_size_url.set(url.clone());
+            remote_size.set(None);
+            if url.is_empty() {
+                return;
+            }
+            spawn(async move {
+                let Ok(client) = ReqwestHttpClient::new() else {
+                    return;
+                };
+                let size = probe_http(&client, ProbeRequest::new(url))
+                    .await
+                    .ok()
+                    .and_then(|metadata| metadata.total_bytes);
+                remote_size.set(size);
+            });
+        });
 
         rect()
             .expanded()
@@ -778,8 +1249,8 @@ impl Component for NewDownloadWindow {
             .child(
                 rect()
                     .expanded()
-                    .padding(Gaps::new(40., 20., 0., 20.))
-                    .spacing(12.)
+                    .padding(Gaps::new(18., 22., 0., 22.))
+                    .spacing(10.)
                     .vertical()
                     .child(
                         Input::new(link)
@@ -806,20 +1277,73 @@ impl Component for NewDownloadWindow {
                     .child(
                         rect()
                             .horizontal()
+                            .cross_align(Alignment::Center)
+                            .width(Size::fill())
+                            .spacing(10.)
+                            .child(category_toggle(
+                                use_category,
+                                selected_category,
+                                folder,
+                                category_dropdown_open,
+                                category_popup_window,
+                                self.services.default_folder.clone(),
+                            ))
+                            .child(category_dropdown(
+                                selected_category,
+                                category_dropdown_open,
+                                category_popup_window,
+                                use_category,
+                                folder,
+                                self.services.default_folder.clone(),
+                            ))
+                            .child(download_size_badge(remote_size())),
+                    )
+                    .child(folder_input(folder))
+                    .child(
+                        Input::new(file_name)
+                            .placeholder(default_file_name)
+                            .width(Size::fill())
+                            .theme_colors(dialog_input_colors())
+                            .theme_layout(InputLayoutThemePartial {
+                                corner_radius: Some(CornerRadius::new_all(8.).into()),
+                                inner_margin: Some(Gaps::new(10., 12., 10., 12.).into()),
+                            })
+                            .leading(
+                                SvgViewer::new(icons::lucide::file_text())
+                                    .width(Size::px(18.))
+                                    .height(Size::px(18.))
+                                    .color(theme::TEXT_SUBTLE),
+                            ),
+                    )
+                    .child(
+                        rect()
+                            .horizontal()
                             .main_align(Alignment::SpaceBetween)
                             .cross_align(Alignment::Center)
                             .width(Size::fill())
-                            .child(dropdown_button("Auto"))
+                            .padding(Gaps::new(14., 0., 0., 0.))
+                            .child(dialog_button(
+                                "Add",
+                                can_download,
+                                add_download_to_list_action(
+                                    services.clone(),
+                                    link.read().trim().to_owned(),
+                                    PathBuf::from(folder.read().trim()),
+                                    resolved_file_name.clone(),
+                                ),
+                            ))
                             .child(
                                 rect()
                                     .horizontal()
                                     .spacing(10.)
                                     .child(dialog_button(
-                                        "OK",
-                                        has_link,
+                                        "Download",
+                                        can_download,
                                         add_download_action(
                                             services,
                                             link.read().trim().to_owned(),
+                                            PathBuf::from(folder.read().trim()),
+                                            resolved_file_name,
                                         ),
                                     ))
                                     .child(dialog_button(
@@ -838,8 +1362,8 @@ pub(crate) fn new_download_window_config(services: AppServices) -> WindowConfig 
         services: services.clone(),
     })
     .with_title("New Download")
-    .with_size(430., 145.)
-    .with_min_size(430., 145.)
+    .with_size(570., 290.)
+    .with_min_size(500., 260.)
     .with_resizable(true)
     .with_background(theme::RAIJIN_BACKGROUND)
 }
@@ -851,28 +1375,50 @@ enum DownloadAction {
     Remove,
 }
 
-fn rows_from_state(state: &MonitorState) -> Vec<DownloadRowData> {
+fn filtered_rows_from_state(state: &MonitorState, filter: SidebarFilter) -> Vec<DownloadRowData> {
     state
         .active
         .values()
         .chain(state.completed.values())
         .map(row_from_view)
+        .filter(|row| row_matches_filter(row, filter))
         .collect()
 }
 
 fn row_from_view(view: &DownloadView) -> DownloadRowData {
+    let folder_category = row_category_label(&view.folder);
     DownloadRowData {
         id: view.id,
         file_name: display_name(view),
-        kind: kind_from_name(&view.file_name).to_owned(),
+        kind: folder_category
+            .unwrap_or_else(|| kind_from_name(&view.file_name))
+            .to_owned(),
         size_bytes: view.total_bytes,
         status: view.status,
         speed_bps: view.speed.get(),
         time_left: view.eta_seconds,
         date_added: format_date_added(view.created_at),
+        folder: view.folder.clone(),
         progress: progress_ratio(view),
         connections: view.active_part_count.max(1),
     }
+}
+
+fn row_matches_filter(row: &DownloadRowData, filter: SidebarFilter) -> bool {
+    match filter {
+        SidebarFilter::All => true,
+        SidebarFilter::Category(label) => row_category_label(&row.folder) == Some(label),
+        SidebarFilter::Finished => row.status == DownloadStatus::Completed,
+        SidebarFilter::Unfinished => row.status != DownloadStatus::Completed,
+    }
+}
+
+fn row_category_label(folder: &std::path::Path) -> Option<&'static str> {
+    let folder_name = folder.file_name()?.to_str()?;
+    DOWNLOAD_CATEGORIES
+        .iter()
+        .map(|category| category.label())
+        .find(|label| folder_name.eq_ignore_ascii_case(label))
 }
 
 fn run_for_selected(services: AppServices, ids: Vec<DownloadId>, action: DownloadAction) {
@@ -895,16 +1441,22 @@ fn stop_all_active(services: AppServices, snapshot: MonitorState) {
     run_for_selected(services, ids, DownloadAction::Pause);
 }
 
-fn add_download_action(services: AppServices, url: String) -> EventHandler<()> {
+fn add_download_action(
+    services: AppServices,
+    url: String,
+    folder: PathBuf,
+    file_name: String,
+) -> EventHandler<()> {
     (move |()| {
         let services = services.clone();
         let url = url.clone();
+        let folder = folder.clone();
+        let file_name = file_name.clone();
         spawn(async move {
-            if url.trim().is_empty() {
+            if url.trim().is_empty() || file_name.trim().is_empty() {
                 return;
             }
-            let file_name = file_name_from_url(&url);
-            let request = NewDownload::http(url, file_name, services.default_folder.clone());
+            let request = NewDownload::http(url, sanitize_file_name(&file_name), folder);
             match services.downloads.add(request).await {
                 Ok(item) => {
                     if let Err(error) = services.queues.enqueue(QueueId::MAIN, item.id).await {
@@ -913,6 +1465,11 @@ fn add_download_action(services: AppServices, url: String) -> EventHandler<()> {
                     if let Err(error) = services.queues.start(QueueId::MAIN).await {
                         tracing::warn!(%error, "queue start from UI failed");
                     }
+                    if let Err(error) =
+                        resume_new_download_if_queue_did_not_start(&services, item.id).await
+                    {
+                        tracing::warn!(%error, "direct start fallback from UI failed");
+                    }
                     close_current_window();
                 }
                 Err(error) => tracing::warn!(?error, "add download from UI failed"),
@@ -920,6 +1477,55 @@ fn add_download_action(services: AppServices, url: String) -> EventHandler<()> {
         });
     })
     .into()
+}
+
+fn add_download_to_list_action(
+    services: AppServices,
+    url: String,
+    folder: PathBuf,
+    file_name: String,
+) -> EventHandler<()> {
+    (move |()| {
+        let services = services.clone();
+        let url = url.clone();
+        let folder = folder.clone();
+        let file_name = file_name.clone();
+        spawn(async move {
+            if url.trim().is_empty() || file_name.trim().is_empty() {
+                return;
+            }
+            let request = NewDownload::http(url, sanitize_file_name(&file_name), folder);
+            match services.downloads.add(request).await {
+                Ok(item) => {
+                    if let Err(error) = services.queues.enqueue(QueueId::MAIN, item.id).await {
+                        tracing::warn!(%error, "enqueue from UI failed");
+                    }
+                    close_current_window();
+                }
+                Err(error) => tracing::warn!(?error, "add download from UI failed"),
+            }
+        });
+    })
+    .into()
+}
+
+async fn resume_new_download_if_queue_did_not_start(
+    services: &AppServices,
+    id: DownloadId,
+) -> crate::download::DownloadManagerResult<()> {
+    let Some(item) = services
+        .downloads
+        .list()
+        .await?
+        .into_iter()
+        .find(|item| item.id == id)
+    else {
+        return Ok(());
+    };
+    if matches!(item.status, DownloadStatus::Added | DownloadStatus::Paused) {
+        services.downloads.resume(id).await?;
+    }
+    Ok(())
 }
 
 fn open_new_download_window(services: AppServices) {
@@ -1186,25 +1792,6 @@ fn dialog_button(
         }))
 }
 
-fn dropdown_button(text: &'static str) -> impl IntoElement {
-    rect()
-        .width(Size::px(112.))
-        .height(Size::px(36.))
-        .horizontal()
-        .center()
-        .spacing(8.)
-        .corner_radius(8.)
-        .background(theme::SURFACE)
-        .border(Border::new().width(1.).fill(theme::BORDER))
-        .child(label().text(text).font_size(14.).color(theme::TEXT_PRIMARY))
-        .child(
-            SvgViewer::new(icons::lucide::chevron_down())
-                .width(Size::px(14.))
-                .height(Size::px(14.))
-                .color(theme::TEXT_MUTED),
-        )
-}
-
 fn toolbar_divider() -> impl IntoElement {
     rect()
         .width(Size::px(1.))
@@ -1406,7 +1993,16 @@ fn file_name_from_url(url: &str) -> String {
         .find(|part| !part.trim().is_empty())
         .map(sanitize_file_name)
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "download.bin".to_owned())
+        .unwrap_or_else(|| "Name".to_owned())
+}
+
+fn resolved_download_file_name(input: &str, fallback: &str) -> String {
+    let candidate = input.trim();
+    if candidate.is_empty() {
+        fallback.to_owned()
+    } else {
+        candidate.to_owned()
+    }
 }
 
 fn sanitize_file_name(value: &str) -> String {

@@ -1,15 +1,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::fs;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{DbError, DownloadRepository, PartRepository};
-use crate::download::job::unique_destination_path;
+use crate::download::job::{LiveDownloadProgress, unique_destination_path};
 use crate::download::{
     Bytes, BytesPerSecond, DownloadFailure, DownloadId, DownloadItem, DownloadKind, DownloadPart,
     DownloadProgress, DownloadStatus, HttpDownloadJob, PartStatus, ReqwestHttpClient,
@@ -32,6 +34,9 @@ pub enum DownloadManagerError {
     /// Database operation failed.
     #[error(transparent)]
     Db(#[from] DbError),
+    /// Filesystem operation failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     /// Command channel is closed because the manager has stopped.
     #[error("download manager is stopped")]
     Stopped,
@@ -320,6 +325,7 @@ impl DownloadManagerHandle {
 #[derive(Debug)]
 struct ActiveJob {
     cancellation: CancellationToken,
+    live_progress: Arc<LiveDownloadProgress>,
     task: JoinHandle<()>,
 }
 
@@ -450,11 +456,14 @@ impl DownloadManager {
         let mut item = self.item_for_update(id).await?;
         item.status = DownloadStatus::Paused;
         item.updated_at = now_ms()?;
-        self.repository.update(&item).await?;
 
         if let Some(job) = self.active_jobs.get_mut(&id) {
+            let (downloaded_bytes, _) = job.live_progress.snapshot();
+            item.downloaded_bytes = item.downloaded_bytes.max(downloaded_bytes);
+            job.live_progress.clear_active_parts();
             job.cancellation.cancel();
         }
+        self.repository.update(&item).await?;
 
         self.publish(DownloadEvent::DownloadPaused { item: item.clone() });
         Ok(item)
@@ -473,15 +482,31 @@ impl DownloadManager {
     }
 
     async fn remove_download(&mut self, id: DownloadId) -> DownloadManagerResult<bool> {
-        if let Some(job) = self.active_jobs.remove(&id) {
-            job.cancellation.cancel();
-        }
+        let Some(item) = self.repository.get(id).await? else {
+            return Ok(false);
+        };
+        self.stop_active_job(id).await;
+        delete_download_files(&item).await?;
 
         let removed = self.repository.remove(id).await?;
         if removed {
             self.publish(DownloadEvent::DownloadRemoved { id });
         }
         Ok(removed)
+    }
+
+    async fn stop_active_job(&mut self, id: DownloadId) {
+        if let Some(job) = self.active_jobs.remove(&id) {
+            job.cancellation.cancel();
+            job.task.abort();
+            match job.task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    tracing::warn!(%id, ?error, "download job stopped with join error during remove")
+                }
+            }
+        }
     }
 
     async fn item_for_update(&self, id: DownloadId) -> DownloadManagerResult<DownloadItem> {
@@ -505,16 +530,24 @@ impl DownloadManager {
         }
 
         let cancellation = CancellationToken::new();
+        let live_progress = Arc::new(LiveDownloadProgress::new(item.downloaded_bytes));
         let task = tokio::spawn(run_http_job_task(JobTaskContext {
             download_repo: self.repository.clone(),
             part_repo: self.part_repository.clone(),
             events: self.events.clone(),
             commands: self.command_sender.clone(),
             item: item.clone(),
+            live_progress: Arc::clone(&live_progress),
             cancellation: cancellation.clone(),
         }));
-        self.active_jobs
-            .insert(item.id, ActiveJob { cancellation, task });
+        self.active_jobs.insert(
+            item.id,
+            ActiveJob {
+                cancellation,
+                live_progress,
+                task,
+            },
+        );
     }
 
     fn publish(&self, event: DownloadEvent) {
@@ -540,6 +573,7 @@ struct JobTaskContext {
     events: broadcast::Sender<DownloadEvent>,
     commands: mpsc::Sender<DownloadCommand>,
     item: DownloadItem,
+    live_progress: Arc<LiveDownloadProgress>,
     cancellation: CancellationToken,
 }
 
@@ -587,7 +621,8 @@ async fn run_http_job_task_inner(
         context.part_repo.clone(),
         client,
         context.item.clone(),
-    );
+    )
+    .with_live_progress(Arc::clone(&context.live_progress));
     let job_future = job.run(context.cancellation.clone());
     tokio::pin!(job_future);
     let mut ticker = tokio::time::interval(JOB_PROGRESS_TICK);
@@ -607,7 +642,7 @@ async fn publish_progress_snapshot(
     match context.download_repo.get(context.item.id).await {
         Ok(Some(item)) => {
             let progress = progress_from_item(context, &item).await;
-            if last_progress.as_ref() != Some(&progress) {
+            if progress.active_part_count > 0 || last_progress.as_ref() != Some(&progress) {
                 *last_progress = Some(progress);
                 publish_event(
                     &context.events,
@@ -628,6 +663,17 @@ async fn publish_progress_snapshot(
 }
 
 async fn progress_from_item(context: &JobTaskContext, item: &DownloadItem) -> DownloadProgress {
+    let (live_downloaded_bytes, live_active_part_count) = context.live_progress.snapshot();
+    if live_active_part_count > 0 {
+        return DownloadProgress {
+            downloaded_bytes: live_downloaded_bytes,
+            total_bytes: item.total_bytes,
+            speed: BytesPerSecond::ZERO,
+            eta_seconds: None,
+            active_part_count: live_active_part_count,
+        };
+    }
+
     let parts = match context.part_repo.list_for_download(item.id).await {
         Ok(parts) => parts,
         Err(error) => {
@@ -640,18 +686,20 @@ async fn progress_from_item(context: &JobTaskContext, item: &DownloadItem) -> Do
         }
     };
 
-    let downloaded_bytes = if parts.is_empty() {
+    let persisted_downloaded_bytes = if parts.is_empty() {
         item.downloaded_bytes
     } else {
         Bytes::new(downloaded_from_parts(&parts))
     };
+    let downloaded_bytes = live_downloaded_bytes.max(persisted_downloaded_bytes);
+    let active_part_count = live_active_part_count.max(active_part_count(&parts, item.status));
 
     DownloadProgress {
         downloaded_bytes,
         total_bytes: item.total_bytes,
         speed: BytesPerSecond::ZERO,
         eta_seconds: None,
-        active_part_count: active_part_count(&parts, item.status),
+        active_part_count,
     }
 }
 
@@ -691,6 +739,31 @@ fn publish_event(events: &broadcast::Sender<DownloadEvent>, event: DownloadEvent
         Ok(_) => {}
         Err(error) => tracing::trace!(?error, "download event had no subscribers"),
     }
+}
+
+async fn delete_download_files(item: &DownloadItem) -> std::io::Result<()> {
+    remove_file_if_exists(&incomplete_path_for_item(item)).await?;
+    remove_file_if_exists(&final_path_for_item(item)).await
+}
+
+async fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn final_path_for_item(item: &DownloadItem) -> PathBuf {
+    item.folder.join(&item.file_name)
+}
+
+fn incomplete_path_for_item(item: &DownloadItem) -> PathBuf {
+    item.folder.join(format!(
+        "{}{}",
+        item.file_name,
+        crate::download::DownloadConfig::default().incomplete_extension
+    ))
 }
 
 async fn unique_file_name(folder: &Path, file_name: &str) -> DownloadManagerResult<String> {
@@ -869,6 +942,46 @@ mod tests {
         assert_eq!(paused.status, DownloadStatus::Paused);
         assert_eq!(resumed.status, DownloadStatus::Queued);
         assert!(removed);
+        stop_manager(&handle, task).await
+    }
+
+    #[tokio::test]
+    async fn remove_should_delete_final_and_incomplete_files() -> DownloadManagerResult<()> {
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()
+            .map_err(sqlx::Error::Io)
+            .map_err(DbError::from)?;
+        let (handle, task) = DownloadManagerHandle::spawn(
+            db.repository,
+            db.part_repository,
+            DownloadManagerOptions {
+                command_buffer: 8,
+                event_buffer: 8,
+            },
+        );
+        let added = handle
+            .add(NewDownload::http(
+                "https://example.com/file.bin",
+                "file.bin",
+                folder.path().to_path_buf(),
+            ))
+            .await?;
+        let final_path = final_path_for_item(&added);
+        let incomplete_path = incomplete_path_for_item(&added);
+        tokio::fs::write(&final_path, b"complete")
+            .await
+            .map_err(sqlx::Error::Io)
+            .map_err(DbError::from)?;
+        tokio::fs::write(&incomplete_path, b"partial")
+            .await
+            .map_err(sqlx::Error::Io)
+            .map_err(DbError::from)?;
+
+        let removed = handle.remove(added.id).await?;
+
+        assert!(removed);
+        assert!(!final_path.exists());
+        assert!(!incomplete_path.exists());
         stop_manager(&handle, task).await
     }
 

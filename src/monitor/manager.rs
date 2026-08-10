@@ -114,14 +114,26 @@ impl DownloadMonitor {
                     self.projection.apply_item(&item, now);
                 }
             }
-            DownloadEvent::DownloadAdded { item }
-            | DownloadEvent::DownloadChanged { item }
-            | DownloadEvent::DownloadPaused { item }
-            | DownloadEvent::DownloadResumed { item } => self.projection.apply_item(&item, now),
+            DownloadEvent::DownloadAdded { item } => self.projection.apply_item(&item, now),
+            DownloadEvent::DownloadChanged { item } => {
+                if matches!(
+                    item.status,
+                    crate::download::DownloadStatus::Completed
+                        | crate::download::DownloadStatus::Error
+                ) {
+                    self.projection.reset_meter(item.id);
+                }
+                self.projection.apply_item(&item, now);
+            }
+            DownloadEvent::DownloadPaused { item } | DownloadEvent::DownloadResumed { item } => {
+                self.projection.reset_meter(item.id);
+                self.projection.apply_item(&item, now);
+            }
             DownloadEvent::DownloadRemoved { id } => self.projection.remove(id),
             DownloadEvent::DownloadFailed { id, failure } => {
                 let updated_at =
                     i64::try_from(now).map_err(|_| DownloadMonitorError::ClockOutOfRange)?;
+                self.projection.reset_meter(id);
                 self.projection.apply_failure(id, failure, updated_at);
             }
             DownloadEvent::DownloadProgress { id, progress } => {

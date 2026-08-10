@@ -11,6 +11,9 @@ pub enum RangeSplitError {
     /// Part identifier calculation overflowed.
     #[error("part id overflow for download `{download_id}` part `{index}`")]
     PartIdOverflow { download_id: DownloadId, index: u32 },
+    /// Part cannot be split while preserving valid ranges.
+    #[error("part `{index}` cannot be split")]
+    UnsplitablePart { index: u32 },
 }
 
 const PART_ID_STRIDE: i64 = 65_536;
@@ -114,7 +117,45 @@ fn part(
     })
 }
 
-fn part_id(download_id: DownloadId, index: u32) -> Result<PartId, RangeSplitError> {
+pub(crate) fn split_part_at(
+    part: &DownloadPart,
+    child_index: u32,
+    split_start: Bytes,
+    now_ms: i64,
+) -> Result<(DownloadPart, DownloadPart), RangeSplitError> {
+    let end = part
+        .end_byte
+        .ok_or(RangeSplitError::UnsplitablePart { index: part.index })?;
+    if split_start <= part.current_byte || split_start > end {
+        return Err(RangeSplitError::UnsplitablePart { index: part.index });
+    }
+    let parent_end = split_start
+        .get()
+        .checked_sub(1)
+        .map(Bytes::new)
+        .ok_or(RangeSplitError::UnsplitablePart { index: part.index })?;
+
+    let mut parent = part.clone();
+    parent.end_byte = Some(parent_end);
+    parent.status = PartStatus::Idle;
+    parent.updated_at = now_ms;
+
+    let child = DownloadPart {
+        id: part_id(part.download_id, child_index)?,
+        download_id: part.download_id,
+        index: child_index,
+        start_byte: split_start,
+        end_byte: Some(end),
+        current_byte: split_start,
+        status: PartStatus::Idle,
+        retry_count: 0,
+        updated_at: now_ms,
+    };
+
+    Ok((parent, child))
+}
+
+pub(crate) fn part_id(download_id: DownloadId, index: u32) -> Result<PartId, RangeSplitError> {
     let id = download_id
         .get()
         .checked_mul(PART_ID_STRIDE)
@@ -193,6 +234,21 @@ mod tests {
 
         assert_eq!(parts[0].id, PartId::new(65_537));
         assert_eq!(parts[1_023].id, PartId::new(66_560));
+        Ok(())
+    }
+
+    #[test]
+    fn splitter_should_split_existing_part_for_dynamic_workers() -> Result<(), RangeSplitError> {
+        let part = part(DownloadId::new(1), 1, 100, Some(199), 120, 1)?;
+
+        let (parent, child) = split_part_at(&part, 2, Bytes::new(160), 2)?;
+
+        assert_eq!(parent.start_byte, Bytes::new(100));
+        assert_eq!(parent.current_byte, Bytes::new(120));
+        assert_eq!(parent.end_byte, Some(Bytes::new(159)));
+        assert_eq!(child.start_byte, Bytes::new(160));
+        assert_eq!(child.current_byte, Bytes::new(160));
+        assert_eq!(child.end_byte, Some(Bytes::new(199)));
         Ok(())
     }
 }

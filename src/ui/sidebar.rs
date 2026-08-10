@@ -28,8 +28,18 @@ enum IconKind {
     Video,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarFilter {
+    All,
+    Category(&'static str),
+    Finished,
+    Unfinished,
+}
+
 #[derive(PartialEq)]
-pub(crate) struct Sidebar;
+pub(crate) struct Sidebar {
+    pub(crate) filter: State<SidebarFilter>,
+}
 
 impl Component for Sidebar {
     fn render(&self) -> impl IntoElement {
@@ -39,13 +49,17 @@ impl Component for Sidebar {
             .padding(Gaps::new(12., 12., 20., 20.))
             .spacing(12.)
             .vertical()
-            .child(CategoriesCard)
+            .child(CategoriesCard {
+                filter: self.filter,
+            })
             .child(QueuesCard)
     }
 }
 
 #[derive(PartialEq)]
-struct CategoriesCard;
+struct CategoriesCard {
+    filter: State<SidebarFilter>,
+}
 
 impl Component for CategoriesCard {
     fn render(&self) -> impl IntoElement {
@@ -53,33 +67,83 @@ impl Component for CategoriesCard {
         let finished_expanded = use_state(|| false);
         let unfinished_expanded = use_state(|| false);
 
+        let selected_filter = (self.filter)();
+
         sidebar_card()
-            .child(section_header("All", IconKind::Folder, all_expanded, true))
+            .child(section_header(
+                "All",
+                IconKind::Folder,
+                all_expanded,
+                selected_filter == SidebarFilter::All,
+                Some((self.filter, SidebarFilter::All)),
+            ))
             .maybe(all_expanded(), |el| {
-                el.child(indent_row("Compressed", IconKind::Archive))
-                    .child(indent_row("Programs", IconKind::Boxes))
-                    .child(indent_row("Videos", IconKind::Video))
-                    .child(indent_row("Music", IconKind::Music))
-                    .child(indent_row("Pictures", IconKind::Image))
-                    .child(indent_row("Documents", IconKind::FileText))
+                el.child(indent_row(
+                    "Compressed",
+                    IconKind::Archive,
+                    selected_filter,
+                    self.filter,
+                ))
+                .child(indent_row(
+                    "Programs",
+                    IconKind::Boxes,
+                    selected_filter,
+                    self.filter,
+                ))
+                .child(indent_row(
+                    "Videos",
+                    IconKind::Video,
+                    selected_filter,
+                    self.filter,
+                ))
+                .child(indent_row(
+                    "Music",
+                    IconKind::Music,
+                    selected_filter,
+                    self.filter,
+                ))
+                .child(indent_row(
+                    "Pictures",
+                    IconKind::Image,
+                    selected_filter,
+                    self.filter,
+                ))
+                .child(indent_row(
+                    "Documents",
+                    IconKind::FileText,
+                    selected_filter,
+                    self.filter,
+                ))
             })
             .child(section_header(
                 "Finished",
                 IconKind::FolderCheck,
                 finished_expanded,
-                false,
+                selected_filter == SidebarFilter::Finished,
+                Some((self.filter, SidebarFilter::Finished)),
             ))
             .maybe(finished_expanded(), |el| {
-                el.child(indent_row("Finished", IconKind::FolderCheck))
+                el.child(indent_row(
+                    "Finished",
+                    IconKind::FolderCheck,
+                    selected_filter,
+                    self.filter,
+                ))
             })
             .child(section_header(
                 "Unfinished",
                 IconKind::FolderDown,
                 unfinished_expanded,
-                false,
+                selected_filter == SidebarFilter::Unfinished,
+                Some((self.filter, SidebarFilter::Unfinished)),
             ))
             .maybe(unfinished_expanded(), |el| {
-                el.child(indent_row("Unfinished", IconKind::FolderDown))
+                el.child(indent_row(
+                    "Unfinished",
+                    IconKind::FolderDown,
+                    selected_filter,
+                    self.filter,
+                ))
             })
     }
 }
@@ -112,6 +176,7 @@ impl Component for QueuesCard {
                 IconKind::Panels,
                 queues_expanded,
                 false,
+                None,
             ))
             .maybe(queues_expanded(), |el| {
                 el.children(
@@ -164,6 +229,7 @@ fn section_header(
     icon: IconKind,
     mut expanded: State<bool>,
     selected: bool,
+    filter_selection: Option<(State<SidebarFilter>, SidebarFilter)>,
 ) -> impl IntoElement {
     let is_expanded = expanded();
 
@@ -178,7 +244,12 @@ fn section_header(
             theme::SURFACE
         })
         .border(card_border())
-        .on_press(move |_| expanded.toggle())
+        .on_press(move |_| {
+            if let Some((mut filter, filter_value)) = filter_selection {
+                filter.set(filter_value);
+            }
+            expanded.toggle();
+        })
         .child(
             rect()
                 .width(Size::px(3.))
@@ -217,7 +288,18 @@ fn section_header(
         )
 }
 
-fn indent_row(title: &'static str, icon: IconKind) -> impl IntoElement {
+fn indent_row(
+    title: &'static str,
+    icon: IconKind,
+    selected_filter: SidebarFilter,
+    mut filter: State<SidebarFilter>,
+) -> impl IntoElement {
+    let filter_value = match title {
+        "Finished" => SidebarFilter::Finished,
+        "Unfinished" => SidebarFilter::Unfinished,
+        _ => SidebarFilter::Category(title),
+    };
+    let selected = selected_filter == filter_value;
     rect()
         .height(Size::px(39.))
         .width(Size::fill())
@@ -225,8 +307,27 @@ fn indent_row(title: &'static str, icon: IconKind) -> impl IntoElement {
         .cross_align(Alignment::Center)
         .padding(Gaps::new(0., 12., 0., 56.))
         .spacing(8.)
-        .child(icon_view(icon, theme::TEXT_SUBTLE, 17.))
-        .child(label().text(title).font_size(14.).color(theme::TEXT_SUBTLE))
+        .corner_radius(7.)
+        .background(if selected {
+            theme::SURFACE_ELEVATED
+        } else {
+            Color::TRANSPARENT
+        })
+        .on_press(move |_| filter.set(filter_value))
+        .child(icon_view(
+            icon,
+            if selected {
+                theme::TEXT_PRIMARY
+            } else {
+                theme::TEXT_SUBTLE
+            },
+            17.,
+        ))
+        .child(label().text(title).font_size(14.).color(if selected {
+            theme::TEXT_PRIMARY
+        } else {
+            theme::TEXT_SUBTLE
+        }))
 }
 
 fn queue_row(queue: QueueSummary) -> impl IntoElement {

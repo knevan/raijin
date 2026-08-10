@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use crate::download::{
     Bytes, BytesPerSecond, DownloadFailure, DownloadId, DownloadItem, DownloadProgress,
@@ -15,6 +16,8 @@ pub struct DownloadView {
     pub url: String,
     /// File name shown by UI.
     pub file_name: String,
+    /// Destination folder.
+    pub folder: PathBuf,
     /// Durable status.
     pub status: DownloadStatus,
     /// Downloaded bytes.
@@ -41,6 +44,7 @@ impl DownloadView {
             id: item.id,
             url: item.url.clone(),
             file_name: item.file_name.clone(),
+            folder: item.folder.clone(),
             status: item.status,
             downloaded_bytes: item.downloaded_bytes,
             total_bytes: item.total_bytes,
@@ -69,6 +73,7 @@ impl DownloadView {
             id,
             url: String::new(),
             file_name: String::new(),
+            folder: PathBuf::new(),
             status: DownloadStatus::Error,
             downloaded_bytes: Bytes::ZERO,
             total_bytes: None,
@@ -175,6 +180,11 @@ impl Projection {
         self.meters.remove(&id);
     }
 
+    /// Clears speed history for one download lifecycle.
+    pub fn reset_meter(&mut self, id: DownloadId) {
+        self.meters.remove(&id);
+    }
+
     fn place_view(&mut self, view: DownloadView) {
         self.state.active.remove(&view.id);
         self.state.completed.remove(&view.id);
@@ -258,6 +268,62 @@ mod tests {
         projection.remove(active.id);
 
         assert!(!projection.state().active.contains_key(&active.id));
+    }
+
+    #[test]
+    fn projection_should_reset_speed_history_between_lifecycles() {
+        let mut projection = Projection::new(None);
+        let active = item(1, DownloadStatus::Downloading, Bytes::ZERO);
+        projection.apply_item(&active, 1_000);
+        projection.apply_progress(
+            active.id,
+            DownloadProgress {
+                downloaded_bytes: Bytes::new(1_000),
+                total_bytes: Some(Bytes::new(3_000)),
+                speed: BytesPerSecond::ZERO,
+                eta_seconds: None,
+                active_part_count: 1,
+            },
+            2_000,
+        );
+        projection.reset_meter(active.id);
+
+        projection.apply_progress(
+            active.id,
+            DownloadProgress {
+                downloaded_bytes: Bytes::new(1_000),
+                total_bytes: Some(Bytes::new(3_000)),
+                speed: BytesPerSecond::ZERO,
+                eta_seconds: None,
+                active_part_count: 1,
+            },
+            3_000,
+        );
+        let after_reset = projection
+            .state()
+            .active
+            .get(&active.id)
+            .map(|view| view.speed);
+
+        projection.apply_progress(
+            active.id,
+            DownloadProgress {
+                downloaded_bytes: Bytes::new(2_000),
+                total_bytes: Some(Bytes::new(3_000)),
+                speed: BytesPerSecond::ZERO,
+                eta_seconds: None,
+                active_part_count: 1,
+            },
+            4_000,
+        );
+        let after_new_delta = projection
+            .state()
+            .active
+            .get(&active.id)
+            .map(|view| view.speed);
+
+        assert_eq!(after_reset, Some(BytesPerSecond::ZERO));
+        assert_eq!(after_new_delta, Some(BytesPerSecond::new(1_000)));
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod job;
 pub mod manager;
 pub mod model;
 pub mod part;
+pub mod speed;
 
 pub use http::{
     ByteRange, ContentRange, HttpClient, HttpMetadata, HttpProbeError, HttpRequest, HttpResponse,
@@ -20,3 +21,4 @@ pub use model::{
     PartStatus, QueueId, ResumeSupport,
 };
 pub use part::{RangeSplitError, split_fixed_ranges, split_fixed_ranges_with_min_part_size};
+pub use speed::SpeedLimiter;

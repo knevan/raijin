@@ -24,6 +24,7 @@ pub(crate) struct AppServices {
     pub(crate) queues: QueueManagerHandle,
     pub(crate) monitor: DownloadMonitorHandle,
     pub(crate) default_folder: PathBuf,
+    pub(crate) category_root: PathBuf,
 }
 
 impl AppServices {
@@ -34,6 +35,7 @@ impl AppServices {
         let part_repo = PartRepository::new(pool.clone());
         let queue_repo = QueueRepository::new(pool);
         let existing_downloads = download_repo.list().await?;
+        let category_root = platform::download_category_root_dir()?;
         let default_folder = platform::default_download_dir()?;
 
         let (downloads, _download_task) = DownloadManagerHandle::spawn(
@@ -58,6 +60,7 @@ impl AppServices {
             queues,
             monitor,
             default_folder,
+            category_root,
         })
     }
 }

@@ -7,6 +7,7 @@ use freya::icons;
 use freya::prelude::*;
 use freya::winit::dpi::PhysicalPosition;
 use freya::winit::window::WindowId;
+use reqwest::Url;
 
 use super::services::AppServices;
 use super::sidebar::SidebarFilter;
@@ -822,6 +823,7 @@ fn category_toggle(
     mut dropdown_open: State<bool>,
     mut popup_window: State<Option<WindowId>>,
     default_folder: PathBuf,
+    category_root: PathBuf,
 ) -> impl IntoElement {
     let checked = enabled();
     rect()
@@ -838,7 +840,7 @@ fn category_toggle(
                 popup_window.set(None);
             }
             let next_folder = if next {
-                category_folder(&default_folder, selected_category())
+                category_folder(&category_root, selected_category())
             } else {
                 default_folder.clone()
             };
@@ -884,7 +886,7 @@ fn category_dropdown(
     mut popup_window: State<Option<WindowId>>,
     use_category: State<bool>,
     mut folder: State<String>,
-    default_folder: PathBuf,
+    category_root: PathBuf,
 ) -> impl IntoElement {
     let category = selected_category();
     let enabled = use_category();
@@ -902,7 +904,7 @@ fn category_dropdown(
             el.on_press(move |_| {
                 if folder.read().trim().is_empty() {
                     folder.set(
-                        category_folder(&default_folder, category)
+                        category_folder(&category_root, category)
                             .to_string_lossy()
                             .into_owned(),
                     );
@@ -919,7 +921,7 @@ fn category_dropdown(
                     open,
                     popup_window,
                     folder,
-                    default_folder.clone(),
+                    category_root.clone(),
                 );
             })
         })
@@ -961,7 +963,7 @@ fn category_dropdown_menu(
     mut open: State<bool>,
     mut popup_window: State<Option<WindowId>>,
     mut folder: State<String>,
-    default_folder: PathBuf,
+    category_root: PathBuf,
 ) -> impl IntoElement {
     let selected = selected_category();
     rect()
@@ -975,7 +977,7 @@ fn category_dropdown_menu(
         .children(DOWNLOAD_CATEGORIES.iter().map(|category| {
             let category = *category;
             let selected_now = selected == category;
-            let default_folder = default_folder.clone();
+            let category_root = category_root.clone();
             rect()
                 .key(category.label())
                 .height(Size::px(36.))
@@ -993,7 +995,7 @@ fn category_dropdown_menu(
                 .on_press(move |_| {
                     selected_category.set(category);
                     folder.set(
-                        category_folder(&default_folder, category)
+                        category_folder(&category_root, category)
                             .to_string_lossy()
                             .into_owned(),
                     );
@@ -1106,7 +1108,7 @@ struct CategoryPopupWindow {
     open: State<bool>,
     popup_window: State<Option<WindowId>>,
     folder: State<String>,
-    default_folder: PathBuf,
+    category_root: PathBuf,
 }
 
 impl ComponentOwned for CategoryPopupWindow {
@@ -1121,7 +1123,7 @@ impl ComponentOwned for CategoryPopupWindow {
                 self.open,
                 self.popup_window,
                 self.folder,
-                self.default_folder,
+                self.category_root,
             ))
     }
 }
@@ -1131,7 +1133,7 @@ fn open_category_menu_window(
     open: State<bool>,
     mut popup_window: State<Option<WindowId>>,
     folder: State<String>,
-    default_folder: PathBuf,
+    category_root: PathBuf,
 ) {
     spawn(async move {
         let platform = Platform::get();
@@ -1155,7 +1157,7 @@ fn open_category_menu_window(
                 open,
                 popup_window,
                 folder,
-                default_folder,
+                category_root,
                 position,
             ))
             .await;
@@ -1168,7 +1170,7 @@ fn category_popup_window_config(
     open: State<bool>,
     popup_window: State<Option<WindowId>>,
     folder: State<String>,
-    default_folder: PathBuf,
+    category_root: PathBuf,
     position: Option<PhysicalPosition<i32>>,
 ) -> WindowConfig {
     WindowConfig::new(move || CategoryPopupWindow {
@@ -1176,7 +1178,7 @@ fn category_popup_window_config(
         open,
         popup_window,
         folder,
-        default_folder: default_folder.clone(),
+        category_root: category_root.clone(),
     })
     .with_title("Raijin Category")
     .with_size(275., 242.)
@@ -1194,8 +1196,8 @@ fn category_popup_window_config(
     })
 }
 
-fn category_folder(default_folder: &std::path::Path, category: DownloadCategory) -> PathBuf {
-    default_folder.join(category.label())
+fn category_folder(category_root: &std::path::Path, category: DownloadCategory) -> PathBuf {
+    category_root.join(category.label())
 }
 
 impl Component for NewDownloadWindow {
@@ -1210,14 +1212,16 @@ impl Component for NewDownloadWindow {
         let file_name = use_state(String::new);
         let mut remote_size = use_state(|| Option::<Bytes>::None);
         let mut remote_size_url = use_state(String::new);
-        let initial_folder = category_folder(&self.services.default_folder, selected_category());
+        let initial_folder = category_folder(&self.services.category_root, selected_category());
         let folder = use_state(|| initial_folder.to_string_lossy().into_owned());
-        let has_link = !link.read().trim().is_empty();
+        let link_value = link.read().trim().to_owned();
+        let has_valid_link = is_valid_http_download_url(&link_value);
         let services = self.services.clone();
-        let default_file_name = file_name_from_url(link.read().trim());
+        let default_file_name = file_name_from_url(&link_value);
         let resolved_file_name = resolved_download_file_name(&file_name.read(), &default_file_name);
-        let can_download =
-            has_link && !resolved_file_name.trim().is_empty() && !folder.read().trim().is_empty();
+        let can_download = has_valid_link
+            && !resolved_file_name.trim().is_empty()
+            && !folder.read().trim().is_empty();
 
         use_side_effect(move || {
             let url = link.read().trim().to_owned();
@@ -1226,7 +1230,7 @@ impl Component for NewDownloadWindow {
             }
             remote_size_url.set(url.clone());
             remote_size.set(None);
-            if url.is_empty() {
+            if !is_valid_http_download_url(&url) {
                 return;
             }
             spawn(async move {
@@ -1287,6 +1291,7 @@ impl Component for NewDownloadWindow {
                                 category_dropdown_open,
                                 category_popup_window,
                                 self.services.default_folder.clone(),
+                                self.services.category_root.clone(),
                             ))
                             .child(category_dropdown(
                                 selected_category,
@@ -1294,7 +1299,7 @@ impl Component for NewDownloadWindow {
                                 category_popup_window,
                                 use_category,
                                 folder,
-                                self.services.default_folder.clone(),
+                                self.services.category_root.clone(),
                             ))
                             .child(download_size_badge(remote_size())),
                     )
@@ -1327,7 +1332,7 @@ impl Component for NewDownloadWindow {
                                 can_download,
                                 add_download_to_list_action(
                                     services.clone(),
-                                    link.read().trim().to_owned(),
+                                    link_value.clone(),
                                     PathBuf::from(folder.read().trim()),
                                     resolved_file_name.clone(),
                                 ),
@@ -1341,7 +1346,7 @@ impl Component for NewDownloadWindow {
                                         can_download,
                                         add_download_action(
                                             services,
-                                            link.read().trim().to_owned(),
+                                            link_value,
                                             PathBuf::from(folder.read().trim()),
                                             resolved_file_name,
                                         ),
@@ -1453,7 +1458,7 @@ fn add_download_action(
         let folder = folder.clone();
         let file_name = file_name.clone();
         spawn(async move {
-            if url.trim().is_empty() || file_name.trim().is_empty() {
+            if !is_valid_http_download_url(&url) || file_name.trim().is_empty() {
                 return;
             }
             let request = NewDownload::http(url, sanitize_file_name(&file_name), folder);
@@ -1491,7 +1496,7 @@ fn add_download_to_list_action(
         let folder = folder.clone();
         let file_name = file_name.clone();
         spawn(async move {
-            if url.trim().is_empty() || file_name.trim().is_empty() {
+            if !is_valid_http_download_url(&url) || file_name.trim().is_empty() {
                 return;
             }
             let request = NewDownload::http(url, sanitize_file_name(&file_name), folder);
@@ -1996,6 +2001,13 @@ fn file_name_from_url(url: &str) -> String {
         .unwrap_or_else(|| "Name".to_owned())
 }
 
+fn is_valid_http_download_url(url: &str) -> bool {
+    Url::parse(url.trim()).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some_and(|host| !host.is_empty())
+    })
+}
+
 fn resolved_download_file_name(input: &str, fallback: &str) -> String {
     let candidate = input.trim();
     if candidate.is_empty() {
@@ -2023,4 +2035,22 @@ fn left_border() -> Border {
             ..Default::default()
         })
         .fill(theme::BORDER)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_http_download_url_should_reject_plain_file_name() {
+        assert!(!is_valid_http_download_url(
+            "OP-1170-720p-SAMEHADAKU.CARE.mkv"
+        ));
+    }
+
+    #[test]
+    fn valid_http_download_url_should_accept_http_and_https() {
+        assert!(is_valid_http_download_url("https://example.com/file.mkv"));
+        assert!(is_valid_http_download_url("http://example.com/file.mkv"));
+    }
 }

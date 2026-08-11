@@ -15,6 +15,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{DbError, DownloadRepository, PartRepository};
+use crate::download::http::ACCEPT_ENCODING_IDENTITY;
 use crate::download::part::split_part_at;
 use crate::download::speed::SpeedLimiter;
 use crate::download::{
@@ -882,12 +883,19 @@ fn request_headers(
 ) -> HttpDownloadJobResult<HeaderMap> {
     let mut map = HeaderMap::new();
     for (name, value) in headers {
+        if name.eq_ignore_ascii_case(header::HOST.as_str()) {
+            continue;
+        }
         let name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| HttpDownloadJobError::InvalidHeaderName(name.clone()))?;
         let value = HeaderValue::from_str(value)
             .map_err(|_| HttpDownloadJobError::InvalidHeaderValue(name.to_string()))?;
         map.insert(name, value);
     }
+    map.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static(ACCEPT_ENCODING_IDENTITY),
+    );
     Ok(map)
 }
 

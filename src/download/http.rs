@@ -11,6 +11,9 @@ use crate::download::{Bytes, ResumeSupport};
 
 const PROBE_RANGE_START: u64 = 0;
 const PROBE_RANGE_END: u64 = 255;
+const MAX_PROBE_BODY_BYTES: usize = 4096;
+const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+pub(crate) const ACCEPT_ENCODING_IDENTITY: &str = "identity";
 
 /// Inclusive byte range used by HTTP requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +92,8 @@ impl ReqwestHttpClient {
     /// Returns an error if reqwest client construction fails.
     pub fn new() -> Result<Self, HttpProbeError> {
         let client = reqwest::Client::builder()
+            .user_agent(DEFAULT_USER_AGENT)
+            .default_headers(default_http_headers())
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()?;
         Ok(Self { client })
@@ -103,6 +108,15 @@ impl ReqwestHttpClient {
     pub(crate) fn client(&self) -> &reqwest::Client {
         &self.client
     }
+}
+
+fn default_http_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static(ACCEPT_ENCODING_IDENTITY),
+    );
+    headers
 }
 
 impl std::fmt::Debug for ReqwestHttpClient {
@@ -121,10 +135,10 @@ impl HttpClient for ReqwestHttpClient {
             builder = builder.header(header::RANGE, range.header_value());
         }
 
-        let response = builder.send().await?;
+        let mut response = builder.send().await?;
         let status = response.status().as_u16();
         let headers = response_headers(response.headers());
-        let body = response.bytes().await?.to_vec();
+        let body = read_probe_body(&mut response).await?;
 
         Ok(HttpResponse {
             status,
@@ -132,6 +146,22 @@ impl HttpClient for ReqwestHttpClient {
             body,
         })
     }
+}
+
+async fn read_probe_body(response: &mut reqwest::Response) -> Result<Vec<u8>, HttpProbeError> {
+    let mut body = Vec::new();
+    while body.len() < MAX_PROBE_BODY_BYTES {
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        let remaining = MAX_PROBE_BODY_BYTES - body.len();
+        let writable = chunk.len().min(remaining);
+        body.extend_from_slice(&chunk[..writable]);
+        if writable < chunk.len() {
+            break;
+        }
+    }
+    Ok(body)
 }
 
 /// Request for metadata probing.
@@ -467,12 +497,19 @@ pub(crate) fn parse_content_range(value: &str) -> Result<ContentRange, HttpProbe
 fn request_headers(request: &HttpRequest) -> Result<HeaderMap, HttpProbeError> {
     let mut headers = HeaderMap::with_capacity(request.headers.len());
     for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case(header::HOST.as_str()) {
+            continue;
+        }
         let header_name = HeaderName::from_str(name)
             .map_err(|_| HttpProbeError::InvalidHeaderName(name.clone()))?;
         let header_value = HeaderValue::from_str(value)
             .map_err(|_| HttpProbeError::InvalidHeaderValue(name.clone()))?;
         headers.insert(header_name, header_value);
     }
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static(ACCEPT_ENCODING_IDENTITY),
+    );
     Ok(headers)
 }
 
@@ -514,6 +551,7 @@ mod tests {
     enum ServerMode {
         RangeSupported,
         RangeUnsupported,
+        RangeUnsupportedLargeBody,
         ChangedLength,
         ChangedEtag,
         HtmlPage,
@@ -602,6 +640,16 @@ mod tests {
                     ("Content-Type", "application/octet-stream"),
                 ],
                 &vec![b'a'; 1024],
+            ),
+            ServerMode::RangeUnsupportedLargeBody => response(
+                200,
+                "OK",
+                &[
+                    (CONTENT_LENGTH.as_str(), "8192"),
+                    (ETAG.as_str(), "\"etag-1\""),
+                    ("Content-Type", "application/octet-stream"),
+                ],
+                &vec![b'a'; 8192],
             ),
             ServerMode::ChangedLength if has_range => response(
                 206,
@@ -700,6 +748,24 @@ mod tests {
         assert_eq!(metadata.resume_support, ResumeSupport::Unsupported);
         assert_eq!(metadata.total_bytes, Some(Bytes::new(1024)));
         assert_eq!(metadata.content_range, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reqwest_probe_client_should_cap_captured_body()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = TestServer::spawn(ServerMode::RangeUnsupportedLargeBody).await?;
+        let client = reqwest_client()?;
+        let response = client
+            .execute(HttpRequest {
+                url: server.url(),
+                headers: BTreeMap::new(),
+                range: Some(ByteRange::new(Bytes::ZERO, Bytes::new(255))),
+            })
+            .await?;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.len(), MAX_PROBE_BODY_BYTES);
         Ok(())
     }
 

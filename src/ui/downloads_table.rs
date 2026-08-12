@@ -11,7 +11,7 @@ use reqwest::Url;
 
 use super::services::AppServices;
 use super::sidebar::SidebarFilter;
-use super::theme;
+use super::{settings_window, theme};
 use crate::download::{
     Bytes, DownloadId, DownloadStatus, NewDownload, ProbeRequest, QueueId, ReqwestHttpClient,
     probe_http,
@@ -386,7 +386,10 @@ impl Component for DownloadsToolbar {
                 icons::lucide::settings(),
                 true,
                 false,
-                noop_toolbar_action(),
+                {
+                    let services = self.services.clone();
+                    (move |()| open_settings_window(services.clone())).into()
+                },
             ))
     }
 }
@@ -1205,7 +1208,7 @@ impl Component for NewDownloadWindow {
         use_init_theme(theme::raijin_theme);
 
         let link = use_state(String::new);
-        let use_category = use_state(|| true);
+        let mut use_category = use_state(|| true);
         let selected_category = use_state(|| DownloadCategory::Programs);
         let category_dropdown_open = use_state(|| false);
         let category_popup_window = use_state(|| Option::<WindowId>::None);
@@ -1213,7 +1216,24 @@ impl Component for NewDownloadWindow {
         let mut remote_size = use_state(|| Option::<Bytes>::None);
         let mut remote_size_url = use_state(String::new);
         let initial_folder = category_folder(&self.services.category_root, selected_category());
-        let folder = use_state(|| initial_folder.to_string_lossy().into_owned());
+        let mut folder = use_state(|| initial_folder.to_string_lossy().into_owned());
+        let settings_services = self.services.clone();
+        use_hook(move || {
+            spawn(async move {
+                match settings_services.load_desktop_settings().await {
+                    Ok(settings) => {
+                        use_category.set(settings.use_category_by_default);
+                        let next_folder = if settings.use_category_by_default {
+                            category_folder(&settings.category_root, selected_category())
+                        } else {
+                            settings.default_download_folder
+                        };
+                        folder.set(next_folder.to_string_lossy().into_owned());
+                    }
+                    Err(error) => tracing::warn!(?error, "new download settings load failed"),
+                }
+            });
+        });
         let link_value = link.read().trim().to_owned();
         let has_valid_link = is_valid_http_download_url(&link_value);
         let services = self.services.clone();
@@ -1541,6 +1561,14 @@ fn open_new_download_window(services: AppServices) {
     });
 }
 
+fn open_settings_window(services: AppServices) {
+    spawn(async move {
+        Platform::get()
+            .launch_window(settings_window::settings_window_config(services))
+            .await;
+    });
+}
+
 fn close_current_window_action() -> EventHandler<()> {
     (|()| close_current_window()).into()
 }
@@ -1760,10 +1788,6 @@ fn toolbar_button(
                     ),
             )
         })
-}
-
-fn noop_toolbar_action() -> EventHandler<()> {
-    (|()| {}).into()
 }
 
 fn dialog_input_colors() -> InputColorsThemePartial {

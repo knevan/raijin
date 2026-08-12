@@ -1,6 +1,7 @@
 mod app;
 mod downloads_table;
 mod services;
+mod settings_window;
 mod sidebar;
 mod theme;
 

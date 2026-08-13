@@ -411,6 +411,16 @@ pub struct DownloadPart {
 pub struct DownloadConfig {
     /// Default worker count for ranged downloads.
     pub default_connections: NonZeroU16,
+    /// Whether downloads without an explicit connection count use adaptive ranged workers.
+    pub adaptive_connections_enabled: bool,
+    /// Minimum adaptive ranged worker count.
+    pub min_connections: NonZeroU16,
+    /// Maximum ranged worker count, including explicit custom values.
+    pub max_connections: NonZeroU16,
+    /// Probe interval for adaptive connection decisions, in milliseconds.
+    pub connection_probe_interval_ms: u64,
+    /// Required aggregate throughput gain percentage before probing more workers.
+    pub connection_gain_threshold: u8,
     /// Minimum bytes per ranged part.
     pub min_part_size: Bytes,
     /// Maximum retries per failing part or job stage.
@@ -426,7 +436,12 @@ pub struct DownloadConfig {
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
-            default_connections: non_zero_u16(4),
+            default_connections: non_zero_u16(8),
+            adaptive_connections_enabled: true,
+            min_connections: non_zero_u16(1),
+            max_connections: non_zero_u16(16),
+            connection_probe_interval_ms: 1_000,
+            connection_gain_threshold: 10,
             min_part_size: Bytes::new(4 * 1024 * 1024),
             max_retries: non_zero_u32(3),
             incomplete_extension: ".raijin-part".to_owned(),

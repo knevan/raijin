@@ -201,6 +201,12 @@ struct HttpDownloadJobConfig {
     progress_interval: Duration,
     max_retries: u32,
     min_part_size: Bytes,
+    adaptive_connections_enabled: bool,
+    default_connections: u16,
+    min_connections: u16,
+    max_connections: u16,
+    connection_probe_interval: Duration,
+    connection_gain_threshold: u8,
 }
 
 impl Default for HttpDownloadJobConfig {
@@ -211,6 +217,14 @@ impl Default for HttpDownloadJobConfig {
             progress_interval: DEFAULT_PROGRESS_INTERVAL,
             max_retries: download_config.max_retries.get(),
             min_part_size: download_config.min_part_size,
+            adaptive_connections_enabled: download_config.adaptive_connections_enabled,
+            default_connections: download_config.default_connections.get(),
+            min_connections: download_config.min_connections.get(),
+            max_connections: download_config.max_connections.get(),
+            connection_probe_interval: Duration::from_millis(
+                download_config.connection_probe_interval_ms.max(1),
+            ),
+            connection_gain_threshold: download_config.connection_gain_threshold,
         }
     }
 }
@@ -408,8 +422,16 @@ impl HttpDownloadJob {
             .item
             .total_bytes
             .ok_or(HttpDownloadJobError::ResumeUnsupported)?;
+        let mut connection_controller = ConnectionController::new(
+            &self.config,
+            self.item.preferred_connections,
+            total.get(),
+            downloaded_from_parts(&existing_parts),
+        );
+        let mut connection_target = connection_controller.target();
+        let mut retries_since_probe = 0_u32;
         let mut parts = if existing_parts.is_empty() || existing_parts.len() == 1 {
-            let desired_parts = self.preferred_connections().get();
+            let desired_parts = u16::try_from(connection_target).unwrap_or(u16::MAX);
             split_fixed_ranges_with_min_part_size(
                 self.item.id,
                 Some(total),
@@ -423,6 +445,11 @@ impl HttpDownloadJob {
         self.part_repo
             .set_for_download(self.item.id, &parts)
             .await?;
+        if self.live_progress.is_none() {
+            self.live_progress = Some(Arc::new(LiveDownloadProgress::new(Bytes::new(
+                downloaded_from_parts(&parts),
+            ))));
+        }
         if let Some(live_progress) = &self.live_progress {
             live_progress.set_downloaded(Bytes::new(downloaded_from_parts(&parts)));
         }
@@ -445,12 +472,28 @@ impl HttpDownloadJob {
             .collect::<std::collections::VecDeque<_>>();
         let mut workers = JoinSet::new();
         let mut worker_controls = std::collections::HashMap::new();
-        let limit = usize::from(self.preferred_connections().get());
+        let mut connection_probe = tokio::time::interval(self.config.connection_probe_interval);
+        connection_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        connection_probe.tick().await;
         let speed_limiter = self.item.speed_limit.and_then(SpeedLimiter::new);
         let mut first_error = None;
 
         loop {
-            while workers.len() < limit {
+            while workers.len().saturating_add(pending.len()) < connection_target {
+                if !split_pending_part(
+                    &mut pending,
+                    &self.part_repo,
+                    &mut next_part_index,
+                    self.config.min_part_size,
+                    now_ms()?,
+                )
+                .await?
+                {
+                    break;
+                }
+            }
+
+            while workers.len() < connection_target {
                 if let Some(part) = pending.pop_front() {
                     let part_index = part.index;
                     let (control_tx, control_rx) = mpsc::channel(1);
@@ -483,7 +526,7 @@ impl HttpDownloadJob {
                     continue;
                 }
 
-                if workers.len() < limit {
+                if workers.len() < connection_target {
                     let child = request_inflight_split(
                         &worker_controls,
                         &self.part_repo,
@@ -506,15 +549,28 @@ impl HttpDownloadJob {
                 break;
             }
 
-            let joined =
-                if workers.len() < limit && pending.is_empty() && !worker_controls.is_empty() {
-                    tokio::select! {
-                        () = tokio::time::sleep(SPLIT_RETRY_INTERVAL) => continue,
-                        joined = workers.join_next() => joined,
-                    }
-                } else {
-                    workers.join_next().await
-                };
+            let should_wait_for_split = workers.len() < connection_target
+                && pending.is_empty()
+                && !worker_controls.is_empty();
+            let joined = tokio::select! {
+                _ = connection_probe.tick(), if connection_controller.is_adaptive() => {
+                    let (downloaded, active_part_count) = self
+                        .live_progress
+                        .as_ref()
+                        .map(|progress| progress.snapshot())
+                        .unwrap_or((Bytes::ZERO, u16::try_from(workers.len()).unwrap_or(u16::MAX)));
+                    connection_target = connection_controller.observe(ConnectionSample {
+                        downloaded_bytes: downloaded.get(),
+                        active_part_count,
+                        retry_count: retries_since_probe,
+                        remaining_bytes: total.get().saturating_sub(downloaded.get()),
+                    });
+                    retries_since_probe = 0;
+                    continue;
+                }
+                () = tokio::time::sleep(SPLIT_RETRY_INTERVAL), if should_wait_for_split => continue,
+                joined = workers.join_next() => joined,
+            };
             let (part_index, outcome) = joined.ok_or(HttpDownloadJobError::ResumeUnsupported)??;
             let outcome = outcome?;
             worker_controls.remove(&part_index);
@@ -532,6 +588,7 @@ impl HttpDownloadJob {
                         break;
                     } else if part.retry_count < self.config.max_retries {
                         part.retry_count += 1;
+                        retries_since_probe = retries_since_probe.saturating_add(1);
                         part.status = PartStatus::Idle;
                         part.updated_at = now_ms()?;
                         self.part_repo.set(&part).await?;
@@ -1021,6 +1078,206 @@ async fn request_inflight_split(
     Ok(None)
 }
 
+async fn split_pending_part(
+    pending: &mut std::collections::VecDeque<DownloadPart>,
+    part_repo: &PartRepository,
+    next_part_index: &mut u32,
+    min_part_size: Bytes,
+    now_ms: i64,
+) -> HttpDownloadJobResult<bool> {
+    let Some((candidate_index, split_start)) = pending
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            let end = part.end_byte?;
+            let remaining = end
+                .get()
+                .checked_add(1)?
+                .checked_sub(part.current_byte.get())?;
+            let split_start =
+                valid_inflight_split_start(part.current_byte, end.get(), min_part_size)?;
+            Some((index, remaining, split_start))
+        })
+        .max_by_key(|(_, remaining, _)| *remaining)
+        .map(|(index, _, split_start)| (index, split_start))
+    else {
+        return Ok(false);
+    };
+
+    let Some(part) = pending.get(candidate_index).cloned() else {
+        return Ok(false);
+    };
+    let (parent, child) = split_part_at(&part, *next_part_index, split_start, now_ms)?;
+    part_repo.set_many(&[parent.clone(), child.clone()]).await?;
+    *next_part_index = next_part_index.saturating_add(1);
+    if let Some(slot) = pending.get_mut(candidate_index) {
+        *slot = parent;
+    }
+    pending.push_back(child);
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionMode {
+    Fixed,
+    Adaptive,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConnectionSample {
+    downloaded_bytes: u64,
+    active_part_count: u16,
+    retry_count: u32,
+    remaining_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionController {
+    mode: ConnectionMode,
+    min: usize,
+    max: usize,
+    min_part_size: u64,
+    gain_threshold: u8,
+    target: usize,
+    last_downloaded_bytes: u64,
+    last_speed_bps: Option<u64>,
+    slow_probe_count: u8,
+}
+
+impl ConnectionController {
+    fn new(
+        config: &HttpDownloadJobConfig,
+        preferred_connections: Option<NonZeroU16>,
+        total_bytes: u64,
+        downloaded_bytes: u64,
+    ) -> Self {
+        let max = usize::from(config.max_connections.max(1));
+        let min = usize::from(config.min_connections.max(1)).min(max);
+        let remaining = total_bytes.saturating_sub(downloaded_bytes);
+        let mode = if preferred_connections.is_some() || !config.adaptive_connections_enabled {
+            ConnectionMode::Fixed
+        } else {
+            ConnectionMode::Adaptive
+        };
+        let requested = preferred_connections
+            .map(NonZeroU16::get)
+            .unwrap_or(config.default_connections);
+        let target = Self::cap_by_remaining(
+            usize::from(requested).clamp(min, max),
+            min,
+            config.min_part_size.get(),
+            remaining,
+        );
+
+        Self {
+            mode,
+            min,
+            max,
+            min_part_size: config.min_part_size.get(),
+            gain_threshold: config.connection_gain_threshold,
+            target,
+            last_downloaded_bytes: downloaded_bytes,
+            last_speed_bps: None,
+            slow_probe_count: 0,
+        }
+    }
+
+    fn is_adaptive(&self) -> bool {
+        self.mode == ConnectionMode::Adaptive
+    }
+
+    fn target(&self) -> usize {
+        self.target
+    }
+
+    fn observe(&mut self, sample: ConnectionSample) -> usize {
+        if !self.is_adaptive() {
+            return self.target;
+        }
+
+        let speed_bps = sample
+            .downloaded_bytes
+            .saturating_sub(self.last_downloaded_bytes);
+        self.last_downloaded_bytes = sample.downloaded_bytes;
+        let remaining_cap = Self::cap_by_remaining(
+            self.max,
+            self.min,
+            self.min_part_size,
+            sample.remaining_bytes,
+        );
+
+        if sample.retry_count > 0 {
+            self.target = self
+                .target
+                .saturating_sub(1)
+                .max(self.min)
+                .min(remaining_cap);
+            self.last_speed_bps = Some(speed_bps);
+            self.slow_probe_count = 0;
+            return self.target;
+        }
+
+        let Some(last_speed_bps) = self.last_speed_bps.replace(speed_bps) else {
+            self.target = self.target.min(remaining_cap);
+            return self.target;
+        };
+
+        if usize::from(sample.active_part_count) < self.target {
+            self.target = self.target.min(remaining_cap);
+            self.slow_probe_count = 0;
+            return self.target;
+        }
+
+        if has_meaningful_gain(last_speed_bps, speed_bps, self.gain_threshold)
+            && self.target < remaining_cap
+        {
+            self.target += 1;
+            self.slow_probe_count = 0;
+            return self.target;
+        }
+
+        if speed_bps < last_speed_bps {
+            self.slow_probe_count = self.slow_probe_count.saturating_add(1);
+            if self.slow_probe_count >= 2 && self.target > self.min {
+                self.target -= 1;
+                self.slow_probe_count = 0;
+            }
+        } else {
+            self.slow_probe_count = 0;
+        }
+
+        self.target = self.target.min(remaining_cap);
+        self.target
+    }
+
+    fn cap_by_remaining(
+        target: usize,
+        min: usize,
+        min_part_size: u64,
+        remaining_bytes: u64,
+    ) -> usize {
+        if remaining_bytes == 0 {
+            return min;
+        }
+
+        let min_part_size = min_part_size.max(1);
+        let range_limited = remaining_bytes.div_ceil(min_part_size).max(1);
+        target
+            .min(usize::try_from(range_limited).unwrap_or(usize::MAX))
+            .max(min)
+    }
+}
+
+fn has_meaningful_gain(previous_bps: u64, current_bps: u64, threshold_percent: u8) -> bool {
+    if current_bps <= previous_bps {
+        return false;
+    }
+    let threshold = previous_bps
+        .saturating_mul(u64::from(threshold_percent))
+        .div_ceil(100);
+    current_bps.saturating_sub(previous_bps) >= threshold.max(1)
+}
+
 fn probe_error_requires_manual_action(error: &crate::download::HttpProbeError) -> bool {
     matches!(
         error,
@@ -1362,7 +1619,7 @@ async fn handle_part_worker_control(
     part: &mut DownloadPart,
     target_end: &mut u64,
     control: PartWorkerControl,
-    cancellation: &CancellationToken,
+    _cancellation: &CancellationToken,
 ) {
     let PartWorkerControl::RequestSplit {
         child_index,
@@ -1399,10 +1656,7 @@ async fn handle_part_worker_control(
         return;
     }
 
-    let committed = tokio::select! {
-        _ = cancellation.cancelled() => false,
-        committed = commit_rx => committed.unwrap_or(false),
-    };
+    let committed = commit_rx.await.unwrap_or(false);
     if committed {
         part.end_byte = Some(parent_end);
         part.updated_at = now_ms;
@@ -1724,6 +1978,28 @@ mod tests {
         }
     }
 
+    fn non_zero_connection(value: u16) -> NonZeroU16 {
+        match NonZeroU16::new(value) {
+            Some(value) => value,
+            None => panic!("test connection count must be non-zero"),
+        }
+    }
+
+    fn adaptive_test_config() -> HttpDownloadJobConfig {
+        HttpDownloadJobConfig {
+            incomplete_extension: ".part".to_owned(),
+            progress_interval: Duration::from_millis(10),
+            max_retries: 3,
+            min_part_size: Bytes::new(1_024),
+            adaptive_connections_enabled: true,
+            default_connections: 4,
+            min_connections: 1,
+            max_connections: 8,
+            connection_probe_interval: Duration::from_millis(10),
+            connection_gain_threshold: 10,
+        }
+    }
+
     fn assert_contiguous_completed_ranges(parts: &[DownloadPart], total_len: u64) {
         let mut parts = parts.to_vec();
         parts.sort_by_key(|part| part.start_byte);
@@ -1756,6 +2032,65 @@ mod tests {
             next_start = end.get().saturating_add(1);
         }
         assert_eq!(next_start, total_len);
+    }
+
+    #[test]
+    fn adaptive_connections_should_increase_after_meaningful_gain() {
+        let config = adaptive_test_config();
+        let mut controller = ConnectionController::new(&config, None, 64 * 1_024, 0);
+
+        assert_eq!(controller.target(), 4);
+        assert_eq!(
+            controller.observe(ConnectionSample {
+                downloaded_bytes: 10_000,
+                active_part_count: 4,
+                retry_count: 0,
+                remaining_bytes: 54_000,
+            }),
+            4
+        );
+        assert_eq!(
+            controller.observe(ConnectionSample {
+                downloaded_bytes: 22_000,
+                active_part_count: 4,
+                retry_count: 0,
+                remaining_bytes: 42_000,
+            }),
+            5
+        );
+    }
+
+    #[test]
+    fn adaptive_connections_should_decrease_after_retries() {
+        let config = adaptive_test_config();
+        let mut controller = ConnectionController::new(&config, None, 64 * 1_024, 0);
+
+        let target = controller.observe(ConnectionSample {
+            downloaded_bytes: 10_000,
+            active_part_count: 4,
+            retry_count: 1,
+            remaining_bytes: 54_000,
+        });
+
+        assert_eq!(target, 3);
+    }
+
+    #[test]
+    fn fixed_connections_should_clamp_custom_values_to_safe_cap() {
+        let config = adaptive_test_config();
+        let mut controller =
+            ConnectionController::new(&config, Some(non_zero_connection(64)), 128 * 1_024, 0);
+
+        assert_eq!(controller.target(), 8);
+        assert_eq!(
+            controller.observe(ConnectionSample {
+                downloaded_bytes: 32_000,
+                active_part_count: 8,
+                retry_count: 2,
+                remaining_bytes: 96_000,
+            }),
+            8
+        );
     }
 
     fn sample_item(url: String, folder: PathBuf, downloaded: u64) -> DownloadItem {

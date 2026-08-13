@@ -12,4 +12,11 @@ run = "cargo run --features dev"
 
 [tasks.release]
 dir = "."
-run = "cargo build --profile small"
+run = "cargo build --profile small --features desktop"
+
+[tasks.dev-tool]
+dir = "."
+run = "freya-devtools-app"
+
+[tasks.dev-ui]
+depends = ["dev", "dev-tool"]

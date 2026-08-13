@@ -1,6 +1,8 @@
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::NonZeroU16;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use freya::animation::{AnimNum, Ease, use_animation_transition};
 use freya::icons;
 use freya::prelude::*;
 
@@ -11,15 +13,14 @@ use crate::download::QueueId;
 
 const MIN_THREADS: u16 = 1;
 const MAX_THREADS: u16 = 32;
-const MIN_CONCURRENT_DOWNLOADS: u16 = 1;
+const MIN_CONCURRENT_DOWNLOADS: u16 = 0;
 const MAX_CONCURRENT_DOWNLOADS: u16 = 16;
-const MIN_RETRIES: u32 = 1;
+const MIN_RETRIES: u32 = 0;
 const MAX_RETRIES: u32 = 10;
-const SETTINGS_CONTENT_WIDTH: f32 = 620.;
 const SETTING_COPY_WIDTH: f32 = 340.;
 const SETTING_CONTROL_WIDTH: f32 = 150.;
-const FOLDER_CONTROL_WIDTH: f32 = 230.;
-const SETTING_ROW_RIGHT_PADDING: f32 = 120.;
+const FOLDER_INPUT_WIDTH: f32 = 255.;
+const FOLDER_CONTROL_WIDTH: f32 = FOLDER_INPUT_WIDTH + 38.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
@@ -51,8 +52,10 @@ impl Component for SettingsWindow {
             )
         });
         let mut folder = use_state(|| self.services.default_folder.to_string_lossy().into_owned());
+        let mut folder_autosave_enabled = use_state(|| false);
         let mut load_error = use_state(|| Option::<String>::None);
-        let save_status = use_state(|| Option::<String>::None);
+        let mut save_status = use_state(|| Option::<String>::None);
+        let mut visible_save_status = use_state(|| Option::<String>::None);
         let services = self.services.clone();
 
         use_hook(move || {
@@ -67,9 +70,25 @@ impl Component for SettingsWindow {
                                 .into_owned(),
                         );
                         settings.set(loaded);
+                        folder_autosave_enabled.set(true);
                         load_error.set(None);
                     }
                     Err(error) => load_error.set(Some(error.to_string())),
+                }
+            });
+        });
+
+        use_side_effect(move || {
+            let Some(message) = save_status.read().clone() else {
+                return;
+            };
+            visible_save_status.set(Some(message.clone()));
+            save_status.set(None);
+
+            spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if visible_save_status.read().as_ref() == Some(&message) {
+                    visible_save_status.set(None);
                 }
             });
         });
@@ -96,8 +115,12 @@ impl Component for SettingsWindow {
                             selected_tab(),
                             settings,
                             folder,
+                            folder_autosave_enabled,
                             save_status,
-                            load_error.read().clone(),
+                            SettingsBanners {
+                                saved: visible_save_status.read().clone(),
+                                load_error: load_error.read().clone(),
+                            },
                         ),
                     )),
             )
@@ -215,18 +238,28 @@ fn settings_content(
     tab: SettingsTab,
     settings: State<DesktopSettings>,
     folder: State<String>,
+    folder_autosave_enabled: State<bool>,
     save_status: State<Option<String>>,
-    load_error: Option<String>,
+    banners: SettingsBanners,
 ) -> impl IntoElement {
     rect()
-        .width(Size::px(SETTINGS_CONTENT_WIDTH))
+        .width(Size::fill())
         .vertical()
         .spacing(14.)
-        .maybe_child(load_error.map(status_banner))
-        .maybe_child(save_status.read().clone().map(status_banner))
+        .maybe_child(banners.load_error.map(status_banner))
+        .maybe_child(banners.saved.map(status_banner))
         .child(match tab {
             SettingsTab::Appearance => placeholder_panel("Appearance", "Theme and density settings are not wired yet."),
-            SettingsTab::DownloadEngine => download_engine_panel(services, settings, folder, save_status).into_element(),
+            SettingsTab::DownloadEngine => {
+                download_engine_panel(
+                    services,
+                    settings,
+                    folder,
+                    folder_autosave_enabled,
+                    save_status,
+                )
+                .into_element()
+            }
             SettingsTab::BrowserIntegration => placeholder_panel(
                 "Browser Integration",
                 "Browser capture server and extension settings will be enabled after integration API is wired.",
@@ -234,10 +267,16 @@ fn settings_content(
         })
 }
 
+struct SettingsBanners {
+    saved: Option<String>,
+    load_error: Option<String>,
+}
+
 fn download_engine_panel(
     services: AppServices,
     settings: State<DesktopSettings>,
     folder: State<String>,
+    folder_autosave_enabled: State<bool>,
     save_status: State<Option<String>>,
 ) -> impl IntoElement {
     let current = settings.read().clone();
@@ -247,12 +286,13 @@ fn download_engine_panel(
         .spacing(20.)
         .child(
             settings_card()
-                .child(folder_setting_row(
-                    services.clone(),
+                .child(FolderSettingRow {
+                    services: services.clone(),
                     settings,
                     folder,
+                    autosave_enabled: folder_autosave_enabled,
                     save_status,
-                ))
+                })
                 .child(setting_row(
                     "Use Category By Default",
                     enabled_text(current.use_category_by_default),
@@ -293,43 +333,20 @@ fn download_engine_panel(
                         current.thread_count.get()
                     ),
                     number_stepper(
-                        current.thread_count.get().to_string(),
-                        current.thread_count.get() > MIN_THREADS,
-                        current.thread_count.get() < MAX_THREADS,
+                        u32::from(current.thread_count.get()),
+                        u32::from(MIN_THREADS),
+                        u32::from(MAX_THREADS),
                         {
                             let services = services.clone();
-                            move |()| {
+                            move |value| {
                                 update_settings(
                                     settings,
                                     services.clone(),
                                     save_status,
-                                    |settings| {
-                                        let next = settings
-                                            .thread_count
-                                            .get()
-                                            .saturating_sub(1)
-                                            .max(MIN_THREADS);
-                                        if let Some(value) = NonZeroU16::new(next) {
-                                            settings.thread_count = value;
-                                        }
-                                    },
-                                )
-                            }
-                        },
-                        {
-                            let services = services.clone();
-                            move |()| {
-                                update_settings(
-                                    settings,
-                                    services.clone(),
-                                    save_status,
-                                    |settings| {
-                                        let next = settings
-                                            .thread_count
-                                            .get()
-                                            .saturating_add(1)
-                                            .min(MAX_THREADS);
-                                        if let Some(value) = NonZeroU16::new(next) {
+                                    move |settings| {
+                                        if let Ok(value) = u16::try_from(value)
+                                            && let Some(value) = NonZeroU16::new(value)
+                                        {
                                             settings.thread_count = value;
                                         }
                                     },
@@ -340,21 +357,20 @@ fn download_engine_panel(
                 ))
                 .child(setting_row(
                     "Maximum Concurrent Downloads",
-                    current.max_concurrent_downloads.get().to_string(),
+                    current.max_concurrent_downloads.to_string(),
                     number_stepper(
-                        current.max_concurrent_downloads.get().to_string(),
-                        current.max_concurrent_downloads.get() > MIN_CONCURRENT_DOWNLOADS,
-                        current.max_concurrent_downloads.get() < MAX_CONCURRENT_DOWNLOADS,
+                        u32::from(current.max_concurrent_downloads),
+                        u32::from(MIN_CONCURRENT_DOWNLOADS),
+                        u32::from(MAX_CONCURRENT_DOWNLOADS),
                         {
                             let services = services.clone();
-                            move |()| {
-                                update_max_concurrent(settings, services.clone(), save_status, -1)
-                            }
-                        },
-                        {
-                            let services = services.clone();
-                            move |()| {
-                                update_max_concurrent(settings, services.clone(), save_status, 1)
+                            move |value| {
+                                update_max_concurrent(
+                                    settings,
+                                    services.clone(),
+                                    save_status,
+                                    value,
+                                )
                             }
                         },
                     ),
@@ -363,50 +379,21 @@ fn download_engine_panel(
                     "Maximum Download Retries",
                     format!(
                         "Failed downloads will be retried {} time(s)",
-                        current.max_download_retries.get()
+                        current.max_download_retries
                     ),
-                    number_stepper(
-                        current.max_download_retries.get().to_string(),
-                        current.max_download_retries.get() > MIN_RETRIES,
-                        current.max_download_retries.get() < MAX_RETRIES,
-                        {
-                            let services = services.clone();
-                            move |()| {
-                                update_settings(
-                                    settings,
-                                    services.clone(),
-                                    save_status,
-                                    |settings| {
-                                        let next =
-                                            settings.max_download_retries.get().saturating_sub(1);
-                                        if let Some(value) = NonZeroU32::new(next) {
-                                            settings.max_download_retries = value;
-                                        }
-                                    },
-                                )
-                            }
-                        },
-                        {
-                            let services = services.clone();
-                            move |()| {
-                                update_settings(
-                                    settings,
-                                    services.clone(),
-                                    save_status,
-                                    |settings| {
-                                        let next = settings
-                                            .max_download_retries
-                                            .get()
-                                            .saturating_add(1)
-                                            .min(MAX_RETRIES);
-                                        if let Some(value) = NonZeroU32::new(next) {
-                                            settings.max_download_retries = value;
-                                        }
-                                    },
-                                )
-                            }
-                        },
-                    ),
+                    number_stepper(current.max_download_retries, MIN_RETRIES, MAX_RETRIES, {
+                        let services = services.clone();
+                        move |value| {
+                            update_settings(
+                                settings,
+                                services.clone(),
+                                save_status,
+                                move |settings| {
+                                    settings.max_download_retries = value;
+                                },
+                            )
+                        }
+                    }),
                 ))
                 .child(setting_row(
                     "Dynamic Part Creation",
@@ -423,52 +410,82 @@ fn download_engine_panel(
         )
 }
 
-fn folder_setting_row(
+#[derive(Clone)]
+struct FolderSettingRow {
     services: AppServices,
     settings: State<DesktopSettings>,
-    mut folder: State<String>,
+    folder: State<String>,
+    autosave_enabled: State<bool>,
     save_status: State<Option<String>>,
-) -> impl IntoElement {
-    rect()
-        .height(Size::px(74.))
-        .width(Size::fill())
-        .horizontal()
-        .main_align(Alignment::Start)
-        .cross_align(Alignment::Center)
-        .padding(Gaps::new(0., SETTING_ROW_RIGHT_PADDING, 0., 22.))
-        .child(setting_copy(
-            "Default Download Folder",
-            "New manual downloads use this folder unless category routing is enabled.",
-        ))
-        .child(
-            rect()
-                .width(Size::px(FOLDER_CONTROL_WIDTH))
-                .horizontal()
-                .cross_align(Alignment::Center)
-                .spacing(8.)
-                .padding(Gaps::new(0., 25., 0., 0.))
-                .child(folder_input(folder))
-                .child(small_icon_button(icons::lucide::folder_open(), true, {
-                    move |()| {
-                        spawn(async move {
-                            let Some(handle) = rfd::AsyncFileDialog::new().pick_folder().await
-                            else {
-                                return;
-                            };
-                            folder.set(handle.path().to_string_lossy().into_owned());
-                        });
-                    }
-                }))
-                .child(small_text_button("Save", true, move |()| {
-                    save_folder_setting(services.clone(), settings, folder, save_status);
-                })),
-        )
+}
+
+impl PartialEq for FolderSettingRow {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Component for FolderSettingRow {
+    fn render(&self) -> impl IntoElement {
+        let services = self.services.clone();
+        let settings = self.settings;
+        let mut folder = self.folder;
+        let autosave_enabled = self.autosave_enabled;
+        let save_status = self.save_status;
+
+        use_side_effect(move || {
+            if !autosave_enabled() {
+                return;
+            }
+            let candidate = folder.read().trim().to_owned();
+            let saved = settings
+                .read()
+                .default_download_folder
+                .to_string_lossy()
+                .into_owned();
+            if candidate == saved {
+                return;
+            }
+            save_folder_path(services.clone(), settings, candidate, save_status);
+        });
+
+        rect()
+            .height(Size::px(74.))
+            .width(Size::fill())
+            .horizontal()
+            .main_align(Alignment::SpaceBetween)
+            .cross_align(Alignment::Center)
+            .padding(Gaps::new(0., 25., 0., 22.))
+            .child(setting_copy(
+                "Default Download Folder",
+                "New manual downloads use this folder unless category routing is enabled.",
+            ))
+            .child(
+                rect()
+                    .width(Size::px(FOLDER_CONTROL_WIDTH))
+                    .horizontal()
+                    .cross_align(Alignment::Center)
+                    .spacing(8.)
+                    .child(folder_input(folder))
+                    .child(small_icon_button(icons::lucide::folder_open(), true, {
+                        move |()| {
+                            spawn(async move {
+                                let Some(handle) = rfd::AsyncFileDialog::new().pick_folder().await
+                                else {
+                                    return;
+                                };
+                                folder.set(handle.path().to_string_lossy().into_owned());
+                            });
+                        }
+                    })),
+            )
+    }
 }
 
 fn folder_input(folder: State<String>) -> impl IntoElement {
     Input::new(folder)
         .placeholder("Default folder")
-        .width(Size::fill())
+        .width(Size::px(FOLDER_INPUT_WIDTH))
         .theme_colors(InputColorsThemePartial {
             background: Some(theme::SURFACE.into()),
             focus_background: Some(theme::SURFACE.into()),
@@ -492,15 +509,15 @@ fn setting_row(
         .height(Size::px(94.))
         .width(Size::fill())
         .horizontal()
-        .main_align(Alignment::Start)
+        .main_align(Alignment::SpaceBetween)
         .cross_align(Alignment::Center)
         .padding(Gaps::new(0., 25., 0., 22.))
         .child(setting_copy(title, description))
         .child(
             rect()
                 .width(Size::px(SETTING_CONTROL_WIDTH))
+                .horizontal()
                 .main_align(Alignment::End)
-                .padding(Gaps::new(0., 25., 0., 0.))
                 .child(control),
         )
 }
@@ -550,63 +567,223 @@ fn settings_card() -> Rect {
 }
 
 fn toggle_control(enabled: bool, on_toggle: impl Fn(()) + 'static) -> impl IntoElement {
-    rect()
-        .width(Size::px(54.))
-        .height(Size::px(31.))
-        .corner_radius(16.)
-        .padding(Gaps::new(3., 3., 3., 3.))
-        .main_align(if enabled {
-            Alignment::End
-        } else {
-            Alignment::Start
-        })
-        .background(if enabled {
-            theme::ACCENT
-        } else {
-            theme::SURFACE
-        })
-        .on_press(move |_| on_toggle(()))
-        .child(
-            rect()
-                .width(Size::px(25.))
-                .height(Size::px(25.))
-                .corner_radius(13.)
-                .background(theme::TEXT_PRIMARY),
-        )
+    ToggleControl {
+        enabled,
+        on_toggle: on_toggle.into(),
+    }
+}
+
+#[derive(PartialEq)]
+struct ToggleControl {
+    enabled: bool,
+    on_toggle: EventHandler<()>,
+}
+
+impl Component for ToggleControl {
+    fn render(&self) -> impl IntoElement {
+        let progress = if self.enabled { 1. } else { 0. };
+        let animation = use_animation_transition(progress, |from, to| {
+            AnimNum::new(from, to).time(180).ease(Ease::InOut)
+        });
+        let knob_left = 3. + (animation.get().value() * 23.);
+        let on_toggle = self.on_toggle.clone();
+
+        rect()
+            .width(Size::px(54.))
+            .height(Size::px(31.))
+            .corner_radius(16.)
+            .background(if self.enabled {
+                theme::ACCENT
+            } else {
+                theme::SURFACE
+            })
+            .on_press(move |_| on_toggle.call(()))
+            .child(
+                rect()
+                    .position(Position::new_absolute().left(knob_left).top(3.))
+                    .width(Size::px(25.))
+                    .height(Size::px(25.))
+                    .corner_radius(13.)
+                    .background(theme::TEXT_PRIMARY),
+            )
+    }
 }
 
 fn number_stepper(
-    value: String,
+    value: u32,
+    min: u32,
+    max: u32,
+    on_change: impl Fn(u32) + 'static,
+) -> impl IntoElement {
+    NumberStepper {
+        value,
+        min,
+        max,
+        on_change: on_change.into(),
+    }
+}
+
+#[derive(PartialEq)]
+struct NumberStepper {
+    value: u32,
+    min: u32,
+    max: u32,
+    on_change: EventHandler<u32>,
+}
+
+impl Component for NumberStepper {
+    fn render(&self) -> impl IntoElement {
+        let mut text = use_state(|| self.value.to_string());
+        let mut synced_value = use_state(|| self.value);
+        let mut was_focused = use_state(|| false);
+        let a11y_id = use_a11y();
+        let focus = use_focus(a11y_id);
+        let value_text = self.value.to_string();
+        let min = self.min;
+        let max = self.max;
+        let value = self.value.clamp(min, max);
+        let can_decrement = value > min;
+        let can_increment = value < max;
+        let on_change = self.on_change.clone();
+
+        use_side_effect(move || {
+            if synced_value() != value {
+                synced_value.set(value);
+                text.set(value_text.clone());
+            }
+
+            if focus().is_focused() {
+                was_focused.set_if_modified(true);
+                return;
+            }
+
+            if !was_focused() {
+                return;
+            }
+
+            was_focused.set(false);
+            let next = stepper_text_value(&text.read(), min, max);
+            text.set(next.to_string());
+
+            if next != value {
+                on_change.call(next);
+            }
+        });
+
+        number_stepper_input(
+            text,
+            a11y_id,
+            can_decrement,
+            can_increment,
+            {
+                let on_change = self.on_change.clone();
+                move |()| {
+                    let next = value.saturating_sub(1).max(min);
+                    on_change.call(next);
+                }
+            },
+            {
+                let on_change = self.on_change.clone();
+                move |()| {
+                    let next = value.saturating_add(1).min(max);
+                    on_change.call(next);
+                }
+            },
+            {
+                let on_change = self.on_change.clone();
+                move |text| {
+                    let next = stepper_text_value(&text, min, max);
+                    on_change.call(next);
+                }
+            },
+        )
+    }
+}
+
+fn stepper_text_value(text: &str, min: u32, max: u32) -> u32 {
+    text.trim()
+        .parse::<u32>()
+        .map_or(min, |value| value.clamp(min, max))
+}
+
+fn number_stepper_input(
+    text: State<String>,
+    a11y_id: AccessibilityId,
     can_decrement: bool,
     can_increment: bool,
     on_decrement: impl Fn(()) + 'static,
     on_increment: impl Fn(()) + 'static,
+    on_submit: impl Fn(String) + 'static,
+) -> impl IntoElement {
+    Input::new(text)
+        .width(Size::px(126.))
+        .a11y_id(a11y_id)
+        .trailing(
+            rect()
+                .horizontal()
+                .spacing(2.)
+                .child(stepper_icon_button(
+                    icons::lucide::chevron_down(),
+                    can_decrement,
+                    on_decrement,
+                ))
+                .child(stepper_icon_button(
+                    icons::lucide::chevron_up(),
+                    can_increment,
+                    on_increment,
+                )),
+        )
+        .on_validate(|validator: InputValidator| {
+            validator.set_valid(
+                validator
+                    .text()
+                    .chars()
+                    .all(|character| character.is_ascii_digit()),
+            );
+        })
+        .on_submit(on_submit)
+        .theme_colors(InputColorsThemePartial {
+            background: Some(theme::SURFACE.into()),
+            focus_background: Some(theme::SURFACE.into()),
+            border_fill: Some(theme::BORDER.into()),
+            focus_border_fill: Some(theme::ACCENT.into()),
+            color: Some(theme::TEXT_PRIMARY.into()),
+            placeholder_color: Some(theme::TEXT_SUBTLE.into()),
+        })
+        .theme_layout(InputLayoutThemePartial {
+            corner_radius: Some(CornerRadius::new_all(8.).into()),
+            inner_margin: Some(Gaps::new(6., 0., 6., 0.).into()),
+        })
+}
+
+fn stepper_icon_button(
+    icon: freya::prelude::Bytes,
+    enabled: bool,
+    on_press: impl Fn(()) + 'static,
 ) -> impl IntoElement {
     rect()
-        .width(Size::px(126.))
-        .height(Size::px(32.))
-        .horizontal()
-        .cross_align(Alignment::Center)
-        .corner_radius(8.)
-        .border(Border::new().width(1.).fill(theme::BORDER))
-        .background(theme::SURFACE)
+        .width(Size::px(22.))
+        .height(Size::px(30.))
+        .center()
+        .corner_radius(6.)
+        .background(Color::TRANSPARENT)
+        .maybe(enabled, |el| {
+            el.on_pointer_down(move |event: Event<PointerEventData>| {
+                event.stop_propagation();
+                event.prevent_default();
+                on_press(());
+            })
+        })
         .child(
-            label()
-                .text(value)
-                .font_size(14.)
-                .width(Size::fill())
-                .padding(Gaps::new(0., 0., 0., 10.)),
+            SvgViewer::new(icon)
+                .width(Size::px(16.))
+                .height(Size::px(16.))
+                .color(if enabled {
+                    theme::TEXT_MUTED
+                } else {
+                    theme::BORDER
+                }),
         )
-        .child(small_icon_button(
-            icons::lucide::chevron_down(),
-            can_decrement,
-            on_decrement,
-        ))
-        .child(small_icon_button(
-            icons::lucide::chevron_up(),
-            can_increment,
-            on_increment,
-        ))
 }
 
 fn small_icon_button(
@@ -631,30 +808,6 @@ fn small_icon_button(
                     theme::BORDER
                 }),
         )
-}
-
-fn small_text_button(
-    text: &'static str,
-    enabled: bool,
-    on_press: impl Fn(()) + 'static,
-) -> impl IntoElement {
-    rect()
-        .height(Size::px(32.))
-        .padding(Gaps::new(0., 12., 0., 12.))
-        .center()
-        .corner_radius(8.)
-        .border(Border::new().width(1.).fill(theme::BORDER))
-        .background(if enabled {
-            theme::SURFACE
-        } else {
-            Color::TRANSPARENT
-        })
-        .maybe(enabled, |el| el.on_press(move |_| on_press(())))
-        .child(label().text(text).font_size(13.).color(if enabled {
-            theme::TEXT_PRIMARY
-        } else {
-            theme::TEXT_SUBTLE
-        }))
 }
 
 fn placeholder_panel(title: &'static str, body: &'static str) -> Element {
@@ -714,24 +867,21 @@ fn update_max_concurrent(
     mut state: State<DesktopSettings>,
     services: AppServices,
     save_status: State<Option<String>>,
-    delta: i16,
+    value: u32,
 ) {
     let mut next = state.read().clone();
-    let current = i32::from(next.max_concurrent_downloads.get());
-    let updated = (current + i32::from(delta)).clamp(
-        i32::from(MIN_CONCURRENT_DOWNLOADS),
-        i32::from(MAX_CONCURRENT_DOWNLOADS),
+    let updated = value.clamp(
+        u32::from(MIN_CONCURRENT_DOWNLOADS),
+        u32::from(MAX_CONCURRENT_DOWNLOADS),
     ) as u16;
-    let Some(max_concurrent) = NonZeroU16::new(updated) else {
-        return;
-    };
-    next.max_concurrent_downloads = max_concurrent;
+    next.max_concurrent_downloads = updated;
+    let queue_max_concurrent = NonZeroU16::new(updated).unwrap_or(NonZeroU16::MAX);
     state.set(next.clone());
     spawn(async move {
         let result = async {
             services
                 .queues
-                .set_max_concurrent(QueueId::MAIN, max_concurrent)
+                .set_max_concurrent(QueueId::MAIN, queue_max_concurrent)
                 .await?;
             services.save_desktop_settings(&next).await
         }
@@ -740,13 +890,13 @@ fn update_max_concurrent(
     });
 }
 
-fn save_folder_setting(
+fn save_folder_path(
     services: AppServices,
     mut state: State<DesktopSettings>,
-    folder: State<String>,
+    folder: String,
     mut save_status: State<Option<String>>,
 ) {
-    let candidate = PathBuf::from(folder.read().trim());
+    let candidate = PathBuf::from(folder.trim());
     if candidate.as_os_str().is_empty() {
         save_status.set(Some("Default folder cannot be empty".to_owned()));
         return;

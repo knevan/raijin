@@ -466,18 +466,12 @@ pub struct DownloadProgress {
     pub active_part_count: u16,
 }
 
-const fn non_zero_u16(value: u16) -> NonZeroU16 {
-    match NonZeroU16::new(value) {
-        Some(value) => value,
-        None => panic!("non-zero u16 default must be greater than zero"),
-    }
+fn non_zero_u16(value: u16) -> NonZeroU16 {
+    NonZeroU16::new(value).expect("default connection count must be non-zero")
 }
 
-const fn non_zero_u32(value: u32) -> NonZeroU32 {
-    match NonZeroU32::new(value) {
-        Some(value) => value,
-        None => panic!("non-zero u32 default must be greater than zero"),
-    }
+fn non_zero_u32(value: u32) -> NonZeroU32 {
+    NonZeroU32::new(value).expect("default retry count must be non-zero")
 }
 
 #[cfg(test)]

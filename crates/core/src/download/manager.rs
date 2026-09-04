@@ -122,6 +122,14 @@ pub enum DownloadCommand {
         id: DownloadId,
         reply: oneshot::Sender<DownloadManagerResult<DownloadItem>>,
     },
+    /// Pause every active download (tray "Pause all").
+    PauseAll {
+        reply: oneshot::Sender<DownloadManagerResult<Vec<DownloadItem>>>,
+    },
+    /// Resume every paused download (tray "Resume all").
+    ResumeAll {
+        reply: oneshot::Sender<DownloadManagerResult<Vec<DownloadItem>>>,
+    },
     /// Replace the shared global throughput limit (`None` disables shaping).
     SetGlobalLimit {
         limit: Option<BytesPerSecond>,
@@ -335,6 +343,45 @@ impl DownloadManagerHandle {
             .map_err(|_| DownloadManagerError::ResponseDropped)?
     }
 
+    /// Pauses every active download.
+    ///
+    /// Used by the tray "Pause all" action as a single actor command instead
+    /// of N round-trips from the UI. Downloads already paused, completed, or
+    /// failed are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manager stops or persistence fails.
+    pub async fn pause_all(&self) -> DownloadManagerResult<Vec<DownloadItem>> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(DownloadCommand::PauseAll { reply })
+            .await
+            .map_err(|_| DownloadManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| DownloadManagerError::ResponseDropped)?
+    }
+
+    /// Resumes every paused download.
+    ///
+    /// Failed downloads keep their error until an explicit reset; completed
+    /// and active downloads are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manager stops or persistence fails.
+    pub async fn resume_all(&self) -> DownloadManagerResult<Vec<DownloadItem>> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(DownloadCommand::ResumeAll { reply })
+            .await
+            .map_err(|_| DownloadManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| DownloadManagerError::ResponseDropped)?
+    }
+
     /// Replaces the shared global throughput limit layered over per-download limits.
     ///
     /// `None` disables global shaping and restores the zero-cost path.
@@ -469,6 +516,16 @@ impl DownloadManager {
                 send_reply(reply, result);
                 Ok(false)
             }
+            DownloadCommand::PauseAll { reply } => {
+                let result = self.pause_all_downloads().await;
+                send_reply(reply, result);
+                Ok(false)
+            }
+            DownloadCommand::ResumeAll { reply } => {
+                let result = self.resume_all_downloads().await;
+                send_reply(reply, result);
+                Ok(false)
+            }
             DownloadCommand::SetGlobalLimit { limit, reply } => {
                 self.global_limiter = limit.and_then(SpeedLimiter::new);
                 send_reply(reply, Ok(()));
@@ -581,6 +638,50 @@ impl DownloadManager {
         self.publish(DownloadEvent::DownloadChanged { item: item.clone() });
         self.start_job(item.clone());
         Ok(item)
+    }
+
+    async fn pause_all_downloads(&mut self) -> DownloadManagerResult<Vec<DownloadItem>> {
+        let now = now_ms()?;
+        let mut paused = Vec::new();
+        for mut item in self.repository.list().await? {
+            if !is_active_status(item.status) {
+                continue;
+            }
+            item.status = DownloadStatus::Paused;
+            item.updated_at = now;
+            if let Some(job) = self.active_jobs.get(&item.id) {
+                let (downloaded_bytes, _) = job.live_progress.snapshot();
+                item.downloaded_bytes = item.downloaded_bytes.max(downloaded_bytes);
+                job.live_progress.clear_active_parts();
+                job.cancellation.cancel();
+            }
+            self.repository.update(&item).await?;
+            self.publish(DownloadEvent::DownloadPaused { item: item.clone() });
+            paused.push(item);
+        }
+        Ok(paused)
+    }
+
+    async fn resume_all_downloads(&mut self) -> DownloadManagerResult<Vec<DownloadItem>> {
+        let now = now_ms()?;
+        let mut resumed = Vec::new();
+        for mut item in self.repository.list().await? {
+            if item.status != DownloadStatus::Paused {
+                continue;
+            }
+            item.status = DownloadStatus::Queued;
+            item.updated_at = now;
+            item.failure = None;
+            self.repository.update(&item).await?;
+            self.publish(DownloadEvent::DownloadResumed { item: item.clone() });
+            resumed.push(item);
+        }
+        // Start jobs after the scan so a slow spawn never interleaves with
+        // the repository pass above.
+        for item in &resumed {
+            self.start_job(item.clone());
+        }
+        Ok(resumed)
     }
 
     async fn stop_active_job(&mut self, id: DownloadId) {
@@ -881,6 +982,18 @@ fn error_to_io(error: crate::download::HttpDownloadJobError) -> std::io::Error {
     }
 }
 
+/// True for statuses that "Pause all" must suspend.
+fn is_active_status(status: DownloadStatus) -> bool {
+    matches!(
+        status,
+        DownloadStatus::Added
+            | DownloadStatus::Queued
+            | DownloadStatus::Downloading
+            | DownloadStatus::Retrying
+            | DownloadStatus::PreparingFile
+    )
+}
+
 fn should_start_on_boot(status: DownloadStatus) -> bool {
     matches!(
         status,
@@ -1034,6 +1147,57 @@ mod tests {
         assert_eq!(paused.status, DownloadStatus::Paused);
         assert_eq!(resumed.status, DownloadStatus::Queued);
         assert!(removed);
+        stop_manager(&handle, task).await
+    }
+
+    #[tokio::test]
+    async fn actor_should_pause_all_active_and_resume_all_paused() -> DownloadManagerResult<()> {
+        let db = test_db().await?;
+        let (handle, task) = DownloadManagerHandle::spawn(
+            db.repository,
+            db.part_repository,
+            DownloadManagerOptions {
+                command_buffer: 8,
+                event_buffer: 32,
+            },
+        );
+        let first = handle
+            .add(NewDownload::http(
+                "https://example.com/a.bin",
+                "a.bin",
+                PathBuf::from("C:/Downloads"),
+            ))
+            .await?;
+        let second = handle
+            .add(NewDownload::http(
+                "https://example.com/b.bin",
+                "b.bin",
+                PathBuf::from("C:/Downloads"),
+            ))
+            .await?;
+        handle.resume(first.id).await?;
+        handle.resume(second.id).await?;
+
+        let paused = handle.pause_all().await?;
+        assert_eq!(paused.len(), 2);
+        assert!(
+            paused
+                .iter()
+                .all(|item| item.status == DownloadStatus::Paused)
+        );
+
+        // Second call is a no-op: already-paused downloads stay untouched.
+        assert!(handle.pause_all().await?.is_empty());
+
+        let resumed = handle.resume_all().await?;
+        assert_eq!(resumed.len(), 2);
+        assert!(
+            resumed
+                .iter()
+                .all(|item| item.status == DownloadStatus::Queued)
+        );
+        assert!(handle.resume_all().await?.is_empty());
+
         stop_manager(&handle, task).await
     }
 

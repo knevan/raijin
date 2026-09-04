@@ -1,13 +1,16 @@
-//! Raijin core: UI-free download engine, persistence, and platform helpers.
-//!
-//! Module boundaries follow `AGENTS.md`:
-//! - `config`: desktop settings shape.
-//! - `db`: SQLite bootstrap (WAL) and repositories.
-//! - `download`: native HTTP engine (manager actor, jobs, probe, splitter).
-//! - `queue`: persisted queue model only; manager/scheduler deferred to M3 (ON HOLD).
-//! - `monitor`: UI-safe projected state, speed meter, event aggregation.
-//! - `integration`: stub until M7; localhost API models only.
-//! - `platform`: filesystem paths and `RAIJIN_*` overrides.
+#![deny(
+    clippy::panic,
+    clippy::panicking_unwrap,
+    clippy::redundant_clone,
+    clippy::implicit_clone,
+    clippy::perf,
+    clippy::large_types_passed_by_value,
+    clippy::large_futures,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::clone_on_ref_ptr,
+)]
+// Tests may panic on violated assumptions; the deny above stays for production code.
+#![cfg_attr(test, allow(clippy::panic))]
 
 pub mod config;
 pub mod db;

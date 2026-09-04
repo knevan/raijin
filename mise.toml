@@ -1,0 +1,6 @@
+[settings]
+auto_install = false
+
+[tasks.dev]
+dir = "."
+run = "cargo run -p raijin-ui"

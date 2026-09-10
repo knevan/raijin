@@ -1,8 +1,12 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
-use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableEvent, TableState};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::*;
 use raijin_core::download::{DownloadId, DownloadStatus, FailureKind};
 use raijin_core::monitor::DownloadView;
@@ -15,6 +19,15 @@ use crate::format::{
 
 /// Poll interval for monitor snapshots on the GPUI thread.
 pub const MONITOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Fixed table body/header row height in pixels.
+///
+/// The framework fixes `DataTable` row height per size preset (Medium = 32px),
+/// which clips the two-line Name (file + category) and Status (label +
+/// progress) cells. A custom `Size::Size` keeps cell padding/text at the
+/// Medium defaults while fitting both lines; every cell root below is
+/// full-height + vertically centered to match.
+pub const TABLE_ROW_HEIGHT_PX: f32 = 48.0;
 
 /// Table column keys. Also used as stable [`Column`] keys.
 pub mod col {
@@ -320,6 +333,86 @@ pub fn category_icon(category: FileCategory) -> IconName {
         FileCategory::Other => IconName::File,
     }
 }
+/// Checkbox multi-select set keyed by stable [`DownloadId`].
+///
+/// Pure state (no GPUI dependency) so it stays unit-testable: checks survive
+/// re-sorting and monitor polls because ids are stable, while [`set_rows`]
+/// prunes ids that left the visible set.
+#[derive(Debug, Clone, Default)]
+struct RowChecklist {
+    checked: BTreeSet<DownloadId>,
+}
+
+impl RowChecklist {
+    /// Returns true when `id` is checked.
+    #[must_use]
+    fn is_checked(&self, id: DownloadId) -> bool {
+        self.checked.contains(&id)
+    }
+
+    /// Toggles the checked state of one id.
+    fn toggle(&mut self, id: DownloadId) {
+        if !self.checked.remove(&id) {
+            self.checked.insert(id);
+        }
+    }
+
+    /// Checks or unchecks every id in `visible`.
+    fn set_all(&mut self, visible: impl IntoIterator<Item = DownloadId>, checked: bool) {
+        if checked {
+            self.checked.extend(visible);
+        } else {
+            for id in visible {
+                self.checked.remove(&id);
+            }
+        }
+    }
+
+    /// Drops the given ids from the set.
+    fn uncheck_ids(&mut self, ids: &[DownloadId]) {
+        for id in ids {
+            self.checked.remove(id);
+        }
+    }
+
+    /// Drops every checked id that is not in `visible`.
+    fn retain_visible(&mut self, visible: impl IntoIterator<Item = DownloadId>) {
+        let visible: BTreeSet<DownloadId> = visible.into_iter().collect();
+        self.checked.retain(|id| visible.contains(id));
+    }
+
+    /// Returns the checked ids in stable (ascending) order.
+    #[must_use]
+    fn ids(&self) -> Vec<DownloadId> {
+        self.checked.iter().copied().collect()
+    }
+
+    /// Returns the number of checked ids.
+    #[must_use]
+    fn len(&self) -> usize {
+        self.checked.len()
+    }
+}
+
+/// Wraps a framework `Checkbox` in a visible bordered box.
+///
+/// The theme `input` token (unchecked box bg + border) matches the table row
+/// background, so a bare unchecked box is invisible on the rows. The wrapper
+/// paints the ABDM-style outline while the inner control keeps its focus,
+/// keyboard, and accessibility behavior.
+fn checkbox_frame(checkbox: Checkbox, cx: &App) -> impl IntoElement {
+    div()
+        .size(px(18.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(px(4.))
+        .child(checkbox)
+}
+
 /// Column definition kept by the delegate (order = display order).
 #[derive(Debug, Clone)]
 struct ColumnDef {
@@ -337,13 +430,19 @@ impl ColumnDef {
 /// `DataTable` delegate rendering [`DownloadRow`]s.
 ///
 /// The delegate owns exactly the rows currently visible (already filtered and
-/// sorted by the owning view) so `render_td` stays allocation-light.
+/// sorted by the owning view) so `render_td` stays allocation-light. It also
+/// owns the checkbox multi-select set ([`RowChecklist`]), keyed by stable
+/// [`DownloadId`] so checks survive re-sorting, filtering, and monitor polls.
+/// The framework has no built-in checkbox column — row clicks only move the
+/// single-row highlight — so both the row boxes and the header select-all box
+/// are rendered here, ABDM-style.
 pub struct DownloadsDelegate {
     rows: Vec<DownloadRow>,
     columns: Vec<ColumnDef>,
     sort_column: SortColumn,
     sort_dir: SortDir,
     loaded: bool,
+    checklist: RowChecklist,
     commands: EngineHandles,
 }
 
@@ -364,13 +463,18 @@ impl DownloadsDelegate {
             sort_column: SortColumn::DateAdded,
             sort_dir: SortDir::Descending,
             loaded: false,
+            checklist: RowChecklist::default(),
             commands,
         }
     }
 
     /// Replaces visible rows and re-applies the stored sort order.
+    ///
+    /// Checks for downloads that are no longer visible are dropped, so a
+    /// removed or filtered-out row can never stay checked.
     pub fn set_rows(&mut self, mut rows: Vec<DownloadRow>) {
         sort_rows(&mut rows, self.sort_column, self.sort_dir);
+        self.checklist.retain_visible(rows.iter().map(|row| row.id));
         self.rows = rows;
     }
 
@@ -427,6 +531,50 @@ impl DownloadsDelegate {
             .get(col_ix)
             .map(|def| def.key)
             .unwrap_or(col::NAME)
+    }
+
+    /// Returns true when `id` is checkbox-checked.
+    #[must_use]
+    pub fn is_checked(&self, id: DownloadId) -> bool {
+        self.checklist.is_checked(id)
+    }
+
+    /// Toggles the checkbox for one download id.
+    pub fn toggle_checked(&mut self, id: DownloadId) {
+        self.checklist.toggle(id);
+    }
+
+    /// Checks or unchecks every currently visible row (header select-all).
+    pub fn set_all_checked(&mut self, checked: bool) {
+        self.checklist
+            .set_all(self.rows.iter().map(|row| row.id), checked);
+    }
+
+    /// Unchecks the given ids (used right after dispatching Remove).
+    pub fn uncheck_ids(&mut self, ids: &[DownloadId]) {
+        self.checklist.uncheck_ids(ids);
+    }
+
+    /// Returns true when at least one visible row exists and all are checked.
+    #[must_use]
+    pub fn all_visible_checked(&self) -> bool {
+        !self.rows.is_empty()
+            && self
+                .rows
+                .iter()
+                .all(|row| self.checklist.is_checked(row.id))
+    }
+
+    /// Returns the checked download ids in stable (ascending) order.
+    #[must_use]
+    pub fn checked_ids(&self) -> Vec<DownloadId> {
+        self.checklist.ids()
+    }
+
+    /// Returns the number of checked downloads.
+    #[must_use]
+    pub fn checked_count(&self) -> usize {
+        self.checklist.len()
     }
 
     fn cell_icon(category: FileCategory) -> IconName {
@@ -499,9 +647,11 @@ impl TableDelegate for DownloadsDelegate {
                 .text_color(cx.theme().muted_foreground),
         };
         let table = cx.entity();
-        div()
+        let sort_label = div()
             .id(SharedString::from(format!("sort-header-{key}")))
             .flex()
+            .flex_1()
+            .min_w_0()
             .h_full()
             .items_center()
             .gap_1()
@@ -516,6 +666,44 @@ impl TableDelegate for DownloadsDelegate {
             })
             .child(sort_icon)
             .child(name)
+            .into_any_element();
+        // ABDM-style header select-all box. It lives outside the sort-click
+        // area so checking all rows never re-sorts the table.
+        if key == col::NAME {
+            let header_table = cx.entity();
+            let all_checked = self.all_visible_checked();
+            let has_rows = !self.rows.is_empty();
+            h_flex()
+                .h_full()
+                .items_center()
+                .gap_2()
+                .child(checkbox_frame(
+                    Checkbox::new("header-check-name")
+                        .checked(all_checked)
+                        .disabled(!has_rows)
+                        .on_click(move |_, _: &mut Window, cx: &mut App| {
+                            header_table.update(cx, |table, cx| {
+                                let check = !table.delegate().all_visible_checked();
+                                table.delegate_mut().set_all_checked(check);
+                                table.refresh(cx);
+                                // Sync the owning view's toolbar state: the
+                                // framework only emits click/keyboard events.
+                                if check {
+                                    if table.delegate().rows_count(cx) > 0 {
+                                        cx.emit(TableEvent::SelectRow(0));
+                                    }
+                                } else {
+                                    cx.emit(TableEvent::ClearSelection);
+                                }
+                            });
+                        }),
+                    cx,
+                ))
+                .child(sort_label)
+                .into_any_element()
+        } else {
+            sort_label
+        }
     }
 
     fn render_tr(
@@ -545,35 +733,62 @@ impl TableDelegate for DownloadsDelegate {
             .map(|def| def.key)
             .unwrap_or(col::NAME);
         match key {
-            col::NAME => h_flex()
-                .gap_2()
-                .min_w_0()
+            col::NAME => {
+                // ABDM-style multi-select box. Clicking it also makes the row
+                // current (emitted below) so the toolbar stays in step; the
+                // framework itself only moves the single-row highlight.
+                let id = row.id;
+                let checked = self.is_checked(id);
+                let table = cx.entity();
+                h_flex()
+                    .gap_2()
+                    .min_w_0()
+                    .h_full()
+                    .items_center()
+                    .child(checkbox_frame(
+                        Checkbox::new(SharedString::from(format!("row-check-{}", id.get())))
+                            .checked(checked)
+                            .on_click(move |_, _: &mut Window, cx: &mut App| {
+                                table.update(cx, |table, cx| {
+                                    table.delegate_mut().toggle_checked(id);
+                                    table.refresh(cx);
+                                    cx.emit(TableEvent::SelectRow(row_ix));
+                                });
+                            }),
+                        cx,
+                    ))
+                    .child(
+                        Icon::new(Self::cell_icon(row.category))
+                            .small()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().foreground)
+                                    .child(row.file_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(row.category.label().to_owned()),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            col::SIZE => h_flex()
+                .h_full()
+                .items_center()
                 .child(
-                    Icon::new(Self::cell_icon(row.category))
-                        .small()
-                        .text_color(cx.theme().muted_foreground),
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(row.size_label.clone()),
                 )
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().foreground)
-                                .child(row.file_name.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(row.category.label().to_owned()),
-                        ),
-                )
-                .into_any_element(),
-            col::SIZE => div()
-                .text_sm()
-                .text_color(cx.theme().foreground)
-                .child(row.size_label.clone())
                 .into_any_element(),
             col::STATUS => {
                 let color = match row.status {
@@ -582,7 +797,7 @@ impl TableDelegate for DownloadsDelegate {
                     DownloadStatus::Paused => cx.theme().muted_foreground,
                     _ => cx.theme().foreground,
                 };
-                let mut cell = v_flex().gap_1().child(
+                let mut cell = v_flex().h_full().justify_center().gap_1().child(
                     div()
                         .text_sm()
                         .text_color(color)
@@ -600,20 +815,35 @@ impl TableDelegate for DownloadsDelegate {
                 }
                 cell.into_any_element()
             }
-            col::SPEED => div()
-                .text_sm()
-                .text_color(cx.theme().foreground)
-                .child(row.speed_label.clone())
+            col::SPEED => h_flex()
+                .h_full()
+                .items_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(row.speed_label.clone()),
+                )
                 .into_any_element(),
-            col::ETA => div()
-                .text_sm()
-                .text_color(cx.theme().foreground)
-                .child(row.eta_label.clone())
+            col::ETA => h_flex()
+                .h_full()
+                .items_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(row.eta_label.clone()),
+                )
                 .into_any_element(),
-            _ => div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(row.added_label.clone())
+            _ => h_flex()
+                .h_full()
+                .items_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(row.added_label.clone()),
+                )
                 .into_any_element(),
         }
     }
@@ -754,7 +984,10 @@ mod tests {
     };
     use raijin_core::monitor::DownloadView;
 
-    use super::{DownloadRow, SortColumn, SortDir, build_rows, filter_rows, next_sort, sort_rows};
+    use super::{
+        DownloadRow, RowChecklist, SortColumn, SortDir, build_rows, filter_rows, next_sort,
+        sort_rows,
+    };
     use crate::category::{CategoryFilter, FileCategory, StatusFilter};
     use crate::format::format_bytes;
 
@@ -865,6 +1098,45 @@ mod tests {
             next_sort((C::Name, D::Ascending), C::Name),
             (C::DateAdded, D::Descending)
         );
+    }
+
+    #[test]
+    fn checklist_should_toggle_and_list_ids_in_stable_order() {
+        let mut checklist = RowChecklist::default();
+        assert_eq!(checklist.len(), 0);
+
+        checklist.toggle(DownloadId::new(2));
+        checklist.toggle(DownloadId::new(1));
+        assert!(checklist.is_checked(DownloadId::new(1)));
+        assert_eq!(
+            checklist.ids(),
+            vec![DownloadId::new(1), DownloadId::new(2)]
+        );
+
+        // Toggling twice unchecks.
+        checklist.toggle(DownloadId::new(1));
+        assert!(!checklist.is_checked(DownloadId::new(1)));
+        assert_eq!(checklist.len(), 1);
+    }
+
+    #[test]
+    fn checklist_should_check_all_visible_and_prune_stale_ids() {
+        let mut checklist = RowChecklist::default();
+        checklist.set_all([DownloadId::new(1), DownloadId::new(2)], true);
+        assert_eq!(checklist.len(), 2);
+
+        // Unchecking all visible clears only those ids.
+        checklist.toggle(DownloadId::new(9));
+        checklist.set_all([DownloadId::new(1), DownloadId::new(2)], false);
+        assert_eq!(checklist.ids(), vec![DownloadId::new(9)]);
+
+        // Rows that left the visible set (removed/filtered) are pruned.
+        checklist.toggle(DownloadId::new(1));
+        checklist.retain_visible([DownloadId::new(9)]);
+        assert_eq!(checklist.ids(), vec![DownloadId::new(9)]);
+
+        checklist.uncheck_ids(&[DownloadId::new(9)]);
+        assert_eq!(checklist.len(), 0);
     }
 
     fn view(

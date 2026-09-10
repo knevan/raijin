@@ -255,6 +255,17 @@ impl MainView {
             .map(|row| row.id)
     }
 
+    /// Returns the ids toolbar actions apply to: the checked set when
+    /// non-empty (ABDM multi-select), else the single current row.
+    fn target_ids(&self, cx: &App) -> Vec<raijin_core::download::DownloadId> {
+        let checked = self.table.read(cx).delegate().checked_ids();
+        if checked.is_empty() {
+            self.selected_id(cx).into_iter().collect()
+        } else {
+            checked
+        }
+    }
+
     /// Applies a combined status + category filter from the sidebar tree.
     fn set_filter(
         &mut self,
@@ -268,27 +279,36 @@ impl MainView {
     }
 
     fn pause_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.selected_id(cx) {
+        for id in self.target_ids(cx) {
             self.handles.dispatch(EngineCommand::Pause(id));
         }
         cx.notify();
     }
 
     fn resume_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.selected_id(cx) {
+        for id in self.target_ids(cx) {
             self.handles.dispatch(EngineCommand::Resume(id));
         }
         cx.notify();
     }
 
     fn remove_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.selected_id(cx) {
+        let targets = self.target_ids(cx);
+        if targets.is_empty() {
+            return;
+        }
+        for id in &targets {
             // Immediate removal keeps list management fast; the engine only
             // deletes the download's own final and partial files. A confirm
             // step follows with the AlertDialog pass.
-            self.handles.dispatch(EngineCommand::Remove(id));
-            self.selected = None;
+            self.handles.dispatch(EngineCommand::Remove(*id));
         }
+        // Uncheck at once; the next monitor poll prunes them as well.
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().uncheck_ids(&targets);
+            table.refresh(cx);
+        });
+        self.selected = None;
         cx.notify();
     }
 
@@ -474,7 +494,10 @@ impl MainView {
     }
 
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_selection = self.selected.is_some();
+        // Toolbar acts on the checked set when non-empty, else the current
+        // row — so any check enables the row actions immediately.
+        let has_selection =
+            self.selected.is_some() || self.table.read(cx).delegate().checked_count() > 0;
         h_flex()
             .gap_2()
             .items_center()
@@ -621,6 +644,9 @@ impl Render for MainView {
                                             .overflow_hidden()
                                             .child(
                                                 DataTable::new(&self.table)
+                                                    .with_size(px(
+                                                        crate::downloads::TABLE_ROW_HEIGHT_PX,
+                                                    ))
                                                     .stripe(false)
                                                     .bordered(false),
                                             ),

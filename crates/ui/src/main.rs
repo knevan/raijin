@@ -161,10 +161,13 @@ fn main() {
                 let handles = handles.clone();
                 let tray = tray.clone();
                 cx.spawn(async move |cx| {
-                    cx.open_window(TitleBar::window_options(), |window, cx| {
-                        build_main_root(window, cx, handles.clone(), tray.clone())
+                    cx.update(|cx| {
+                        let options = main_window_options(cx);
+                        cx.open_window(options, |window, cx| {
+                            build_main_root(window, cx, handles.clone(), tray.clone())
+                        })
+                        .expect("failed to open main window");
                     })
-                    .expect("failed to open main window");
                 })
                 .detach();
             }
@@ -391,7 +394,7 @@ fn spawn_tray_sync(cx: &mut App, icon: native_tray::Tray, session: TraySession) 
 fn open_main_window(cx: &mut App, handles: &EngineHandles, tray: &TraySession) {
     let root_handles = handles.clone();
     let root_tray = tray.clone();
-    match cx.open_window(TitleBar::window_options(), |window, cx| {
+    match cx.open_window(main_window_options(cx), |window, cx| {
         build_main_root(window, cx, root_handles.clone(), root_tray.clone())
     }) {
         Ok(handle) => {
@@ -404,6 +407,14 @@ fn open_main_window(cx: &mut App, handles: &EngineHandles, tray: &TraySession) {
         }
         Err(error) => tracing::error!(?error, "failed to open main window"),
     }
+}
+
+/// Default main-window options: centered windowed frame, never fullscreen.
+fn main_window_options(cx: &App) -> WindowOptions {
+    let mut options = TitleBar::window_options();
+    options.window_bounds = Some(WindowBounds::centered(size(px(900.), px(600.)), cx));
+    options.window_min_size = Some(size(px(600.), px(300.)));
+    options
 }
 
 /// Builds the main window root view and wires the close veto.

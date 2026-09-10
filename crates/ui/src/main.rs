@@ -92,7 +92,7 @@ fn main() {
                 minimize_to_tray = behavior.minimize_to_tray,
                 close_to_tray = behavior.close_to_tray,
                 start_minimized,
-                "raijin-ui starting"
+                "raijin starting"
             );
             // OS quit requests (dock, taskbar, session end) must stand the
             // window-closed observer down, or it would reopen mid-quit.

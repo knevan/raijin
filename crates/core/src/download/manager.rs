@@ -146,7 +146,7 @@ pub enum DownloadCommand {
 /// Events published by the download manager.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DownloadEvent {
-    /// Manager boot loaded unfinished downloads from persistence.
+    /// Manager boot loaded persisted downloads (all except removed) for UI seeding.
     BootLoaded { downloads: Vec<DownloadItem> },
     /// Download metadata was added.
     DownloadAdded { item: DownloadItem },
@@ -473,15 +473,17 @@ impl DownloadManager {
     }
 
     async fn boot(&mut self) -> DownloadManagerResult<()> {
-        let unfinished = self.repository.list_unfinished().await?;
-        for item in &unfinished {
+        let stored = self.repository.list().await?;
+        let visible: Vec<DownloadItem> = stored
+            .into_iter()
+            .filter(|item| item.status != DownloadStatus::Removed)
+            .collect();
+        for item in &visible {
             if should_start_on_boot(item.status) {
                 self.start_job(item.clone());
             }
         }
-        self.publish(DownloadEvent::BootLoaded {
-            downloads: unfinished,
-        });
+        self.publish(DownloadEvent::BootLoaded { downloads: visible });
         Ok(())
     }
 
@@ -1073,12 +1075,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_should_recreate_unfinished_download_metadata() -> DownloadManagerResult<()> {
+    async fn boot_should_seed_visible_downloads_including_completed() -> DownloadManagerResult<()> {
         let db = test_db().await?;
         let unfinished = sample_item(DownloadId::new(1), DownloadStatus::Paused);
         let completed = sample_item(DownloadId::new(2), DownloadStatus::Completed);
+        let removed = sample_item(DownloadId::new(3), DownloadStatus::Removed);
         db.repository.add(&unfinished).await?;
         db.repository.add(&completed).await?;
+        db.repository.add(&removed).await?;
         let (handle, task, mut events) = DownloadManagerHandle::spawn_with_events(
             db.repository,
             db.part_repository,
@@ -1096,7 +1100,7 @@ mod tests {
         assert_eq!(
             event,
             DownloadEvent::BootLoaded {
-                downloads: vec![unfinished]
+                downloads: vec![unfinished, completed]
             }
         );
         stop_manager(&handle, task).await

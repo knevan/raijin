@@ -452,8 +452,9 @@ impl MainView {
             None => ("Detecting…".to_owned(), 0.0),
         };
         v_flex()
+            .w_full()
             .gap_1()
-            .p_3()
+            .p_2()
             .rounded_md()
             .bg(cx.theme().muted)
             .child(

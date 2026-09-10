@@ -4,3 +4,6 @@
 *.sqlite-shm
 *.sqlite-journal
 .agents
+*.md
+*.json
+!README.md

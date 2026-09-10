@@ -52,6 +52,8 @@ pub struct HttpRequest {
 pub struct HttpResponse {
     /// Numeric HTTP status code.
     pub status: u16,
+    /// Final URL after redirects.
+    pub url: String,
     /// Response headers with lowercase names.
     pub headers: BTreeMap<String, String>,
     /// Response body bytes captured for metadata checks.
@@ -137,11 +139,13 @@ impl HttpClient for ReqwestHttpClient {
 
         let mut response = builder.send().await?;
         let status = response.status().as_u16();
+        let url = response.url().to_string();
         let headers = response_headers(response.headers());
         let body = read_probe_body(&mut response).await?;
 
         Ok(HttpResponse {
             status,
+            url,
             headers,
             body,
         })
@@ -214,6 +218,9 @@ pub struct ContentRange {
 pub struct HttpMetadata {
     /// Final probed URL.
     pub url: String,
+    /// Server-suggested file name from `Content-Disposition`, if present.
+    #[serde(default)]
+    pub file_name: Option<String>,
     /// Resume capability detected by probe.
     pub resume_support: ResumeSupport,
     /// Total resource size, if known.
@@ -299,7 +306,8 @@ where
 
     let status = range_response.status_code()?;
     let metadata = if status == StatusCode::PARTIAL_CONTENT {
-        metadata_from_range_response(&request.url, range, range_response)?
+        let url = range_response.url.clone();
+        metadata_from_range_response(&url, range, range_response)?
     } else {
         let fallback_response = if should_fallback(status) {
             client
@@ -312,7 +320,8 @@ where
         } else {
             range_response
         };
-        metadata_from_full_response(&request.url, fallback_response)?
+        let url = fallback_response.url.clone();
+        metadata_from_full_response(&url, fallback_response)?
     };
 
     validate_webpage_mismatch(&metadata, request.file_name.as_deref())?;
@@ -366,6 +375,9 @@ fn metadata_from_range_response(
 
     Ok(HttpMetadata {
         url: url.to_owned(),
+        file_name: response
+            .header("content-disposition")
+            .and_then(extract_filename_from_content_disposition),
         resume_support: ResumeSupport::Supported,
         total_bytes: content_range.total,
         response_content_length,
@@ -389,6 +401,9 @@ fn metadata_from_full_response(
 
     Ok(HttpMetadata {
         url: url.to_owned(),
+        file_name: response
+            .header("content-disposition")
+            .and_then(extract_filename_from_content_disposition),
         resume_support: ResumeSupport::Unsupported,
         total_bytes: content_length,
         response_content_length: content_length,
@@ -398,6 +413,256 @@ fn metadata_from_full_response(
         content_type: response.header("content-type").map(ToOwned::to_owned),
         status: response.status,
     })
+}
+
+/// Decodes `%XX` runs as UTF-8 without touching `+`.
+///
+/// Mirrors ABDM `FilenameDecoder`: consecutive escapes form one UTF-8 run,
+/// stray/invalid escapes stay literal so no name is lost.
+#[must_use]
+pub fn decode_percent_filename(segment: &str) -> String {
+    if !segment.contains('%') {
+        return segment.to_owned();
+    }
+    let bytes = segment.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_escape =
+            bytes[i] == b'%' && is_hex(bytes.get(i + 1)) && is_hex(bytes.get(i + 2));
+        if !is_escape {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let raw_start = i;
+        let mut pending: Vec<u8> = Vec::new();
+        while i < bytes.len()
+            && bytes[i] == b'%'
+            && is_hex(bytes.get(i + 1))
+            && is_hex(bytes.get(i + 2))
+        {
+            pending.push((hex_val(bytes[i + 1]) << 4) | hex_val(bytes[i + 2]));
+            i += 3;
+        }
+        match String::from_utf8(pending) {
+            Ok(text) => out.extend_from_slice(text.as_bytes()),
+            Err(_) => out.extend_from_slice(&bytes[raw_start..i]),
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| segment.to_owned())
+}
+
+/// Extracts a server-suggested file name from a `Content-Disposition` value.
+///
+/// Priority mirrors ABDM `fileNameExtractor`: extended `filename*=UTF-8''...`
+/// first, then plain `filename="..."` (with RFC 2047 MIME-word and percent
+/// decoding). Returns `None` when nothing usable remains; callers fall back
+/// to the URL-derived name.
+#[must_use]
+pub fn extract_filename_from_content_disposition(value: &str) -> Option<String> {
+    extended_filename(value)
+        .or_else(|| plain_filename(value))
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+/// Finds an extended `filename*=charset'lang'percent-encoded` parameter.
+fn extended_filename(value: &str) -> Option<String> {
+    for param in split_header_params(value) {
+        // Non-parameter segments (e.g. leading `attachment`) are skipped.
+        let Some((name, param_value)) = split_param(&param) else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("filename*") {
+            continue;
+        }
+        let encoded = param_value.trim().trim_matches('"').trim();
+        // RFC 5987 shape is `charset'lang'value`; accept a bare value too.
+        let encoded = encoded.rsplit("''").next().unwrap_or(encoded);
+        let decoded = decode_percent_filename(encoded);
+        let decoded = decoded.trim();
+        if !decoded.is_empty() {
+            return Some(decoded.to_owned());
+        }
+    }
+    None
+}
+
+/// Finds a plain `filename="..."` parameter with MIME-word support.
+fn plain_filename(value: &str) -> Option<String> {
+    for param in split_header_params(value) {
+        // Non-parameter segments (e.g. leading `attachment`) are skipped.
+        let Some((name, param_value)) = split_param(&param) else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("filename") {
+            continue;
+        }
+        let mut filename = param_value.trim().to_owned();
+        if filename.len() >= 2
+            && filename.starts_with('"')
+            && filename.ends_with('"')
+        {
+            filename = filename[1..filename.len() - 1].to_owned();
+        }
+        let filename = decode_mime_words(&filename);
+        let filename = decode_percent_filename(&filename);
+        let filename = filename.trim();
+        if !filename.is_empty() {
+            return Some(filename.to_owned());
+        }
+    }
+    None
+}
+
+/// Splits a header value on `;` outside quoted strings.
+fn split_header_params(value: &str) -> Vec<String> {
+    let mut params = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for ch in value.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            ';' if !in_quotes => {
+                params.push(current);
+                current = String::new();
+            }
+            _ => current.push(ch),
+        }
+    }
+    params.push(current);
+    params
+}
+
+/// Splits one `name=value` parameter on its first `=`.
+fn split_param(param: &str) -> Option<(String, String)> {
+    let (name, param_value) = param.split_once('=')?;
+    Some((name.to_owned(), param_value.to_owned()))
+}
+
+/// Decodes RFC 2047 `=?charset?B|Q?text?=` words, leaving unknown ones raw.
+fn decode_mime_words(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(token) = mime_word_at(&bytes[i..]) {
+            out.push_str(&token.text);
+            i += token.len;
+        } else if bytes[i] < 0x80 {
+            out.push(bytes[i] as char);
+            i += 1;
+        } else {
+            // Copy one full UTF-8 char so multibyte text survives intact.
+            let ch = value[i..].chars().next().unwrap_or('\u{FFFD}');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+struct MimeWord {
+    text: String,
+    len: usize,
+}
+
+/// Scans one encoded word at the slice start; `None` means literal text.
+fn mime_word_at(input: &[u8]) -> Option<MimeWord> {
+    if input.len() < 8 || &input[..2] != b"=?" {
+        return None;
+    }
+    let rest = &input[2..];
+    let charset_end = rest.iter().position(|&byte| byte == b'?')?;
+    let charset = std::str::from_utf8(&rest[..charset_end]).ok()?;
+    let rest = &rest[charset_end + 1..];
+    if rest.is_empty() {
+        return None;
+    }
+    let encoding = rest[0];
+    if rest.len() < 3 || rest[1] != b'?' {
+        return None;
+    }
+    let rest = &rest[2..];
+    let end = find_mime_end(rest)?;
+    let encoded = std::str::from_utf8(&rest[..end]).ok()?;
+    let decoded = match encoding {
+        b'B' | b'b' => decode_mime_base64(encoded, charset)?,
+        b'Q' | b'q' => decode_mime_quoted(encoded, charset)?,
+        _ => return None,
+    };
+    Some(MimeWord {
+        len: input.len() - rest.len() + end + 2,
+        text: decoded,
+    })
+}
+
+/// Finds the closing `?=` of an encoded word.
+fn find_mime_end(input: &[u8]) -> Option<usize> {
+    input
+        .windows(2)
+        .position(|window| window == b"?=")
+}
+
+/// Decodes `B` (base64) MIME-word bytes into text.
+fn decode_mime_base64(encoded: &str, charset: &str) -> Option<String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let bytes = STANDARD.decode(encoded.trim()).ok()?;
+    bytes_to_text(&bytes, charset)
+}
+
+/// Decodes `Q` (quoted-printable) MIME-word bytes into text.
+fn decode_mime_quoted(encoded: &str, charset: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    let mut raw: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // `_` represents a space in Q encoding.
+            b'_' => {
+                raw.push(b' ');
+                i += 1;
+            }
+            b'=' if is_hex(bytes.get(i + 1)) && is_hex(bytes.get(i + 2)) => {
+                raw.push((hex_val(bytes[i + 1]) << 4) | hex_val(bytes[i + 2]));
+                i += 3;
+            }
+            byte => {
+                raw.push(byte);
+                i += 1;
+            }
+        }
+    }
+    bytes_to_text(&raw, charset)
+}
+
+/// Converts decoded bytes using the declared charset.
+///
+/// Resolves the label per the WHATWG Encoding Standard (covers Shift_JIS,
+/// GBK, windows-1252, and friends). Malformed input yields `None` so the
+/// caller keeps the raw token instead of a replacement-damaged name. Note
+/// the standard maps `iso-8859-1` onto `windows-1252` by design.
+fn bytes_to_text(bytes: &[u8], charset: &str) -> Option<String> {
+    let encoding = encoding_rs::Encoding::for_label(charset.as_bytes())?;
+    let (text, _, had_errors) = encoding.decode(bytes);
+    (!had_errors).then(|| text.into_owned())
+}
+
+fn is_hex(value: Option<&u8>) -> bool {
+    matches!(value, Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+}
+
+fn hex_val(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        b'A'..=b'F' => value - b'A' + 10,
+        _ => 0,
+    }
 }
 
 fn should_fallback(status: StatusCode) -> bool {
@@ -550,6 +815,7 @@ mod tests {
     #[derive(Debug, Clone)]
     enum ServerMode {
         RangeSupported,
+        RangeSupportedWithDisposition,
         RangeUnsupported,
         RangeUnsupportedLargeBody,
         ChangedLength,
@@ -620,6 +886,35 @@ mod tests {
                     ("Content-Type", "application/octet-stream"),
                 ],
                 &vec![b'a'; 256],
+            ),
+            ServerMode::RangeSupportedWithDisposition if has_range => response(
+                206,
+                "Partial Content",
+                &[
+                    (CONTENT_LENGTH.as_str(), "256"),
+                    ("Content-Range", "bytes 0-255/1024"),
+                    (ETAG.as_str(), "\"etag-1\""),
+                    ("Content-Type", "application/octet-stream"),
+                    (
+                        "Content-Disposition",
+                        "attachment; filename*=UTF-8''My%20App.exe",
+                    ),
+                ],
+                &vec![b'a'; 256],
+            ),
+            ServerMode::RangeSupportedWithDisposition => response(
+                200,
+                "OK",
+                &[
+                    (CONTENT_LENGTH.as_str(), "1024"),
+                    (ETAG.as_str(), "\"etag-1\""),
+                    ("Content-Type", "application/octet-stream"),
+                    (
+                        "Content-Disposition",
+                        "attachment; filename*=UTF-8''My%20App.exe",
+                    ),
+                ],
+                &vec![b'a'; 1024],
             ),
             ServerMode::RangeSupported => response(
                 200,
@@ -845,6 +1140,118 @@ mod tests {
         assert_eq!(range.start, Bytes::new(10));
         assert_eq!(range.end, Bytes::new(19));
         assert_eq!(range.total, Some(Bytes::new(100)));
+        Ok(())
+    }
+
+    #[test]
+    fn disposition_should_prefer_extended_over_plain_filename() {
+        assert_eq!(
+            extract_filename_from_content_disposition(
+                "attachment; filename=\"fallback.exe\"; filename*=UTF-8''My%20App.exe"
+            ),
+            Some("My App.exe".to_owned())
+        );
+        assert_eq!(
+            extract_filename_from_content_disposition("attachment; filename=\"My App.exe\""),
+            Some("My App.exe".to_owned())
+        );
+        assert_eq!(
+            extract_filename_from_content_disposition("attachment; filename=setup.exe"),
+            Some("setup.exe".to_owned())
+        );
+    }
+
+    #[test]
+    fn disposition_should_decode_mime_words_and_keep_plus_literal() {
+        assert_eq!(
+            extract_filename_from_content_disposition(
+                "attachment; filename=\"=?UTF-8?Q?My_App=2Eexe?=\""
+            ),
+            Some("My App.exe".to_owned())
+        );
+        assert_eq!(
+            extract_filename_from_content_disposition("attachment; filename=\"a%2Bb.exe\""),
+            Some("a+b.exe".to_owned())
+        );
+    }
+
+    #[test]
+    fn disposition_should_decode_legacy_charsets_via_whatwg() {
+        // Shift_JIS `あ` (0x82 0xA0) carried as base64 `gqA=`.
+        assert_eq!(
+            extract_filename_from_content_disposition(
+                "attachment; filename=\"=?Shift_JIS?B?gqA=?=.txt\""
+            ),
+            Some("あ.txt".to_owned())
+        );
+        // WHATWG maps ISO-8859-1 onto windows-1252, so 0x80 is `€`.
+        assert_eq!(
+            extract_filename_from_content_disposition(
+                "attachment; filename=\"=?ISO-8859-1?Q?=80?=\""
+            ),
+            Some("€".to_owned())
+        );
+    }
+
+    #[test]
+    fn disposition_should_keep_raw_token_for_unknown_or_broken_charsets() {
+        assert_eq!(
+            extract_filename_from_content_disposition(
+                "attachment; filename=\"=?X-UNKNOWN?Q?hello?=\""
+            ),
+            Some("=?X-UNKNOWN?Q?hello?=".to_owned())
+        );
+        // 0xFF is malformed UTF-8: no replacement-damaged name.
+        assert_eq!(
+            extract_filename_from_content_disposition(
+                "attachment; filename=\"=?UTF-8?Q?=FF?=\""
+            ),
+            Some("=?UTF-8?Q?=FF?=".to_owned())
+        );
+    }
+
+    #[test]
+    fn disposition_should_reject_unusable_values() {
+        assert_eq!(extract_filename_from_content_disposition("attachment"), None);
+        assert_eq!(
+            extract_filename_from_content_disposition("attachment; filename=\"\""),
+            None
+        );
+        assert_eq!(
+            extract_filename_from_content_disposition("attachment; filename=\"   \""),
+            None
+        );
+    }
+
+    #[test]
+    fn percent_decoder_should_keep_stray_escapes_literal() {
+        assert_eq!(
+            decode_percent_filename("Antigravity%20IDE.exe"),
+            "Antigravity IDE.exe"
+        );
+        assert_eq!(decode_percent_filename("100%.exe"), "100%.exe");
+        assert_eq!(decode_percent_filename("a+b.zip"), "a+b.zip");
+    }
+
+    #[tokio::test]
+    async fn probe_should_capture_disposition_filename_and_final_url(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let server = TestServer::spawn(ServerMode::RangeSupportedWithDisposition).await?;
+        let metadata = probe_http(&reqwest_client()?, ProbeRequest::new(server.url())).await?;
+
+        assert_eq!(metadata.file_name, Some("My App.exe".to_owned()));
+        assert_eq!(metadata.url, server.url());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_should_leave_filename_empty_without_disposition(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let server = TestServer::spawn(ServerMode::RangeSupported).await?;
+        let metadata = probe_http(&reqwest_client()?, ProbeRequest::new(server.url())).await?;
+
+        assert_eq!(metadata.file_name, None);
+        assert_eq!(metadata.url, server.url());
         Ok(())
     }
 }

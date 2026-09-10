@@ -61,6 +61,8 @@ pub struct AddDownloadView {
     /// True once the user edits the folder by hand (stops category auto-fill).
     folder_manual: bool,
     probe: ProbeState,
+    /// Last server-suggested file name from the probe (header over final URL).
+    probe_name: Option<String>,
     /// Monotonic id; only the newest probe task may write `probe`.
     probe_gen: u64,
     _subscriptions: [Subscription; 4],
@@ -114,6 +116,7 @@ impl AddDownloadView {
             category_manual: false,
             folder_manual: false,
             probe: ProbeState::Idle,
+            probe_name: None,
             probe_gen: 0,
             _subscriptions: subscriptions,
         };
@@ -199,7 +202,7 @@ impl AddDownloadView {
                 state.set_value(folder.to_string_lossy().as_ref(), window, cx);
             });
         }
-        self.schedule_probe(url, cx);
+        self.schedule_probe(url, window, cx);
         cx.notify();
     }
 
@@ -217,7 +220,11 @@ impl AddDownloadView {
     }
 
     /// Starts a debounced size probe for `url`; stale results are dropped.
-    fn schedule_probe(&mut self, url: String, cx: &mut Context<Self>) {
+    ///
+    /// A successful probe also upgrades the file suggestion (header over final
+    /// URL) unless the user already typed a name by hand. Field writes need a
+    /// live window, so they run through its handle; the badge works windowless.
+    fn schedule_probe(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
         self.probe_gen += 1;
         let generation = self.probe_gen;
         if !is_http_url_str(&url) {
@@ -226,23 +233,79 @@ impl AddDownloadView {
         }
         self.probe = ProbeState::Checking;
         let runtime = self.handles.runtime.clone();
+        let window_handle = window.window_handle();
         cx.spawn(async move |weak, cx| {
             let probed = runtime
-                .spawn(async move { probe_total_bytes(&url).await })
+                .spawn(async move { probe_download_info(&url).await })
                 .await
                 .unwrap_or(None);
-            let _ = weak.update(cx, |view, cx| {
-                if view.probe_gen != generation {
-                    return;
-                }
-                view.probe = match probed {
-                    Some(total) => ProbeState::Ready { total_bytes: total },
-                    None => ProbeState::Failed,
-                };
-                cx.notify();
+            let info = weak
+                .update(cx, |view, cx| {
+                    if view.probe_gen != generation {
+                        return None;
+                    }
+                    match probed {
+                        Some(info) => {
+                            view.probe = ProbeState::Ready {
+                                total_bytes: info.total_bytes,
+                            };
+                            cx.notify();
+                            Some(info)
+                        }
+                        None => {
+                            view.probe = ProbeState::Failed;
+                            cx.notify();
+                            None
+                        }
+                    }
+                })
+                .ok()
+                .flatten();
+            let Some(info) = info else {
+                return;
+            };
+            let _ = window_handle.update(cx, |_, window, cx| {
+                let _ = weak.update(cx, |view, cx| {
+                    if view.probe_gen != generation {
+                        return;
+                    }
+                    view.apply_probe_name(info, window, cx);
+                    cx.notify();
+                });
             });
         })
         .detach();
+    }
+
+    /// Applies a probe result to the file/category/folder derivation.
+    ///
+    /// Programmatic `set_value` calls suppress `Change` events, so manual
+    /// flags stay untouched: a probe upgrade never locks the user out.
+    fn apply_probe_name(&mut self, info: ProbeInfo, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(name) = info.file_name {
+            let sanitized = sanitize_filename(&name);
+            if !sanitized.is_empty() {
+                self.probe_name = Some(sanitized);
+            }
+        }
+        if self.file_manual {
+            return;
+        }
+        let current = self.file.read(cx).value().to_string();
+        let Some(upgrade) =
+            select_probe_filename(&current, self.probe_name.as_deref(), &info.final_url, &info.typed_url)
+        else {
+            return;
+        };
+        self.file.update(cx, |state, cx| {
+            state.set_value(upgrade.as_str(), window, cx);
+        });
+        if !self.category_manual {
+            self.set_category(infer_category(upgrade.trim()), window, cx);
+        }
+        if !self.folder_manual {
+            self.refresh_folder(window, cx);
+        }
     }
 
     fn on_url_event(
@@ -348,7 +411,11 @@ impl AddDownloadView {
         let raw_file = self.file.read(cx).value().to_string();
         let file_name = sanitize_filename(&raw_file);
         let file_name = if file_name.is_empty() {
-            crate::bridge::suggest_filename(url.trim())
+            self.probe_name
+                .as_deref()
+                .map(sanitize_filename)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| crate::bridge::suggest_filename(url.trim()))
         } else {
             file_name
         };
@@ -661,11 +728,53 @@ pub fn open_add_download_window(cx: &mut App, handles: &EngineHandles, initial_u
     }
 }
 
-/// Probes `url` for its total size; `None` covers unknown sizes and failures.
+/// Probe result feeding the size badge plus the file-name suggestion.
+struct ProbeInfo {
+    /// Probed total size; `None` covers blind servers.
+    total_bytes: Option<u64>,
+    /// Sanitized server-suggested name (header over final URL), if any.
+    file_name: Option<String>,
+    /// Final URL after redirects.
+    final_url: String,
+    /// Typed URL the probe ran for (stale-result guard lives on `probe_gen`).
+    typed_url: String,
+}
+
+/// Picks a probe-driven file upgrade, if the probe knows better.
+///
+/// Priority mirrors ABDM: `Content-Disposition` header over the final URL
+/// after redirects over the typed URL. Returns `None` when the current value
+/// already wins (or is equally good), so callers never churn the field.
+fn select_probe_filename(
+    current: &str,
+    header_name: Option<&str>,
+    final_url: &str,
+    typed_url: &str,
+) -> Option<String> {
+    let header = header_name
+        .map(sanitize_filename)
+        .filter(|name| !name.is_empty());
+    if let Some(header) = header {
+        if header != current.trim() {
+            return Some(header);
+        }
+        return None;
+    }
+    if final_url == typed_url {
+        return None;
+    }
+    let suggestion = crate::bridge::suggest_filename(final_url);
+    if suggestion != current.trim() && suggestion != crate::bridge::suggest_filename(typed_url) {
+        return Some(suggestion);
+    }
+    None
+}
+
+/// Probes `url` for size plus naming hints; `None` covers failures.
 ///
 /// A short timeout keeps the badge from hanging the submit path: the form
 /// stays submittable either way because blind servers are still downloadable.
-async fn probe_total_bytes(url: &str) -> Option<Option<u64>> {
+async fn probe_download_info(url: &str) -> Option<ProbeInfo> {
     let client = raijin_core::download::ReqwestHttpClient::new().ok()?;
     let request = raijin_core::download::ProbeRequest::new(url.to_owned());
     let metadata = tokio::time::timeout(
@@ -675,7 +784,12 @@ async fn probe_total_bytes(url: &str) -> Option<Option<u64>> {
     .await
     .ok()?
     .ok()?;
-    Some(metadata.total_bytes.map(|bytes| bytes.get()))
+    Some(ProbeInfo {
+        total_bytes: metadata.total_bytes.map(|bytes| bytes.get()),
+        file_name: metadata.file_name,
+        final_url: metadata.url,
+        typed_url: url.to_owned(),
+    })
 }
 
 /// Reads clipboard text, if any, on the GPUI thread.
@@ -799,6 +913,7 @@ mod tests {
 
     use super::{
         category_from_label, category_position, initial_category, resolve_folder, sanitize_filename,
+        select_probe_filename,
     };
     use crate::category::FileCategory;
 
@@ -867,5 +982,51 @@ mod tests {
         );
         assert_eq!(initial_category(""), FileCategory::Other);
         assert_eq!(initial_category("not a url"), FileCategory::Other);
+    }
+
+    #[test]
+    fn probe_filename_should_prefer_header_over_urls() {
+        assert_eq!(
+            select_probe_filename(
+                "stat",
+                Some("Antigravity IDE.exe"),
+                "https://cdn.example.com/files/Antigravity%20IDE.exe",
+                "https://example.com/stat?id=1",
+            ),
+            Some("Antigravity IDE.exe".to_owned())
+        );
+        // Identical header never churns the field.
+        assert_eq!(
+            select_probe_filename(
+                "Antigravity IDE.exe",
+                Some("Antigravity IDE.exe"),
+                "https://cdn.example.com/files/Antigravity%20IDE.exe",
+                "https://example.com/stat?id=1",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn probe_filename_should_upgrade_from_final_url_after_redirect() {
+        assert_eq!(
+            select_probe_filename(
+                "download.bin",
+                None,
+                "https://cdn.example.com/files/Antigravity%20IDE.exe",
+                "https://example.com/go?id=1",
+            ),
+            Some("Antigravity IDE.exe".to_owned())
+        );
+        // No redirect and no header means the typed suggestion already won.
+        assert_eq!(
+            select_probe_filename(
+                "app.zip",
+                None,
+                "https://example.com/files/app.zip",
+                "https://example.com/files/app.zip",
+            ),
+            None
+        );
     }
 }

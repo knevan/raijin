@@ -7,7 +7,8 @@ pub mod speed;
 
 pub use http::{
     ByteRange, ContentRange, HttpClient, HttpMetadata, HttpProbeError, HttpRequest, HttpResponse,
-    ProbeRequest, ReqwestHttpClient, ResumeValidation, probe_http, validate_resume_metadata,
+    ProbeRequest, ReqwestHttpClient, ResumeValidation, decode_percent_filename,
+    extract_filename_from_content_disposition, probe_http, validate_resume_metadata,
 };
 pub use job::{HttpDownloadJob, HttpDownloadJobError, HttpDownloadJobResult};
 pub use manager::{

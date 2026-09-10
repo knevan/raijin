@@ -3,6 +3,8 @@ resolver = "3"
 members = ["crates/core", "crates/ui"]
 
 [workspace.dependencies]
+base64 = "0.23"
+encoding_rs = "0.8"
 gpui-kit = { version = "0.6", features = ["component", "assets"] }
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"

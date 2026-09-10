@@ -123,8 +123,10 @@ pub fn is_http_url_str(url: &str) -> bool {
 
 /// Suggests a file name from the last URL path segment.
 ///
-/// Query strings and fragments are stripped. Bare hosts, trailing slashes,
-/// and unusable segments fall back to `download.bin`.
+/// Query strings and fragments are stripped, then percent-escapes are decoded
+/// like ABDM `FilenameDecoder` (keeps `+` literal, tolerant on bad escapes).
+/// Bare hosts, trailing slashes, and unusable segments fall back to
+/// `download.bin`.
 #[must_use]
 pub fn suggest_filename(url: &str) -> String {
     let after_scheme = url.split("://").nth(1).unwrap_or(url);
@@ -133,8 +135,14 @@ pub fn suggest_filename(url: &str) -> String {
     if !path.contains('/') || segment.is_empty() || segment.contains(['\\', ':']) {
         return "download.bin".to_owned();
     }
+    // Single decoder owned by core (ABDM `FilenameDecoder` parity).
+    let decoded = raijin_core::download::decode_percent_filename(segment);
+    let decoded = decoded.trim();
+    if decoded.is_empty() {
+        return "download.bin".to_owned();
+    }
     // Cap the suggestion so absurdly long segments cannot create hostile names.
-    segment.chars().take(128).collect()
+    decoded.chars().take(128).collect()
 }
 
 #[cfg(test)]
@@ -190,5 +198,23 @@ mod tests {
         );
         assert_eq!(suggest_filename("https://example.com/"), "download.bin");
         assert_eq!(suggest_filename("https://example.com"), "download.bin");
+    }
+
+    #[test]
+    fn suggest_should_decode_percent_escapes_like_abdm() {
+        assert_eq!(
+            suggest_filename("https://example.com/windows-x64/Antigravity%20IDE.exe"),
+            "Antigravity IDE.exe"
+        );
+        // `+` stays literal (not a space), matching ABDM `FilenameDecoder`.
+        assert_eq!(
+            suggest_filename("https://example.com/a%2Bb.zip"),
+            "a+b.zip"
+        );
+        // Stray `%` stays literal so no name is lost.
+        assert_eq!(
+            suggest_filename("https://example.com/100%.exe"),
+            "100%.exe"
+        );
     }
 }

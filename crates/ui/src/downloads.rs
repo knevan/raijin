@@ -170,6 +170,49 @@ fn failure_kind_label(kind: FailureKind) -> &'static str {
     }
 }
 
+/// True when Resume applies to `status` (paused or failed).
+#[must_use]
+pub const fn can_resume(status: DownloadStatus) -> bool {
+    matches!(status, DownloadStatus::Paused | DownloadStatus::Error)
+}
+
+/// True when Pause (and Pause-all) applies to `status`.
+#[must_use]
+pub const fn can_pause(status: DownloadStatus) -> bool {
+    matches!(
+        status,
+        DownloadStatus::Added
+            | DownloadStatus::Queued
+            | DownloadStatus::Downloading
+            | DownloadStatus::Retrying
+            | DownloadStatus::PreparingFile
+    )
+}
+
+/// Toolbar enablement derived from selection and full list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolbarActions {
+    /// At least one target can resume.
+    pub can_resume: bool,
+    /// At least one target can pause.
+    pub can_pause: bool,
+    /// At least one target selected (remove always applies).
+    pub can_remove: bool,
+    /// At least one download anywhere can pause.
+    pub can_pause_all: bool,
+}
+
+/// Computes toolbar enablement from target and full-list statuses.
+#[must_use]
+pub fn toolbar_actions(targets: &[DownloadStatus], all: &[DownloadStatus]) -> ToolbarActions {
+    ToolbarActions {
+        can_resume: targets.iter().any(|status| can_resume(*status)),
+        can_pause: targets.iter().any(|status| can_pause(*status)),
+        can_remove: !targets.is_empty(),
+        can_pause_all: all.iter().any(|status| can_pause(*status)),
+    }
+}
+
 /// Builds presentation rows from monitor views, skipping removed downloads.
 #[must_use]
 pub fn build_rows<'a>(
@@ -387,7 +430,8 @@ impl RowChecklist {
         self.checked.iter().copied().collect()
     }
 
-    /// Returns the number of checked ids.
+    /// Returns the number of checked ids (test helper).
+    #[cfg(test)]
     #[must_use]
     fn len(&self) -> usize {
         self.checked.len()
@@ -419,11 +463,23 @@ struct ColumnDef {
     key: &'static str,
     name: &'static str,
     width: f32,
+    /// Drag floor so a column stays readable (header label + cell content).
+    min_width: f32,
 }
 
 impl ColumnDef {
-    const fn new(key: &'static str, name: &'static str, width: f32) -> Self {
-        Self { key, name, width }
+    const fn new(key: &'static str, name: &'static str, width: f32, min_width: f32) -> Self {
+        Self {
+            key,
+            name,
+            width,
+            min_width,
+        }
+    }
+
+    /// Floors a dragged width at this column's readable minimum.
+    fn clamp_width(&self, raw: f32) -> f32 {
+        raw.max(self.min_width)
     }
 }
 
@@ -453,12 +509,12 @@ impl DownloadsDelegate {
         Self {
             rows: Vec::new(),
             columns: vec![
-                ColumnDef::new(col::NAME, "Name", 390.0),
-                ColumnDef::new(col::SIZE, "Size", 110.0),
-                ColumnDef::new(col::STATUS, "Status", 210.0),
-                ColumnDef::new(col::SPEED, "Speed", 130.0),
-                ColumnDef::new(col::ETA, "Time Left", 130.0),
-                ColumnDef::new(col::ADDED, "Date Added", 150.0),
+                ColumnDef::new(col::NAME, "Name", 390.0, 180.0),
+                ColumnDef::new(col::SIZE, "Size", 110.0, 80.0),
+                ColumnDef::new(col::STATUS, "Status", 210.0, 140.0),
+                ColumnDef::new(col::SPEED, "Speed", 130.0, 80.0),
+                ColumnDef::new(col::ETA, "Time Left", 130.0, 90.0),
+                ColumnDef::new(col::ADDED, "Date Added", 150.0, 110.0),
             ],
             sort_column: SortColumn::DateAdded,
             sort_dir: SortDir::Descending,
@@ -487,7 +543,7 @@ impl DownloadsDelegate {
     /// refresh keeps the user's layout instead of resetting to defaults.
     pub fn set_column_widths(&mut self, widths: &[Pixels]) {
         for (def, width) in self.columns.iter_mut().zip(widths.iter()) {
-            def.width = f32::from(*width).max(20.0);
+            def.width = def.clamp_width(f32::from(*width));
         }
     }
 
@@ -495,6 +551,12 @@ impl DownloadsDelegate {
     #[must_use]
     pub fn row(&self, row_ix: usize) -> Option<&DownloadRow> {
         self.rows.get(row_ix)
+    }
+
+    /// Returns the visible row for a download id, if currently shown.
+    #[must_use]
+    pub fn row_by_id(&self, id: DownloadId) -> Option<&DownloadRow> {
+        self.rows.iter().find(|row| row.id == id)
     }
 
     /// Returns the visible index of a download id, if currently shown.
@@ -565,16 +627,10 @@ impl DownloadsDelegate {
                 .all(|row| self.checklist.is_checked(row.id))
     }
 
-    /// Returns the checked download ids in stable (ascending) order.
+    /// Returns the checked ids in stable (ascending) order.
     #[must_use]
     pub fn checked_ids(&self) -> Vec<DownloadId> {
         self.checklist.ids()
-    }
-
-    /// Returns the number of checked downloads.
-    #[must_use]
-    pub fn checked_count(&self) -> usize {
-        self.checklist.len()
     }
 
     fn cell_icon(category: FileCategory) -> IconName {
@@ -595,6 +651,7 @@ impl TableDelegate for DownloadsDelegate {
         let def = &self.columns[col_ix];
         Column::new(def.key, def.name)
             .width(px(def.width))
+            .min_width(px(def.min_width))
             .sortable()
     }
 
@@ -660,9 +717,21 @@ impl TableDelegate for DownloadsDelegate {
             .text_color(cx.theme().secondary)
             .on_click(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                 table.update(cx, |table, cx| {
+                    // Keep the current row anchored by id: sorting reorders
+                    // positions, so re-select the same download afterwards.
+                    let selected_id = table
+                        .selected_row()
+                        .and_then(|ix| table.delegate().row(ix))
+                        .map(|row| row.id);
                     table.delegate_mut().cycle_sort(col_ix);
+                    if let Some(id) = selected_id
+                        && let Some(new_ix) = table.delegate().row_position(id)
+                    {
+                        table.set_selected_row(new_ix, cx);
+                    }
                     cx.notify();
                 });
+                cx.stop_propagation();
             })
             .child(sort_icon)
             .child(name)
@@ -696,6 +765,7 @@ impl TableDelegate for DownloadsDelegate {
                                     cx.emit(TableEvent::ClearSelection);
                                 }
                             });
+                            cx.stop_propagation();
                         }),
                     cx,
                 ))
@@ -916,20 +986,14 @@ impl TableDelegate for DownloadsDelegate {
         };
 
         let mut menu = menu;
-        if matches!(status, DownloadStatus::Paused | DownloadStatus::Error) {
+        if can_resume(status) {
             menu = menu.item(
                 PopupMenuItem::new("Resume")
                     .icon(Icon::new(IconName::Play))
                     .on_click(dispatch(EngineCommand::Resume(id))),
             );
         }
-        if matches!(
-            status,
-            DownloadStatus::Downloading
-                | DownloadStatus::Queued
-                | DownloadStatus::Added
-                | DownloadStatus::Retrying
-        ) {
+        if can_pause(status) {
             menu = menu.item(
                 PopupMenuItem::new("Pause")
                     .icon(Icon::new(IconName::Pause))
@@ -985,8 +1049,8 @@ mod tests {
     use raijin_core::monitor::DownloadView;
 
     use super::{
-        DownloadRow, RowChecklist, SortColumn, SortDir, build_rows, filter_rows, next_sort,
-        sort_rows,
+        ColumnDef, DownloadRow, RowChecklist, SortColumn, SortDir, build_rows, can_pause,
+        can_resume, filter_rows, next_sort, sort_rows, toolbar_actions,
     };
     use crate::category::{CategoryFilter, FileCategory, StatusFilter};
     use crate::format::format_bytes;
@@ -1137,6 +1201,87 @@ mod tests {
 
         checklist.uncheck_ids(&[DownloadId::new(9)]);
         assert_eq!(checklist.len(), 0);
+    }
+
+    #[test]
+    fn toolbar_finished_selection_should_enable_only_remove() {
+        let actions = toolbar_actions(&[DownloadStatus::Completed], &[DownloadStatus::Completed]);
+
+        assert!(!actions.can_resume);
+        assert!(!actions.can_pause);
+        assert!(actions.can_remove);
+        assert!(!actions.can_pause_all);
+    }
+
+    #[test]
+    fn toolbar_should_enable_per_target_capability() {
+        assert!(can_resume(DownloadStatus::Paused));
+        assert!(can_resume(DownloadStatus::Error));
+        assert!(!can_resume(DownloadStatus::Completed));
+        assert!(!can_resume(DownloadStatus::Downloading));
+
+        assert!(can_pause(DownloadStatus::Downloading));
+        assert!(can_pause(DownloadStatus::Queued));
+        assert!(can_pause(DownloadStatus::Added));
+        assert!(can_pause(DownloadStatus::Retrying));
+        assert!(can_pause(DownloadStatus::PreparingFile));
+        assert!(!can_pause(DownloadStatus::Completed));
+        assert!(!can_pause(DownloadStatus::Paused));
+        assert!(!can_pause(DownloadStatus::Error));
+
+        let mixed = toolbar_actions(
+            &[DownloadStatus::Completed, DownloadStatus::Paused],
+            &[DownloadStatus::Completed, DownloadStatus::Paused],
+        );
+        assert!(mixed.can_resume);
+        assert!(!mixed.can_pause);
+        assert!(mixed.can_remove);
+        assert!(!mixed.can_pause_all);
+
+        let downloading = toolbar_actions(
+            &[DownloadStatus::Downloading],
+            &[DownloadStatus::Completed, DownloadStatus::Downloading],
+        );
+        assert!(!downloading.can_resume);
+        assert!(downloading.can_pause);
+        assert!(downloading.can_pause_all);
+
+        let empty = toolbar_actions(&[], &[DownloadStatus::Completed]);
+        assert!(!empty.can_resume);
+        assert!(!empty.can_pause);
+        assert!(!empty.can_remove);
+        assert!(!empty.can_pause_all);
+    }
+
+    #[test]
+    fn column_widths_should_floor_at_readable_minimum() {
+        let def = ColumnDef::new("size", "Size", 110.0, 80.0);
+
+        // The old 20px floor let columns collapse to a sliver.
+        assert_eq!(def.clamp_width(20.0), 80.0);
+        assert_eq!(def.clamp_width(200.0), 200.0);
+    }
+
+    #[test]
+    fn sort_should_keep_row_identity_for_selection_remap() {
+        let now = 1_700_000_000_000;
+        let views = vec![
+            view_named(1, "c.zip", DownloadStatus::Downloading, now),
+            view_named(2, "a.zip", DownloadStatus::Downloading, now),
+            view_named(3, "b.zip", DownloadStatus::Downloading, now),
+        ];
+        let mut rows = build_rows(&views, now);
+
+        // Handler logic: capture id before sort, re-lookup afterwards.
+        let selected_id = rows[0].id;
+        sort_rows(&mut rows, SortColumn::Name, SortDir::Ascending);
+
+        let new_ix = rows
+            .iter()
+            .position(|row| row.id == selected_id)
+            .expect("selected id must survive sorting");
+        assert_eq!(rows[new_ix].file_name, "c.zip");
+        assert_eq!(new_ix, 2);
     }
 
     fn view(

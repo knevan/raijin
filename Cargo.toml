@@ -17,6 +17,19 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tempfile = "3.23"
 
+[profile.deploy]
+inherits = "release"
+debug = false
+opt-level = 3
+strip = "none"
+overflow-checks = false
+debug-assertions = false
+rpath = false
+lto = "thin"
+panic = "abort"
+codegen-units = 1
+incremental = false
+
 [profile.dev.package]
 gpui-pre = { opt-level = 3 }
 gpui-component = { opt-level = 3 }

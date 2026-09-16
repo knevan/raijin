@@ -21,7 +21,8 @@ use crate::add_download::open_add_download_window;
 use crate::bridge::{EngineCommand, EngineHandles};
 use crate::category::{CategoryFilter, FileCategory, StatusFilter};
 use crate::downloads::{
-    DownloadRow, DownloadsDelegate, MONITOR_POLL_INTERVAL, build_rows, category_icon, filter_rows,
+    DownloadRow, DownloadsDelegate, MONITOR_POLL_INTERVAL, build_rows, can_pause, can_resume,
+    category_icon, filter_rows, toolbar_actions,
 };
 use crate::format::{format_bytes, format_speed, now_ms};
 use crate::tray::{TraySession, summarize_monitor};
@@ -77,8 +78,12 @@ impl MainView {
             // `sortable(false)` hides the table's built-in right-side sort
             // glyph; sorting is driven by the sketch's left-side header
             // content via `DownloadsDelegate::cycle_sort`.
+            // `col_selectable(false)` keeps header clicks from entering the
+            // framework's column-selection mode (which would wash the whole
+            // column with `table_active`); headers only sort.
             TableState::new(DownloadsDelegate::new(handles.clone()), window, cx)
                 .row_selectable(true)
+                .col_selectable(false)
                 .sortable(false)
                 .col_movable(true)
                 .col_resizable(true)
@@ -266,7 +271,22 @@ impl MainView {
         }
     }
 
+    /// Returns the statuses toolbar actions apply to: the checked set when
+    /// non-empty (ABDM multi-select), else the single current row.
+    fn target_statuses(&self, cx: &App) -> Vec<DownloadStatus> {
+        let ids = self.target_ids(cx);
+        let table = self.table.read(cx);
+        let delegate = table.delegate();
+        ids.iter()
+            .filter_map(|id| delegate.row_by_id(*id))
+            .map(|row| row.status)
+            .collect()
+    }
+
     /// Applies a combined status + category filter from the sidebar tree.
+    ///
+    /// Navigation invalidates the positional row highlight, so the current
+    /// row is cleared (checkboxes survive via the delegate's id-keyed set).
     fn set_filter(
         &mut self,
         status: StatusFilter,
@@ -275,18 +295,56 @@ impl MainView {
     ) {
         self.status = status;
         self.category = category;
+        self.selected = None;
+        self.table.update(cx, |table, cx| {
+            table.clear_selection(cx);
+        });
         self.recompute(cx);
     }
 
+    /// Clears the row highlight, e.g. after clicking empty table space.
+    ///
+    /// Goes through [`TableState::clear_selection`] so the emitted
+    /// `ClearSelection` keeps `selected` in step via `on_table_event`.
+    fn clear_table_selection(&mut self, cx: &mut Context<Self>) {
+        self.table.update(cx, |table, cx| {
+            table.clear_selection(cx);
+        });
+    }
+
     fn pause_selected(&mut self, cx: &mut Context<Self>) {
-        for id in self.target_ids(cx) {
+        let ids = self.target_ids(cx);
+        let targets: Vec<_> = {
+            let table = self.table.read(cx);
+            let delegate = table.delegate();
+            ids.into_iter()
+                .filter(|id| {
+                    delegate
+                        .row_by_id(*id)
+                        .is_some_and(|row| can_pause(row.status))
+                })
+                .collect()
+        };
+        for id in targets {
             self.handles.dispatch(EngineCommand::Pause(id));
         }
         cx.notify();
     }
 
     fn resume_selected(&mut self, cx: &mut Context<Self>) {
-        for id in self.target_ids(cx) {
+        let ids = self.target_ids(cx);
+        let targets: Vec<_> = {
+            let table = self.table.read(cx);
+            let delegate = table.delegate();
+            ids.into_iter()
+                .filter(|id| {
+                    delegate
+                        .row_by_id(*id)
+                        .is_some_and(|row| can_resume(row.status))
+                })
+                .collect()
+        };
+        for id in targets {
             self.handles.dispatch(EngineCommand::Resume(id));
         }
         cx.notify();
@@ -495,9 +553,11 @@ impl MainView {
 
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         // Toolbar acts on the checked set when non-empty, else the current
-        // row — so any check enables the row actions immediately.
-        let has_selection =
-            self.selected.is_some() || self.table.read(cx).delegate().checked_count() > 0;
+        // row — Resume/Pause enable only when a target actually supports the
+        // action, so a Finished selection leaves only Remove enabled.
+        let targets = self.target_statuses(cx);
+        let all: Vec<DownloadStatus> = self.cache.iter().map(|row| row.status).collect();
+        let actions = toolbar_actions(&targets, &all);
         h_flex()
             .gap_2()
             .items_center()
@@ -523,7 +583,7 @@ impl MainView {
                     .rounded(px(999.))
                     .icon(IconName::Play)
                     .label("Resume")
-                    .disabled(!has_selection)
+                    .disabled(!actions.can_resume)
                     .on_click(cx.listener(|this, _, _, cx| this.resume_selected(cx))),
             )
             .child(
@@ -534,7 +594,7 @@ impl MainView {
                     .rounded(px(999.))
                     .icon(IconName::Pause)
                     .label("Pause")
-                    .disabled(!has_selection)
+                    .disabled(!actions.can_pause)
                     .on_click(cx.listener(|this, _, _, cx| this.pause_selected(cx))),
             )
             .child(div().flex_1())
@@ -548,6 +608,7 @@ impl MainView {
                     .rounded(px(10.))
                     .icon(IconName::Close)
                     .tooltip("Pause all active downloads")
+                    .disabled(!actions.can_pause_all)
                     .on_click(cx.listener(|this, _, _, cx| this.pause_all(cx))),
             )
             .child(
@@ -560,7 +621,7 @@ impl MainView {
                     .rounded(px(10.))
                     .icon(IconName::Delete)
                     .tooltip("Remove selected download")
-                    .disabled(!has_selection)
+                    .disabled(!actions.can_remove)
                     .on_click(cx.listener(|this, _, _, cx| this.remove_selected(cx))),
             )
             .child(
@@ -633,8 +694,10 @@ impl Render for MainView {
                                     // loop in the header color draws the rounded
                                     // top corners with a near-invisible seam
                                     // (a lone top border renders straight).
-                                    .child(
+                                    .child({
+                                        let view = cx.entity();
                                         div()
+                                            .id("downloads-table-wrap")
                                             .flex_1()
                                             .min_h_0()
                                             .rounded_tl(px(8.))
@@ -642,6 +705,20 @@ impl Render for MainView {
                                             .border_1()
                                             .border_color(cx.theme().table_head)
                                             .overflow_hidden()
+                                            // Empty table space clears the row highlight.
+                                            // Row clicks stop propagation in the framework
+                                            // (`set_selected_row`) and header clicks stop
+                                            // in the delegate, so only genuine empty-space
+                                            // clicks arrive here.
+                                            .on_click(
+                                                move |_: &ClickEvent,
+                                                      _: &mut Window,
+                                                      cx: &mut App| {
+                                                    view.update(cx, |this, cx| {
+                                                        this.clear_table_selection(cx);
+                                                    });
+                                                },
+                                            )
                                             .child(
                                                 DataTable::new(&self.table)
                                                     .with_size(px(
@@ -649,8 +726,8 @@ impl Render for MainView {
                                                     ))
                                                     .stripe(false)
                                                     .bordered(false),
-                                            ),
-                                    ),
+                                            )
+                                    }),
                             ),
                         ),
                 ),

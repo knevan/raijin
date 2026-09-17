@@ -18,7 +18,6 @@ mod category;
 mod downloads;
 mod format;
 mod main_view;
-mod native_tray;
 mod theme;
 mod tray;
 
@@ -181,7 +180,7 @@ fn register_tray_actions(
     cx: &mut App,
     handles: &EngineHandles,
     session: &TraySession,
-    native_tray: Option<native_tray::Tray>,
+    native_tray: Option<gpui_tray::Tray>,
 ) {
     let show_handles = handles.clone();
     let show_session = session.clone();
@@ -315,13 +314,13 @@ fn hide_window_to_tray(session: &TraySession, cx: &mut App) {
 fn build_native_tray(
     cx: &mut App,
     session: &TraySession,
-) -> native_tray::Result<native_tray::Tray> {
+) -> gpui_tray::Result<gpui_tray::Tray> {
     let menu_session = session.clone();
-    native_tray::Tray::builder()
+    gpui_tray::Tray::builder()
         .icon(tray_icon()?)
         .title("Raijin")
         .tooltip(session.update_activity(0, 0, 0))
-        .primary_action(ShowWindow)
+        .on_activate(ShowWindow)
         .menu(move |cx: &mut App| {
             // Show is show-only (restore/focus); hiding is the explicit
             // item below, so a minimized window is never hidden by accident.
@@ -347,11 +346,11 @@ fn build_native_tray(
 
 /// Keeps the native icon in step with engine activity.
 ///
-/// The vendored [`native_tray::Tray`] diffs tooltip snapshots internally, so
+/// The [`gpui_tray::Tray`] diffs tooltip snapshots internally, so
 /// pushing the cached text every second is cheap; menu rebuilds are gated on
 /// activity-flag changes. The loop exits on explicit quit; dropping the last
 /// window does not stop it ([`QuitMode::Explicit`]).
-fn spawn_tray_sync(cx: &mut App, icon: native_tray::Tray, session: TraySession) {
+fn spawn_tray_sync(cx: &mut App, icon: gpui_tray::Tray, session: TraySession) {
     cx.spawn(async move |cx| {
         let mut last_flags = (false, false);
         let mut last_tooltip = String::new();
@@ -464,11 +463,8 @@ fn register_should_close(window: &mut Window, cx: &mut App, session: &TraySessio
     });
 }
 
-/// Generates the 32x32 tray icon: indigo rounded square with a white "R".
-///
-/// Pure pixels, unit-tested below; the native backends convert to
-/// `HICON` / SNI pixmap / `NSImage`.
-fn tray_icon() -> native_tray::Result<native_tray::Icon> {
+/// Generates the 32x32 RGBA pixel buffer: indigo rounded square with a white "R".
+fn tray_icon_rgba() -> Vec<u8> {
     const SIZE: u32 = 32;
     // 5x7 bitmap glyph for "R".
     const GLYPH: [&str; 7] = [
@@ -510,7 +506,16 @@ fn tray_icon() -> native_tray::Result<native_tray::Icon> {
             rgba[offset..offset + 4].copy_from_slice(&pixel);
         }
     }
-    native_tray::Icon::from_rgba(rgba, SIZE, SIZE)
+    rgba
+}
+
+/// Generates the 32x32 tray icon: indigo rounded square with a white "R".
+///
+/// Pure pixels, unit-tested below; the native backends convert to
+/// `HICON` / SNI pixmap / `NSImage`.
+fn tray_icon() -> gpui_tray::Result<gpui_tray::Icon> {
+    const SIZE: u32 = 32;
+    gpui_tray::Icon::from_rgba(tray_icon_rgba(), SIZE, SIZE)
 }
 
 /// Bootstraps persistence, settings, the download manager actor, and the monitor.
@@ -588,12 +593,12 @@ fn apply_autostart(settings: &raijin_core::config::DesktopSettings) {
 mod tests {
     // Explicit imports: a `use super::*` glob would shadow the built-in
     // `#[test]` attribute with GPUI's `test` macro.
-    use super::tray_icon;
+    use super::{tray_icon, tray_icon_rgba};
 
     #[test]
     fn tray_icon_should_be_opaque_centered_mark_with_transparent_corners() {
-        let icon = tray_icon().expect("icon must build");
-        let rgba = icon.test_bytes();
+        let _ = tray_icon().expect("icon must build");
+        let rgba = tray_icon_rgba();
         assert_eq!(rgba.len(), 32 * 32 * 4);
 
         // Corners stay transparent (rounded mask).

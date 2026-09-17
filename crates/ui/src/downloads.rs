@@ -97,6 +97,10 @@ impl DownloadRow {
         let downloaded = view.downloaded_bytes.get();
         let progress = progress_percent(downloaded, total);
         let is_active = matches!(view.status, DownloadStatus::Downloading);
+        let show_progress = matches!(
+            view.status,
+            DownloadStatus::Downloading | DownloadStatus::Paused
+        );
         let size_label = match total {
             Some(total) => format_bytes(total),
             None => format_bytes(downloaded),
@@ -114,7 +118,7 @@ impl DownloadRow {
                 view.failure.as_ref().map(|failure| failure.kind),
             ),
             is_active,
-            progress: if is_active { progress } else { None },
+            progress: if show_progress { progress } else { None },
             downloaded_bytes: downloaded,
             total_bytes: total,
             size_label,
@@ -145,7 +149,10 @@ fn status_label(
             Some(percent) => format!("{}% Downloading", percent.round() as u32),
             None => "Downloading".to_owned(),
         },
-        DownloadStatus::Paused => "Paused".to_owned(),
+        DownloadStatus::Paused => match progress {
+            Some(percent) => format!("{}% Paused", percent.round() as u32),
+            None => "Paused".to_owned(),
+        },
         DownloadStatus::Queued => "Queued".to_owned(),
         DownloadStatus::Added => "Waiting".to_owned(),
         DownloadStatus::Retrying => "Retrying".to_owned(),
@@ -863,8 +870,7 @@ impl TableDelegate for DownloadsDelegate {
             col::STATUS => {
                 let color = match row.status {
                     DownloadStatus::Completed => cx.theme().success,
-                    DownloadStatus::Error => cx.theme().danger,
-                    DownloadStatus::Paused => cx.theme().muted_foreground,
+                    DownloadStatus::Error | DownloadStatus::Paused => cx.theme().danger,
                     _ => cx.theme().foreground,
                 };
                 let mut cell = v_flex().h_full().justify_center().gap_1().child(
@@ -874,14 +880,15 @@ impl TableDelegate for DownloadsDelegate {
                         .child(row.status_label.clone()),
                 );
                 if let Some(progress) = row.progress {
-                    cell = cell.child(
-                        gpui_kit::component::progress::Progress::new(SharedString::from(format!(
-                            "download-progress-{}",
-                            row.id.get()
-                        )))
-                        .value(progress)
-                        .small(),
-                    );
+                    let mut bar = gpui_kit::component::progress::Progress::new(
+                        SharedString::from(format!("download-progress-{}", row.id.get())),
+                    )
+                    .value(progress)
+                    .small();
+                    if row.status == DownloadStatus::Paused {
+                        bar = bar.color(cx.theme().danger);
+                    }
+                    cell = cell.child(bar);
                 }
                 cell.into_any_element()
             }
@@ -1072,6 +1079,23 @@ mod tests {
         assert!((progress - 14.0).abs() < 0.01, "progress was {progress}");
         assert_eq!(rows[1].status_label, "Finished");
         assert_eq!(rows[1].progress, None);
+    }
+
+    #[test]
+    fn paused_download_should_retain_progress_and_label() {
+        let now = 1_700_000_000_000;
+        let with_total = view(1, DownloadStatus::Paused, 210, Some(1_000), now);
+        let row = DownloadRow::from_view(&with_total, now);
+        assert_eq!(row.status_label, "21% Paused");
+        assert!(!row.is_active);
+        let progress = row.progress.expect("paused row with total must have progress");
+        assert!((progress - 21.0).abs() < 0.01);
+
+        let without_total = view(2, DownloadStatus::Paused, 210, None, now);
+        let row_blind = DownloadRow::from_view(&without_total, now);
+        assert_eq!(row_blind.status_label, "Paused");
+        assert!(!row_blind.is_active);
+        assert_eq!(row_blind.progress, None);
     }
 
     #[test]

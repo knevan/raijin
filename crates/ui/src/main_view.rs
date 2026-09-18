@@ -78,11 +78,11 @@ impl MainView {
             // `sortable(false)` hides the table's built-in right-side sort
             // glyph; sorting is driven by the sketch's left-side header
             // content via `DownloadsDelegate::cycle_sort`.
-            // `col_selectable(false)` keeps header clicks from entering the
-            // framework's column-selection mode (which would wash the whole
-            // column with `table_active`); headers only sort.
+            // Row selection is managed directly on the hybrid card container
+            // in `DownloadsDelegate::render_tr` so that corner radius (8px)
+            // and 1px borders are preserved without framework's square overlay.
             TableState::new(DownloadsDelegate::new(handles.clone()), window, cx)
-                .row_selectable(true)
+                .row_selectable(false)
                 .col_selectable(false)
                 .sortable(false)
                 .col_movable(true)
@@ -235,6 +235,12 @@ impl MainView {
         match event {
             TableEvent::SelectRow(ix) => {
                 self.selected = Some(*ix);
+                self.table.update(cx, |table, cx| {
+                    if let Some(id) = table.delegate().row(*ix).map(|r| r.id) {
+                        table.delegate_mut().select_row(id);
+                    }
+                    cx.notify();
+                });
                 cx.notify();
             }
             TableEvent::DoubleClickedRow(ix) => {
@@ -247,6 +253,10 @@ impl MainView {
             }
             TableEvent::ClearSelection => {
                 self.selected = None;
+                self.table.update(cx, |table, cx| {
+                    table.delegate_mut().clear_selection();
+                    cx.notify();
+                });
                 cx.notify();
             }
             _ => {}
@@ -297,6 +307,7 @@ impl MainView {
         self.category = category;
         self.selected = None;
         self.table.update(cx, |table, cx| {
+            table.delegate_mut().clear_selection();
             table.clear_selection(cx);
         });
         self.recompute(cx);
@@ -307,9 +318,13 @@ impl MainView {
     /// Goes through [`TableState::clear_selection`] so the emitted
     /// `ClearSelection` keeps `selected` in step via `on_table_event`.
     fn clear_table_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected = None;
         self.table.update(cx, |table, cx| {
+            table.delegate_mut().clear_selection();
             table.clear_selection(cx);
+            cx.notify();
         });
+        cx.notify();
     }
 
     fn pause_selected(&mut self, cx: &mut Context<Self>) {
@@ -363,6 +378,7 @@ impl MainView {
         }
         // Uncheck at once; the next monitor poll prunes them as well.
         self.table.update(cx, |table, cx| {
+            table.delegate_mut().clear_selection();
             table.delegate_mut().uncheck_ids(&targets);
             table.refresh(cx);
         });
@@ -686,24 +702,17 @@ impl Render for MainView {
                                     .gap_3()
                                     .p_4()
                                     .child(self.render_toolbar(cx))
-                                    // Sketch HeaderRow has cornerRadius 8 with no outer
-                                    // border. Proven by visual probe
-                                    // (`examples/radius_probe.rs`): child
-                                    // backgrounds ignore wrapper radii, but a
-                                    // full border loop follows them — so a 1px
-                                    // loop in the header color draws the rounded
-                                    // top corners with a near-invisible seam
-                                    // (a lone top border renders straight).
+                                    // Hybrid Card-Table: the header renders as a floating rounded island
+                                    // with an 8px vertical gap to the body rows, and each row renders as
+                                    // an independent card with smooth borders and a 6px gap.
+                                    // with a compact gap to the body rows, and each row renders as
+                                    // an independent card with smooth borders and a 4px vertical gap.
                                     .child({
                                         let view = cx.entity();
                                         div()
                                             .id("downloads-table-wrap")
                                             .flex_1()
                                             .min_h_0()
-                                            .rounded_tl(px(8.))
-                                            .rounded_tr(px(8.))
-                                            .border_1()
-                                            .border_color(cx.theme().table_head)
                                             .overflow_hidden()
                                             // Empty table space clears the row highlight.
                                             // Row clicks stop propagation in the framework

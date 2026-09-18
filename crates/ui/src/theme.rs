@@ -14,11 +14,26 @@ const ACCENT2: &str = "#FFB224";
 const GREEN: &str = "#2DD4A7";
 const BLUE: &str = "#5AA9FF";
 const CTA_INK: &str = "#06281F";
+const ROW_CARD_BG: &str = "#181D24";
+const ROW_CARD_HOVER_BG: &str = "#16253B";
+const ROW_CARD_SELECTED_BG: &str = "#1A3252";
 
 /// Parses a sketch hex color. Panics only for hardcoded constants, which are
 /// covered by unit tests below, so a failure always means a typo in this file.
 fn hx(hex: &'static str) -> Hsla {
     Hsla::parse_hex(hex).expect("sketch hex color must parse")
+}
+
+/// Card background for table rows in the hybrid card-table design.
+/// Slate-grey, distinct from the `#0C1626` window background and `#12233A` header.
+pub fn row_card_bg() -> Hsla {
+    hx(ROW_CARD_BG)
+}
+
+/// Card background for a selected table row in the hybrid card-table design.
+/// Navy blue, matching the hover hue (`#1A3252`).
+pub fn row_card_selected_bg() -> Hsla {
+    hx(ROW_CARD_SELECTED_BG)
 }
 
 /// Applies the Raijin product palette to the global theme.
@@ -53,8 +68,12 @@ pub fn apply_product_theme(cx: &mut App) {
     colors.success = hx(GREEN);
     colors.info = hx(BLUE);
     colors.warning = hx(ACCENT2);
+    colors.table = gpui::transparent_black();
     colors.table_head = hx(PANEL);
     colors.table_head_foreground = hx(TEXT_SECONDARY);
+    colors.table_hover = hx(ROW_CARD_HOVER_BG);
+    colors.table_active = gpui::transparent_black();
+    colors.table_active_border = gpui::transparent_black();
     // Sketch body rows have no separators. Header dividers use the separate
     // `border` token, so zeroing only the row token keeps them intact.
     colors.table_row_border = hx(BORDER).opacity(0.0);
@@ -78,8 +97,8 @@ mod tests {
     // Explicit imports: a `use super::*` glob would shadow the built-in
     // `#[test]` attribute with GPUI's `test` macro.
     use super::{
-        ACCENT, ACCENT2, BG, BLUE, BORDER, CTA_INK, GREEN, PANEL, PANEL2, TEXT_MUTED, TEXT_PRIMARY,
-        TEXT_SECONDARY, hx,
+        ACCENT, ACCENT2, BG, BLUE, BORDER, CTA_INK, GREEN, PANEL, PANEL2, ROW_CARD_BG,
+        ROW_CARD_HOVER_BG, ROW_CARD_SELECTED_BG, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, hx,
     };
 
     #[test]
@@ -97,6 +116,9 @@ mod tests {
             GREEN,
             BLUE,
             CTA_INK,
+            ROW_CARD_BG,
+            ROW_CARD_HOVER_BG,
+            ROW_CARD_SELECTED_BG,
         ] {
             let color = hx(hex);
             assert!(color.a > 0.99, "{hex} must be fully opaque");

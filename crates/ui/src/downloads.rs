@@ -20,14 +20,12 @@ use crate::format::{
 /// Poll interval for monitor snapshots on the GPUI thread.
 pub const MONITOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Fixed table body/header row height in pixels.
+/// Fixed table body slot height in pixels.
 ///
-/// The framework fixes `DataTable` row height per size preset (Medium = 32px),
-/// which clips the two-line Name (file + category) and Status (label +
-/// progress) cells. A custom `Size::Size` keeps cell padding/text at the
-/// Medium defaults while fitting both lines; every cell root below is
-/// full-height + vertically centered to match.
-pub const TABLE_ROW_HEIGHT_PX: f32 = 48.0;
+/// In the hybrid card-table design, each slot is 52px high, accommodating a
+/// 48px floating card row plus a 4px vertical gap (`my(px(2.))`). This preserves
+/// the two-line Name and Status layouts while rendering distinct island cards.
+pub const TABLE_ROW_HEIGHT_PX: f32 = 52.0;
 
 /// Table column keys. Also used as stable [`Column`] keys.
 pub mod col {
@@ -507,6 +505,7 @@ pub struct DownloadsDelegate {
     loaded: bool,
     checklist: RowChecklist,
     commands: EngineHandles,
+    selected_id: Option<DownloadId>,
 }
 
 impl DownloadsDelegate {
@@ -528,6 +527,7 @@ impl DownloadsDelegate {
             loaded: false,
             checklist: RowChecklist::default(),
             commands,
+            selected_id: None,
         }
     }
 
@@ -538,6 +538,11 @@ impl DownloadsDelegate {
     pub fn set_rows(&mut self, mut rows: Vec<DownloadRow>) {
         sort_rows(&mut rows, self.sort_column, self.sort_dir);
         self.checklist.retain_visible(rows.iter().map(|row| row.id));
+        if let Some(selected) = self.selected_id
+            && !rows.iter().any(|row| row.id == selected)
+        {
+            self.selected_id = None;
+        }
         self.rows = rows;
     }
 
@@ -640,6 +645,22 @@ impl DownloadsDelegate {
         self.checklist.ids()
     }
 
+    /// Returns the currently selected row id, if any.
+    #[must_use]
+    pub fn selected_id(&self) -> Option<DownloadId> {
+        self.selected_id
+    }
+
+    /// Sets the selected download id.
+    pub fn select_row(&mut self, id: DownloadId) {
+        self.selected_id = Some(id);
+    }
+
+    /// Clears the single-row selection.
+    pub fn clear_selection(&mut self) {
+        self.selected_id = None;
+    }
+
     fn cell_icon(category: FileCategory) -> IconName {
         category_icon(category)
     }
@@ -681,6 +702,20 @@ impl TableDelegate for DownloadsDelegate {
             self.apply_sort(SortColumn::from_key(key), SortDir::from_column_sort(sort));
         }
         cx.notify();
+    }
+
+    fn render_header(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        div()
+            .id("downloads-table-header")
+            .mb(px(3.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(cx.theme().border)
+            .overflow_hidden()
     }
 
     fn render_th(
@@ -726,15 +761,12 @@ impl TableDelegate for DownloadsDelegate {
                 table.update(cx, |table, cx| {
                     // Keep the current row anchored by id: sorting reorders
                     // positions, so re-select the same download afterwards.
-                    let selected_id = table
-                        .selected_row()
-                        .and_then(|ix| table.delegate().row(ix))
-                        .map(|row| row.id);
+                    let selected_id = table.delegate().selected_id();
                     table.delegate_mut().cycle_sort(col_ix);
                     if let Some(id) = selected_id
                         && let Some(new_ix) = table.delegate().row_position(id)
                     {
-                        table.set_selected_row(new_ix, cx);
+                        cx.emit(TableEvent::SelectRow(new_ix));
                     }
                     cx.notify();
                 });
@@ -753,6 +785,7 @@ impl TableDelegate for DownloadsDelegate {
                 .h_full()
                 .items_center()
                 .gap_2()
+                .pl_3()
                 .child(checkbox_frame(
                     Checkbox::new("header-check-name")
                         .checked(all_checked)
@@ -766,9 +799,13 @@ impl TableDelegate for DownloadsDelegate {
                                 // framework only emits click/keyboard events.
                                 if check {
                                     if table.delegate().rows_count(cx) > 0 {
+                                        if let Some(first_id) = table.delegate().row(0).map(|r| r.id) {
+                                            table.delegate_mut().select_row(first_id);
+                                        }
                                         cx.emit(TableEvent::SelectRow(0));
                                     }
                                 } else {
+                                    table.delegate_mut().clear_selection();
                                     cx.emit(TableEvent::ClearSelection);
                                 }
                             });
@@ -776,6 +813,13 @@ impl TableDelegate for DownloadsDelegate {
                         }),
                     cx,
                 ))
+                .child(sort_label)
+                .into_any_element()
+        } else if key == col::ADDED {
+            h_flex()
+                .h_full()
+                .items_center()
+                .pr_3()
                 .child(sort_label)
                 .into_any_element()
         } else {
@@ -787,11 +831,57 @@ impl TableDelegate for DownloadsDelegate {
         &mut self,
         row_ix: usize,
         _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
         // Stable domain identity: reordering or filtering must not move row state.
-        let id = self.rows.get(row_ix).map(|row| row.id.get()).unwrap_or(-1);
-        div().id(SharedString::from(format!("download-row-{id}")))
+        let row = self.rows.get(row_ix);
+        let id_num = row.map(|r| r.id.get()).unwrap_or(-1);
+        let id = row.map(|r| r.id);
+        let is_selected = id.is_some_and(|id| self.selected_id == Some(id));
+        let is_checked = id.is_some_and(|id| self.is_checked(id));
+
+        let bg = if is_selected {
+            crate::theme::row_card_selected_bg()
+        } else {
+            crate::theme::row_card_bg()
+        };
+
+        let border_color = if is_selected {
+            cx.theme().accent
+        } else if is_checked {
+            cx.theme().accent.opacity(0.8)
+        } else {
+            cx.theme().border.opacity(0.6)
+        };
+
+        let table = cx.entity();
+
+        let mut row_el = div()
+            .id(SharedString::from(format!("download-row-{id_num}")))
+            .my(px(2.))
+            .h(px(48.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(border_color)
+            .bg(bg)
+            .overflow_hidden();
+
+        if let Some(id) = id {
+            row_el = row_el.on_click(move |event: &ClickEvent, _: &mut Window, cx: &mut App| {
+                table.update(cx, |table, cx| {
+                    table.delegate_mut().select_row(id);
+                    if event.click_count() == 2 {
+                        cx.emit(TableEvent::DoubleClickedRow(row_ix));
+                    } else {
+                        cx.emit(TableEvent::SelectRow(row_ix));
+                    }
+                    cx.notify();
+                });
+                cx.stop_propagation();
+            });
+        }
+
+        row_el
     }
 
     fn render_td(
@@ -822,15 +912,18 @@ impl TableDelegate for DownloadsDelegate {
                     .min_w_0()
                     .h_full()
                     .items_center()
+                    .pl_3()
                     .child(checkbox_frame(
                         Checkbox::new(SharedString::from(format!("row-check-{}", id.get())))
                             .checked(checked)
                             .on_click(move |_, _: &mut Window, cx: &mut App| {
                                 table.update(cx, |table, cx| {
                                     table.delegate_mut().toggle_checked(id);
+                                    table.delegate_mut().select_row(id);
                                     table.refresh(cx);
                                     cx.emit(TableEvent::SelectRow(row_ix));
                                 });
+                                cx.stop_propagation();
                             }),
                         cx,
                     ))
@@ -915,6 +1008,7 @@ impl TableDelegate for DownloadsDelegate {
             _ => h_flex()
                 .h_full()
                 .items_center()
+                .pr_3()
                 .child(
                     div()
                         .text_sm()

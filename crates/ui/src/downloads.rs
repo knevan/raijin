@@ -494,9 +494,6 @@ impl ColumnDef {
 /// sorted by the owning view) so `render_td` stays allocation-light. It also
 /// owns the checkbox multi-select set ([`RowChecklist`]), keyed by stable
 /// [`DownloadId`] so checks survive re-sorting, filtering, and monitor polls.
-/// The framework has no built-in checkbox column — row clicks only move the
-/// single-row highlight — so both the row boxes and the header select-all box
-/// are rendered here, ABDM-style.
 pub struct DownloadsDelegate {
     rows: Vec<DownloadRow>,
     columns: Vec<ColumnDef>,

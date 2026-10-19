@@ -1,11 +1,15 @@
 import { browser } from 'wxt/browser';
 import { defineBackground } from 'wxt/utils/define-background';
-import { BackendApi, NetworkError, UnauthorizedError } from '@/utils/backend';
+import { ApiError, BackendApi, NetworkError, UnauthorizedError } from '@/utils/backend';
 import { getAll } from '@/utils/config';
 import { DOWNLOAD_CREATED_MAX_AGE_MS, PENDING_REQUEST_TTL_MS } from '@/utils/constants';
 import { getFileFromUrl, shouldCapture } from '@/utils/capture';
 import { handleInBackground, sendCheckSelectedToTab } from '@/utils/messaging';
-import type { DownloadRequestItem, TestPortResult } from '@/utils/types';
+import type {
+  AddMediaFailure,
+  DownloadRequestItem,
+  TestPortResult,
+} from '@/utils/types';
 
 const MENU_LINK_ID = 'raijin-download-link';
 const MENU_SELECTION_ID = 'raijin-download-selected';
@@ -118,7 +122,13 @@ async function withHeaders(items: DownloadRequestItem[]): Promise<DownloadReques
 }
 
 async function addItems(items: DownloadRequestItem[]): Promise<boolean> {
-  if (items.length === 0) return false;
+  return (await submitItems(items)).ok;
+}
+
+async function submitItems(
+  items: DownloadRequestItem[],
+): Promise<{ ok: true } | { ok: false; reason: AddMediaFailure }> {
+  if (items.length === 0) return { ok: false, reason: 'error' };
   const config = await getAll();
   const api = new BackendApi(config.port, config.token);
   const options = {
@@ -132,8 +142,10 @@ async function addItems(items: DownloadRequestItem[]): Promise<boolean> {
       await api.add({ items, options });
     }
   } catch (err) {
-    if (err instanceof NetworkError || err instanceof UnauthorizedError) return false;
-    return false;
+    if (err instanceof NetworkError) return { ok: false, reason: 'down' };
+    if (err instanceof UnauthorizedError) return { ok: false, reason: 'unauthorized' };
+    if (err instanceof ApiError) return { ok: false, reason: 'error' };
+    throw err;
   }
   if (config.silentAddDownload && items.length === 1) {
     try {
@@ -147,7 +159,7 @@ async function addItems(items: DownloadRequestItem[]): Promise<boolean> {
       // Notifications are best effort.
     }
   }
-  return true;
+  return { ok: true };
 }
 
 async function testPort(port?: number, token?: string): Promise<TestPortResult> {
@@ -345,12 +357,12 @@ async function handleDownloadCreated(details: unknown): Promise<void> {
   if (intercepted && intercepted.method.toUpperCase() !== 'GET') return;
 
   const downloadPage = d.referrer || null;
-  const fileSizeBytes =
-    typeof d.fileSize === 'number'
-      ? d.fileSize
-      : typeof d.totalBytes === 'number' && d.totalBytes >= 0
-        ? d.totalBytes
-        : null;
+  let fileSizeBytes: number | null = null;
+  if (typeof d.fileSize === 'number') {
+    fileSizeBytes = d.fileSize;
+  } else if (typeof d.totalBytes === 'number' && d.totalBytes >= 0) {
+    fileSizeBytes = d.totalBytes;
+  }
   const ok = shouldCapture(
     {
       url,
@@ -450,6 +462,11 @@ async function boot(): Promise<void> {
   handleDownloads();
   handleInBackground({
     addDownload: async (items) => addItems(await withHeaders(items)),
+    addMedia: async (item) => {
+      const [prepared] = await withHeaders([item]);
+      if (!prepared) return { ok: false, reason: 'error' };
+      return submitItems([prepared]);
+    },
     testPort: (port, token) => testPort(port, token),
     getHeaders: async (urls) => Promise.all(urls.map((u) => getHeadersForUrl(u))),
     setBypass: (pressed) => {

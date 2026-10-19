@@ -4,3 +4,7 @@ auto_install = false
 [tasks.dev]
 dir = "."
 run = "cargo run -p raijin-ui"
+
+[tasks.ext]
+dir = "browser-extension"
+run = "pnpm dev"

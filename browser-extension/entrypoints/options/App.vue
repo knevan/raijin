@@ -8,6 +8,7 @@ const portText = ref(String(defaultConfig.port));
 const token = ref('');
 const autoCaptureLinks = ref(true);
 const popupEnabled = ref(true);
+const mediaOverlayEnabled = ref(true);
 const sendHeaders = ref(true);
 const fileTypesText = ref('');
 const blacklistText = ref('');
@@ -45,6 +46,7 @@ async function load(): Promise<void> {
   token.value = config.token;
   autoCaptureLinks.value = config.autoCaptureLinks;
   popupEnabled.value = config.popupEnabled;
+  mediaOverlayEnabled.value = config.mediaOverlayEnabled;
   sendHeaders.value = config.sendHeaders;
   fileTypesText.value = config.registeredFileTypes.join(', ');
   blacklistText.value = config.blacklistedUrls.join('\n');
@@ -73,6 +75,7 @@ async function save(): Promise<void> {
     token: token.value,
     autoCaptureLinks: autoCaptureLinks.value,
     popupEnabled: popupEnabled.value,
+    mediaOverlayEnabled: mediaOverlayEnabled.value,
     sendHeaders: sendHeaders.value,
     registeredFileTypes: normalizeFileTypes(fileTypesText.value),
     blacklistedUrls: normalizeBlacklist(blacklistText.value),
@@ -147,6 +150,7 @@ onMounted(() => {
       <h2>Capture</h2>
       <label class="check"><input v-model="autoCaptureLinks" type="checkbox" /> Auto capture links</label>
       <label class="check"><input v-model="popupEnabled" type="checkbox" /> Show selection popups</label>
+      <label class="check"><input v-model="mediaOverlayEnabled" type="checkbox" /> Show download button over videos</label>
       <label class="check"><input v-model="sendHeaders" type="checkbox" /> Send headers (cookies go to localhost only)</label>
       <label>File types (comma separated)
         <textarea v-model="fileTypesText" rows="3"></textarea>

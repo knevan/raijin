@@ -3,7 +3,9 @@ import { browser } from 'wxt/browser';
 import { storage } from 'wxt/utils/storage';
 import { DEFAULT_BYPASS_KEY } from '@/utils/constants';
 import { normalizeAndFilterLinks } from '@/utils/capture';
-import { sendAddDownload, sendSetBypass } from '@/utils/messaging';
+import { getAll } from '@/utils/config';
+import { sendAddDownload, sendAddMedia, sendSetBypass } from '@/utils/messaging';
+import { MediaOverlay } from '@/utils/media-overlay';
 import type { DownloadRequestItem } from '@/utils/types';
 
 const BYPASS_KEY = 'local:bypassShortcut';
@@ -100,8 +102,61 @@ export default defineContentScript({
     window.addEventListener('blur', onBlur);
     browser.runtime.onMessage.addListener(onMessage);
 
+    let overlayEnabled = false;
+    const overlay = new MediaOverlay({
+      isEnabled: () => overlayEnabled,
+      addMedia: (item) =>
+        sendAddMedia({
+          link: item.link,
+          downloadPage: location.href,
+          headers: null,
+          description: document.title || null,
+          suggestedName: null,
+          type: 'http',
+        }),
+    });
+    overlay.start();
+
+    // Stay off until the stored preference is known, so a disabled overlay
+    // never flashes on load.
+    void getAll()
+      .then((config) => {
+        overlayEnabled = config.mediaOverlayEnabled;
+        overlay.sync();
+      })
+      .catch(() => {
+        overlayEnabled = false;
+        overlay.sync();
+      });
+
+    // Coalesce DOM churn into one evaluation per frame; player frameworks
+    // rebuild their containers constantly.
+    let syncQueued = false;
+    const queueSync = (): void => {
+      if (syncQueued || disposed) return;
+      syncQueued = true;
+      requestAnimationFrame(() => {
+        syncQueued = false;
+        overlay.sync();
+      });
+    };
+    const observer = new MutationObserver(queueSync);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+
+    const unwatchOverlay = storage.watch<boolean>('local:mediaOverlayEnabled', (next) => {
+      overlayEnabled = next !== false;
+      overlay.sync();
+    });
+
     ctx.onInvalidated(() => {
       disposed = true;
+      observer.disconnect();
+      overlay.destroy();
+      try {
+        unwatchOverlay();
+      } catch {
+        // Best effort.
+      }
       document.removeEventListener('keydown', onKeyDown);
       document.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('blur', onBlur);

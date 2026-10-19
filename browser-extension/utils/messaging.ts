@@ -1,5 +1,10 @@
 import { browser } from 'wxt/browser';
-import type { BackgroundMessage, ContentMessage, DownloadRequestItem } from './types';
+import type {
+  AddMediaResult,
+  BackgroundMessage,
+  ContentMessage,
+  DownloadRequestItem,
+} from './types';
 import type { TestPortResult } from './types';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -11,6 +16,7 @@ export function isBackgroundMessage(value: unknown): value is BackgroundMessage 
   const type = value['type'] as string;
   return (
     type === 'raijin:add_download' ||
+    type === 'raijin:media_add' ||
     type === 'raijin:test_port' ||
     type === 'raijin:get_headers' ||
     type === 'raijin:set_bypass'
@@ -22,6 +28,17 @@ export async function sendAddDownload(items: DownloadRequestItem[]): Promise<boo
     type: 'raijin:add_download',
     items,
   })) as boolean;
+}
+
+// Unlike sendAddDownload, this reports *why* a send failed so the overlay can
+// tell "server down" apart from "token rejected".
+export async function sendAddMedia(item: DownloadRequestItem): Promise<AddMediaResult> {
+  const res = (await browser.runtime.sendMessage({
+    type: 'raijin:media_add',
+    item,
+  })) as AddMediaResult | undefined;
+  if (res && typeof res === 'object' && typeof res.ok === 'boolean') return res;
+  return { ok: false, reason: 'error' };
 }
 
 export async function sendTestPort(port?: number, token?: string): Promise<TestPortResult> {
@@ -53,6 +70,7 @@ export async function sendCheckSelectedToTab(tabId: number): Promise<void> {
 
 export interface BackgroundHandlers {
   addDownload: (items: DownloadRequestItem[]) => Promise<boolean>;
+  addMedia: (item: DownloadRequestItem) => Promise<AddMediaResult>;
   testPort: (port?: number, token?: string) => Promise<TestPortResult>;
   getHeaders: (urls: string[]) => Promise<Array<Record<string, string> | null>>;
   setBypass: (pressed: boolean) => void;
@@ -62,13 +80,23 @@ export interface BackgroundHandlers {
 export function handleInBackground(handlers: BackgroundHandlers): () => void {
   const listener = (
     message: unknown,
-  ): boolean | Promise<boolean | TestPortResult | Array<Record<string, string> | null> | undefined> => {
+  ):
+    | boolean
+    | Promise<
+        | boolean
+        | AddMediaResult
+        | TestPortResult
+        | Array<Record<string, string> | null>
+        | undefined
+      > => {
     if (!isRecord(message) || typeof message['type'] !== 'string') return false;
     switch (message['type']) {
       case 'raijin:add_download':
         return handlers.addDownload(
           Array.isArray(message['items']) ? (message['items'] as DownloadRequestItem[]) : [],
         );
+      case 'raijin:media_add':
+        return handlers.addMedia(message['item'] as DownloadRequestItem);
       case 'raijin:test_port':
         return handlers.testPort(
           typeof message['port'] === 'number' ? (message['port'] as number) : undefined,

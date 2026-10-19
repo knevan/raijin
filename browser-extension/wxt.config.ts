@@ -1,8 +1,18 @@
 import { defineConfig } from 'wxt';
 
+const bravePath =
+  process.platform === 'win32'
+    ? `${process.env.PROGRAMFILES}/BraveSoftware/Brave-Browser-Beta/Application/brave.exe`
+    : '/usr/bin/brave-browser-beta';
+
 // See https://wxt.dev/api/config.html
 export default defineConfig({
   modules: ['@wxt-dev/module-vue'],
+  webExt: {
+    binaries: {
+      chrome: bravePath
+    }
+  },
   manifest: {
     name: 'Raijin Browser Integration',
     description: 'Capture browser downloads and send them to the Raijin download manager.',

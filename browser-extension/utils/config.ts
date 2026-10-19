@@ -12,6 +12,7 @@ export const defaultConfig: RaijinConfig = {
   token: '',
   autoCaptureLinks: true,
   popupEnabled: true,
+  mediaOverlayEnabled: true,
   sendHeaders: true,
   registeredFileTypes: [
     'zip', 'rar', '7z', 'iso', 'tar', 'gz',
@@ -37,6 +38,9 @@ const autoCaptureLinksItem = storage.defineItem<boolean>('local:autoCaptureLinks
 });
 const popupEnabledItem = storage.defineItem<boolean>('local:popupEnabled', {
   fallback: defaultConfig.popupEnabled,
+});
+const mediaOverlayItem = storage.defineItem<boolean>('local:mediaOverlayEnabled', {
+  fallback: defaultConfig.mediaOverlayEnabled,
 });
 const sendHeadersItem = storage.defineItem<boolean>('local:sendHeaders', {
   fallback: defaultConfig.sendHeaders,
@@ -85,6 +89,7 @@ export async function getAll(): Promise<RaijinConfig> {
     token,
     autoCaptureLinks,
     popupEnabled,
+    mediaOverlayEnabled,
     sendHeaders,
     registeredFileTypes,
     blacklistedUrls,
@@ -99,6 +104,7 @@ export async function getAll(): Promise<RaijinConfig> {
     tokenItem.getValue(),
     autoCaptureLinksItem.getValue(),
     popupEnabledItem.getValue(),
+    mediaOverlayItem.getValue(),
     sendHeadersItem.getValue(),
     registeredFileTypesItem.getValue(),
     blacklistedUrlsItem.getValue(),
@@ -114,6 +120,7 @@ export async function getAll(): Promise<RaijinConfig> {
     token: token ?? '',
     autoCaptureLinks,
     popupEnabled,
+    mediaOverlayEnabled,
     sendHeaders,
     registeredFileTypes,
     blacklistedUrls,
@@ -133,6 +140,8 @@ export async function setAll(partial: Partial<RaijinConfig>): Promise<void> {
   if (partial.autoCaptureLinks !== undefined)
     tasks.push(autoCaptureLinksItem.setValue(partial.autoCaptureLinks));
   if (partial.popupEnabled !== undefined) tasks.push(popupEnabledItem.setValue(partial.popupEnabled));
+  if (partial.mediaOverlayEnabled !== undefined)
+    tasks.push(mediaOverlayItem.setValue(partial.mediaOverlayEnabled));
   if (partial.sendHeaders !== undefined) tasks.push(sendHeadersItem.setValue(partial.sendHeaders));
   if (partial.registeredFileTypes !== undefined)
     tasks.push(registeredFileTypesItem.setValue(partial.registeredFileTypes));
@@ -165,6 +174,7 @@ export const configItems = {
   tokenItem,
   autoCaptureLinksItem,
   popupEnabledItem,
+  mediaOverlayItem,
   sendHeadersItem,
   registeredFileTypesItem,
   blacklistedUrlsItem,

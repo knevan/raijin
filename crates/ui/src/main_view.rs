@@ -8,8 +8,8 @@ use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Root, Sizable as _, TitleBar,
-    WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Root, Sizable as _, TitleBar, h_flex,
+    v_flex,
 };
 use gpui_kit::*;
 use raijin_core::download::DownloadStatus;
@@ -25,6 +25,7 @@ use crate::downloads::{
     category_icon, filter_rows, toolbar_actions,
 };
 use crate::format::{format_bytes, format_speed, now_ms};
+use crate::settings::{SettingsHandles, open_settings_window};
 use crate::tray::{TraySession, summarize_monitor};
 
 /// Default sidebar width in pixels, matching the product sketch.
@@ -40,6 +41,8 @@ const STORAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 pub struct MainView {
     handles: EngineHandles,
     tray: TraySession,
+    /// Token plumbing for the Settings window opened from the toolbar.
+    settings: SettingsHandles,
     search: Entity<InputState>,
     table: Entity<TableState<DownloadsDelegate>>,
     /// Last-seen monitor snapshot; compared to skip no-op refreshes.
@@ -72,6 +75,7 @@ impl MainView {
         cx: &mut Context<Self>,
         handles: EngineHandles,
         tray: TraySession,
+        settings: SettingsHandles,
     ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search downloads..."));
         let table = cx.new(|cx| {
@@ -121,6 +125,7 @@ impl MainView {
         Self {
             handles,
             tray,
+            settings,
             search,
             table,
             last_snapshot: MonitorState::default(),
@@ -650,9 +655,8 @@ impl MainView {
                     .rounded(px(10.))
                     .icon(IconName::Settings)
                     .tooltip("Settings")
-                    .on_click(cx.listener(|_, _, window, cx| {
-                        window
-                            .push_notification("Settings page follows in the M5 continuation", cx);
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        open_settings_window(cx, &this.settings);
                     })),
             )
     }

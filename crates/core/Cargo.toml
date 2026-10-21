@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 base64 = {workspace = true}
+axum = {workspace = true}
+getrandom = {workspace = true}
 encoding_rs = {workspace = true}
 tokio = {workspace = true}
 tokio-util = {workspace = true}

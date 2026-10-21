@@ -796,7 +796,9 @@ impl TableDelegate for DownloadsDelegate {
                                 // framework only emits click/keyboard events.
                                 if check {
                                     if table.delegate().rows_count(cx) > 0 {
-                                        if let Some(first_id) = table.delegate().row(0).map(|r| r.id) {
+                                        if let Some(first_id) =
+                                            table.delegate().row(0).map(|r| r.id)
+                                        {
                                             table.delegate_mut().select_row(first_id);
                                         }
                                         cx.emit(TableEvent::SelectRow(0));
@@ -970,9 +972,9 @@ impl TableDelegate for DownloadsDelegate {
                         .child(row.status_label.clone()),
                 );
                 if let Some(progress) = row.progress {
-                    let mut bar = gpui_kit::component::progress::Progress::new(
-                        SharedString::from(format!("download-progress-{}", row.id.get())),
-                    )
+                    let mut bar = gpui_kit::component::progress::Progress::new(SharedString::from(
+                        format!("download-progress-{}", row.id.get()),
+                    ))
                     .value(progress)
                     .small();
                     if row.status == DownloadStatus::Paused {
@@ -1179,7 +1181,9 @@ mod tests {
         let row = DownloadRow::from_view(&with_total, now);
         assert_eq!(row.status_label, "21% Paused");
         assert!(!row.is_active);
-        let progress = row.progress.expect("paused row with total must have progress");
+        let progress = row
+            .progress
+            .expect("paused row with total must have progress");
         assert!((progress - 21.0).abs() < 0.01);
 
         let without_total = view(2, DownloadStatus::Paused, 210, None, now);

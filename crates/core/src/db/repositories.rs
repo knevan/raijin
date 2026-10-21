@@ -49,6 +49,9 @@ pub enum DbError {
         parent: &'static str,
         parent_id: i64,
     },
+    /// OS entropy source failed while generating an API token.
+    #[error("token generation failed: {0}")]
+    TokenGeneration(String),
 }
 
 /// Repository for persisted downloads.

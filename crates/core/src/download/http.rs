@@ -428,8 +428,7 @@ pub fn decode_percent_filename(segment: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        let is_escape =
-            bytes[i] == b'%' && is_hex(bytes.get(i + 1)) && is_hex(bytes.get(i + 2));
+        let is_escape = bytes[i] == b'%' && is_hex(bytes.get(i + 1)) && is_hex(bytes.get(i + 2));
         if !is_escape {
             out.push(bytes[i]);
             i += 1;
@@ -500,10 +499,7 @@ fn plain_filename(value: &str) -> Option<String> {
             continue;
         }
         let mut filename = param_value.trim().to_owned();
-        if filename.len() >= 2
-            && filename.starts_with('"')
-            && filename.ends_with('"')
-        {
+        if filename.len() >= 2 && filename.starts_with('"') && filename.ends_with('"') {
             filename = filename[1..filename.len() - 1].to_owned();
         }
         let filename = decode_mime_words(&filename);
@@ -603,14 +599,13 @@ fn mime_word_at(input: &[u8]) -> Option<MimeWord> {
 
 /// Finds the closing `?=` of an encoded word.
 fn find_mime_end(input: &[u8]) -> Option<usize> {
-    input
-        .windows(2)
-        .position(|window| window == b"?=")
+    input.windows(2).position(|window| window == b"?=")
 }
 
 /// Decodes `B` (base64) MIME-word bytes into text.
 fn decode_mime_base64(encoded: &str, charset: &str) -> Option<String> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
     let bytes = STANDARD.decode(encoded.trim()).ok()?;
     bytes_to_text(&bytes, charset)
 }
@@ -1203,16 +1198,17 @@ mod tests {
         );
         // 0xFF is malformed UTF-8: no replacement-damaged name.
         assert_eq!(
-            extract_filename_from_content_disposition(
-                "attachment; filename=\"=?UTF-8?Q?=FF?=\""
-            ),
+            extract_filename_from_content_disposition("attachment; filename=\"=?UTF-8?Q?=FF?=\""),
             Some("=?UTF-8?Q?=FF?=".to_owned())
         );
     }
 
     #[test]
     fn disposition_should_reject_unusable_values() {
-        assert_eq!(extract_filename_from_content_disposition("attachment"), None);
+        assert_eq!(
+            extract_filename_from_content_disposition("attachment"),
+            None
+        );
         assert_eq!(
             extract_filename_from_content_disposition("attachment; filename=\"\""),
             None
@@ -1234,8 +1230,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_should_capture_disposition_filename_and_final_url(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn probe_should_capture_disposition_filename_and_final_url()
+    -> Result<(), Box<dyn std::error::Error>> {
         let server = TestServer::spawn(ServerMode::RangeSupportedWithDisposition).await?;
         let metadata = probe_http(&reqwest_client()?, ProbeRequest::new(server.url())).await?;
 
@@ -1245,8 +1241,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_should_leave_filename_empty_without_disposition(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn probe_should_leave_filename_empty_without_disposition()
+    -> Result<(), Box<dyn std::error::Error>> {
         let server = TestServer::spawn(ServerMode::RangeSupported).await?;
         let metadata = probe_http(&reqwest_client()?, ProbeRequest::new(server.url())).await?;
 

@@ -7,7 +7,7 @@
     clippy::large_types_passed_by_value,
     clippy::large_futures,
     clippy::trivially_copy_pass_by_ref,
-    clippy::clone_on_ref_ptr,
+    clippy::clone_on_ref_ptr
 )]
 // Tests may panic on violated assumptions; the deny above stays for production code.
 #![cfg_attr(test, allow(clippy::panic))]
@@ -17,19 +17,24 @@ mod bridge;
 mod category;
 mod downloads;
 mod format;
+mod integration_bridge;
 mod main_view;
+mod settings;
 mod theme;
 mod tray;
 
 use std::time::Duration;
 
-use gpui_kit::component::{Root, Theme, ThemeMode, TitleBar, WindowExt as _};
+use gpui_kit::component::{Root, Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
+use raijin_core::integration::DEFAULT_PORT;
 use raijin_core::platform::tray::CloseDecision;
 
 use crate::add_download::open_add_download_window;
 use crate::bridge::{EngineCommand, EngineHandles};
+use crate::integration_bridge::Started;
 use crate::main_view::MainView;
+use crate::settings::{SettingsHandles, apply_autostart, open_settings_window};
 use crate::tray::{OsCloseOutcome, TraySession, parse_add_url, parse_start_minimized};
 
 gpui_kit::actions!(
@@ -62,12 +67,13 @@ fn main() {
             eprintln!("failed to start engine runtime: {error}");
             std::process::exit(1);
         });
-    let (handles, tray) = runtime
-        .block_on(bootstrap_engine())
-        .unwrap_or_else(|error| {
-            eprintln!("failed to bootstrap engine: {error}");
-            std::process::exit(1);
-        });
+    let (handles, tray, integration, settings) =
+        runtime
+            .block_on(bootstrap_engine())
+            .unwrap_or_else(|error| {
+                eprintln!("failed to bootstrap engine: {error}");
+                std::process::exit(1);
+            });
     // `run` blocks until explicit quit, so the local runtime stays alive for
     // the whole application lifetime (including windowless tray mode).
     // Views only keep its `Handle`.
@@ -107,6 +113,7 @@ fn main() {
             // the deliberate `forget` (it dies with the process).
             let reopen_handles = handles.clone();
             let reopen_tray = tray.clone();
+            let reopen_settings = settings.clone();
             let closed_subscription = cx.on_window_closed(move |cx, _| {
                 // Add Download windows are standalone: their close must not
                 // drive the main-window lifecycle. While any window remains,
@@ -119,7 +126,7 @@ fn main() {
                 tracing::debug!(?outcome, "window closed");
                 match outcome {
                     OsCloseOutcome::Reopen => {
-                        open_main_window(cx, &reopen_handles, &reopen_tray);
+                        open_main_window(cx, &reopen_handles, &reopen_tray, &reopen_settings);
                     }
                     OsCloseOutcome::Quit => cx.quit(),
                     OsCloseOutcome::Nothing => {}
@@ -137,7 +144,23 @@ fn main() {
                     None
                 }
             };
-            register_tray_actions(cx, &handles, &tray, native_tray.clone());
+            register_tray_actions(cx, &handles, &tray, &settings, native_tray.clone());
+            // Browser-extension requests arrive over localhost; the dispatcher
+            // stays on this thread and only hands work to the engine runtime.
+            if let Some(started) = integration {
+                let dialog_handles = handles.clone();
+                crate::integration_bridge::spawn_dispatcher(
+                    cx,
+                    started,
+                    Box::new(move |cx, prepared| {
+                        // One dialog per item keeps the existing single-URL
+                        // form unchanged; batches are rare from the extension.
+                        for item in prepared {
+                            open_add_download_window(cx, &dialog_handles, &item.source.link);
+                        }
+                    }),
+                );
+            }
             // A degraded (icon-less) start must never go windowless, even
             // with `--minimized`: there would be no way to restore or quit.
             let windowless_start = start_minimized && native_tray.is_some();
@@ -163,7 +186,13 @@ fn main() {
                     cx.update(|cx| {
                         let options = main_window_options(cx);
                         cx.open_window(options, |window, cx| {
-                            build_main_root(window, cx, handles.clone(), tray.clone())
+                            build_main_root(
+                                window,
+                                cx,
+                                handles.clone(),
+                                tray.clone(),
+                                settings.clone(),
+                            )
                         })
                         .expect("failed to open main window");
                     })
@@ -180,17 +209,19 @@ fn register_tray_actions(
     cx: &mut App,
     handles: &EngineHandles,
     session: &TraySession,
+    settings: &SettingsHandles,
     native_tray: Option<gpui_tray::Tray>,
 ) {
     let show_handles = handles.clone();
     let show_session = session.clone();
+    let show_settings = settings.clone();
     cx.on_action(move |_: &ShowWindow, cx: &mut App| {
         // Show-only: reopen when windowless, otherwise restore + focus.
         // Window-level `activate` restores taskbar-minimized windows on
         // Windows (app-level `activate` is a no-op there).
         if cx.windows().is_empty() {
             tracing::debug!("tray Show: reopening window");
-            open_main_window(cx, &show_handles, &show_session);
+            open_main_window(cx, &show_handles, &show_session, &show_settings);
         } else {
             tracing::debug!("tray Show: activating window");
             show_session.mark_shown();
@@ -233,12 +264,12 @@ fn register_tray_actions(
         }
     });
 
+    // Settings opens as its own window so it works from the tray menu even
+    // when the main window was never created.
+    let settings_handles = settings.clone();
     cx.on_action(move |_: &OpenAppSettings, cx: &mut App| {
-        if let Some(window) = cx.active_window() {
-            let _ = window.update(cx, |_, window, cx| {
-                window.push_notification("Settings page follows in the M5 continuation", cx);
-            });
-        }
+        tracing::debug!("tray Settings: opening Settings window");
+        open_settings_window(cx, &settings_handles);
     });
 
     let quit_session = session.clone();
@@ -311,10 +342,7 @@ fn hide_window_to_tray(session: &TraySession, cx: &mut App) {
 }
 
 /// Builds the native tray icon from the session's activity cache.
-fn build_native_tray(
-    cx: &mut App,
-    session: &TraySession,
-) -> gpui_tray::Result<gpui_tray::Tray> {
+fn build_native_tray(cx: &mut App, session: &TraySession) -> gpui_tray::Result<gpui_tray::Tray> {
     let menu_session = session.clone();
     gpui_tray::Tray::builder()
         .icon(tray_icon()?)
@@ -390,11 +418,23 @@ fn spawn_tray_sync(cx: &mut App, icon: gpui_tray::Tray, session: TraySession) {
 ///
 /// Rebuild path for `remove_window` closes: fresh entities subscribe to the
 /// monitor feed anew; engine state is never rebuilt by the UI.
-fn open_main_window(cx: &mut App, handles: &EngineHandles, tray: &TraySession) {
+fn open_main_window(
+    cx: &mut App,
+    handles: &EngineHandles,
+    tray: &TraySession,
+    settings: &SettingsHandles,
+) {
     let root_handles = handles.clone();
     let root_tray = tray.clone();
+    let root_settings = settings.clone();
     match cx.open_window(main_window_options(cx), |window, cx| {
-        build_main_root(window, cx, root_handles.clone(), root_tray.clone())
+        build_main_root(
+            window,
+            cx,
+            root_handles.clone(),
+            root_tray.clone(),
+            root_settings.clone(),
+        )
     }) {
         Ok(handle) => {
             tray.mark_shown();
@@ -425,9 +465,10 @@ fn build_main_root(
     cx: &mut App,
     handles: EngineHandles,
     session: TraySession,
+    settings: SettingsHandles,
 ) -> Entity<Root> {
     register_should_close(window, cx, &session);
-    let view = cx.new(|cx| MainView::new(window, cx, handles, session));
+    let view = cx.new(|cx| MainView::new(window, cx, handles, session, settings));
     cx.new(|cx| Root::new(view, window, cx))
 }
 
@@ -519,7 +560,9 @@ fn tray_icon() -> gpui_tray::Result<gpui_tray::Icon> {
 }
 
 /// Bootstraps persistence, settings, the download manager actor, and the monitor.
-async fn bootstrap_engine() -> Result<(EngineHandles, TraySession), String> {
+type Bootstrap = (EngineHandles, TraySession, Option<Started>, SettingsHandles);
+
+async fn bootstrap_engine() -> Result<Bootstrap, String> {
     let database_url = raijin_core::platform::desktop_database_url()
         .map_err(|error| format!("database path unavailable: {error}"))?;
     let pool = raijin_core::db::bootstrap(&database_url)
@@ -548,45 +591,99 @@ async fn bootstrap_engine() -> Result<(EngineHandles, TraySession), String> {
         .unwrap_or_else(|_| platform_folder.clone());
     let fallback =
         raijin_core::config::DesktopSettings::from_defaults(platform_folder, category_root);
-    let settings = raijin_core::config::load_desktop_settings(&settings_repository, fallback).await;
-    apply_autostart(&settings);
-    let tray = TraySession::new(settings.tray_behavior());
+    let desktop = raijin_core::config::load_desktop_settings(&settings_repository, fallback).await;
+    if let Err(error) = apply_autostart(&desktop) {
+        tracing::warn!(%error, "autostart apply on boot failed");
+    }
+    let tray = TraySession::new(desktop.tray_behavior());
+    // The token slot is created regardless of the integration toggle: the
+    // Settings window reads and rotates the persisted token either way.
+    let token_cell = raijin_core::integration::TokenCell::new(
+        raijin_core::integration::load_or_create_token(&settings_repository)
+            .await
+            .map_err(|error| format!("integration token unavailable: {error}"))?,
+    );
+    let integration = if integration_enabled(&desktop) {
+        let queues = raijin_core::db::QueueRepository::new(pool.clone());
+        start_integration(
+            token_cell.clone(),
+            desktop.default_download_folder.clone(),
+            manager.clone(),
+            queues,
+        )
+        .await
+        .map(Some)?
+    } else {
+        None
+    };
+    let port = integration.as_ref().map(|started| started.port);
+    let settings = SettingsHandles {
+        token: token_cell,
+        repository: settings_repository,
+        runtime: tokio::runtime::Handle::current(),
+        port,
+        tray: tray.clone(),
+        desktop: std::sync::Arc::new(std::sync::RwLock::new(desktop.clone())),
+    };
     Ok((
         EngineHandles {
-            default_folder: settings.default_download_folder.clone(),
-            category_root: settings.category_root.clone(),
-            use_category_default: settings.use_category_by_default,
+            default_folder: desktop.default_download_folder.clone(),
+            category_root: desktop.category_root.clone(),
+            use_category_default: desktop.use_category_by_default,
             manager,
             monitor,
             runtime: tokio::runtime::Handle::current(),
         },
         tray,
+        integration,
+        settings,
     ))
 }
 
-/// Applies the persisted launch-at-startup toggle idempotently.
+/// Returns whether the localhost integration server should run.
 ///
-/// Only touches the OS mechanism on drift; failures warn without failing
-/// boot (autostart is best-effort, downloads must still work).
-fn apply_autostart(settings: &raijin_core::config::DesktopSettings) {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            tracing::warn!(?error, "autostart skipped: current exe unknown");
-            return;
-        }
-    };
-    let manager = raijin_core::platform::autostart::system_autostart_manager(
-        "Raijin",
-        &exe,
-        &["--minimized".to_owned()],
+/// The persisted toggle has no Settings UI yet, so `RAIJIN_INTEGRATION=1` lets
+/// the extension be exercised end-to-end before that page lands. The setting
+/// stays authoritative once it is on.
+fn integration_enabled(settings: &raijin_core::config::DesktopSettings) -> bool {
+    if settings.browser_integration_enabled {
+        return true;
+    }
+    matches!(
+        std::env::var("RAIJIN_INTEGRATION").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes")
+    )
+}
+
+/// Binds the integration server and logs the effective port.
+///
+/// The token is no longer logged: the Settings window is the supported way to
+/// read it, so a copy in the tracing output would only be a leak.
+async fn start_integration(
+    token: raijin_core::integration::TokenCell,
+    folder: std::path::PathBuf,
+    manager: raijin_core::download::DownloadManagerHandle,
+    queues: raijin_core::db::QueueRepository,
+) -> Result<crate::integration_bridge::Started, String> {
+    let bridge = crate::integration_bridge::bridge();
+    let address = raijin_core::integration::serve(bridge.handle.clone(), token, DEFAULT_PORT)
+        .await
+        .map_err(|error| format!("integration server bind failed: {error}"))?;
+    tracing::info!(
+        %address,
+        port = address.port(),
+        "browser integration listening (Authorization: Bearer <token from Settings>)"
     );
-    if manager.is_enabled() == settings.launch_at_startup {
-        return;
-    }
-    if let Err(error) = manager.set_enabled(settings.launch_at_startup) {
-        tracing::warn!(?error, "autostart toggle failed");
-    }
+    Ok(crate::integration_bridge::Started {
+        receiver: bridge.receiver,
+        port: address.port(),
+        engine: crate::integration_bridge::IntegrationEngine {
+            manager,
+            queues,
+            runtime: tokio::runtime::Handle::current(),
+            default_folder: folder,
+        },
+    })
 }
 
 #[cfg(test)]

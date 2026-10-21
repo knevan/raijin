@@ -1,0 +1,26 @@
+{
+  "extName": {
+    "message": "Raijin Browser Integration"
+  },
+  "extDescription": {
+    "message": "Capture browser downloads and send them to the Raijin download manager."
+  },
+  "contextMenuDownloadLink": {
+    "message": "Download with Raijin"
+  },
+  "contextMenuDownloadSelected": {
+    "message": "Download selected links with Raijin"
+  },
+  "notificationTitle": {
+    "message": "Raijin"
+  },
+  "notificationSilentCapture": {
+    "message": "Download captured silently"
+  },
+  "errorNetwork": {
+    "message": "Cannot reach the Raijin desktop app. Make sure it is running and browser integration is enabled."
+  },
+  "errorApi": {
+    "message": "The Raijin app returned an error. Update both the app and the extension to the latest version."
+  }
+}

@@ -7,7 +7,7 @@
     clippy::large_types_passed_by_value,
     clippy::large_futures,
     clippy::trivially_copy_pass_by_ref,
-    clippy::clone_on_ref_ptr,
+    clippy::clone_on_ref_ptr
 )]
 // Tests may panic on violated assumptions; the deny above stays for production code.
 #![cfg_attr(test, allow(clippy::panic))]

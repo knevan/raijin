@@ -1,10 +1,37 @@
 [settings]
 auto_install = false
 
+[env]
+RAIJIN_INTEGRATION = 1
+
+[tasks."dev:test"]
+alias = ["test", "t"]
+dir = "."
+run = "cargo test --workspace"
+
+[tasks."dev:fmt"]
+alias = ["fmt", "f"]
+dir = "."
+run = "cargo fmt --all"
+
 [tasks.dev]
 dir = "."
 run = "cargo run -p raijin-ui"
 
-[tasks.ext]
+[tasks."ext:dev"]
+alias = ["chrome"]
 dir = "browser-extension"
 run = "pnpm dev"
+
+[tasks."ext:firefox"]
+alias = ["firefox"]
+dir = "browser-extension"
+run = "pnpm dev:firefox"
+
+[tasks."ext:test"]
+dir = "browser-extension"
+run = "pnpm test"
+
+[tasks."ext:build"]
+dir = "browser-extension"
+run = "pnpm build"

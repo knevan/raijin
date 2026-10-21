@@ -3,8 +3,3 @@
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite-journal
-.kilo
-*.md
-*.json
-.ignore
-!README.md

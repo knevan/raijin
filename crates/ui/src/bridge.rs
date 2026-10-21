@@ -207,14 +207,8 @@ mod tests {
             "Antigravity IDE.exe"
         );
         // `+` stays literal (not a space), matching ABDM `FilenameDecoder`.
-        assert_eq!(
-            suggest_filename("https://example.com/a%2Bb.zip"),
-            "a+b.zip"
-        );
+        assert_eq!(suggest_filename("https://example.com/a%2Bb.zip"), "a+b.zip");
         // Stray `%` stays literal so no name is lost.
-        assert_eq!(
-            suggest_filename("https://example.com/100%.exe"),
-            "100%.exe"
-        );
+        assert_eq!(suggest_filename("https://example.com/100%.exe"), "100%.exe");
     }
 }

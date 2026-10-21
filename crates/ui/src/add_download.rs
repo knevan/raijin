@@ -292,9 +292,12 @@ impl AddDownloadView {
             return;
         }
         let current = self.file.read(cx).value().to_string();
-        let Some(upgrade) =
-            select_probe_filename(&current, self.probe_name.as_deref(), &info.final_url, &info.typed_url)
-        else {
+        let Some(upgrade) = select_probe_filename(
+            &current,
+            self.probe_name.as_deref(),
+            &info.final_url,
+            &info.typed_url,
+        ) else {
             return;
         };
         self.file.update(cx, |state, cx| {
@@ -912,8 +915,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        category_from_label, category_position, initial_category, resolve_folder, sanitize_filename,
-        select_probe_filename,
+        category_from_label, category_position, initial_category, resolve_folder,
+        sanitize_filename, select_probe_filename,
     };
     use crate::category::FileCategory;
 

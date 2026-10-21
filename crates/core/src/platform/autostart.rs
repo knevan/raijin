@@ -311,11 +311,30 @@ impl WindowsRunKeyAutostartManager {
 #[cfg(windows)]
 mod windows_impl {
     use winreg::RegKey;
-    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
 
     use super::*;
 
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+    impl WindowsRunKeyAutostartManager {
+        /// Opens the Run key with write access only.
+        ///
+        /// `KEY_SET_VALUE` is the minimum right that `RegSetValueExW` and
+        /// `RegDeleteValueW` accept. Opening it read-only makes deletes fail
+        /// with access denied, and `KEY_ALL_ACCESS` requests rights (write DAC,
+        /// create subkey) that a hardened Run key denies even when writing a
+        /// value is allowed.
+        fn writable_run_key(&self) -> std::io::Result<RegKey> {
+            let root = RegKey::predef(HKEY_CURRENT_USER);
+            match root.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => root
+                    .create_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)
+                    .map(|(key, _)| key),
+                other => other,
+            }
+        }
+    }
 
     impl AutostartManager for WindowsRunKeyAutostartManager {
         fn app_name(&self) -> &str {
@@ -330,19 +349,16 @@ mod windows_impl {
         }
 
         fn set_enabled(&self, enabled: bool) -> AutostartResult<()> {
-            let root = RegKey::predef(HKEY_CURRENT_USER);
+            let key = self
+                .writable_run_key()
+                .map_err(|error| AutostartError::Registry(error.to_string()))?;
             if enabled {
-                let (key, _) = root
-                    .create_subkey(RUN_KEY)
-                    .map_err(|error| AutostartError::Registry(error.to_string()))?;
                 key.set_value(&self.app_name, &self.command)
                     .map_err(|error| AutostartError::Registry(error.to_string()))?;
             } else {
-                let key = root
-                    .open_subkey(RUN_KEY)
-                    .map_err(|error| AutostartError::Registry(error.to_string()))?;
                 match key.delete_value(&self.app_name) {
                     Ok(()) => {}
+                    // Nothing installed: the caller wants this state anyway.
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(AutostartError::Registry(error.to_string())),
                 }
@@ -507,6 +523,67 @@ mod tests {
         let manager = NoopAutostartManager::new("Raijin");
         manager.set_enabled(true).expect("noop must accept writes");
         assert!(!manager.is_enabled());
+    }
+
+    /// Regression: the disable path opened the Run key read-only, so
+    /// `RegDeleteValueW` failed with access denied and the entry survived.
+    #[cfg(windows)]
+    #[test]
+    fn windows_manager_should_round_trip_enable_disable() {
+        // The name doubles as the cleanup handle if an assert panics midway.
+        let _guard = WindowsRunKeyGuard::delete("RaijinAutostartTest");
+        let manager = WindowsRunKeyAutostartManager::new(
+            "RaijinAutostartTest",
+            Path::new("C:/Program Files/Raijin/raijin.exe"),
+            &["--minimized".to_owned()],
+        );
+
+        manager.set_enabled(true).expect("install must succeed");
+        assert!(manager.is_enabled());
+
+        manager.set_enabled(false).expect("uninstall must succeed");
+        assert!(!manager.is_enabled());
+
+        // Disabling again is a no-op, not a NotFound error.
+        manager
+            .set_enabled(false)
+            .expect("second uninstall must stay idempotent");
+    }
+
+    /// Removes the test value from the per-user Run key on drop.
+    #[cfg(windows)]
+    struct WindowsRunKeyGuard {
+        name: &'static str,
+    }
+
+    #[cfg(windows)]
+    impl WindowsRunKeyGuard {
+        fn delete(name: &'static str) -> Self {
+            let root = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+            match root.open_subkey_with_flags(
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                winreg::enums::KEY_SET_VALUE,
+            ) {
+                Ok(key) => {
+                    let _ = key.delete_value(name);
+                }
+                Err(error) => tracing::warn!(%error, "autostart test cleanup key unavailable"),
+            }
+            Self { name }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsRunKeyGuard {
+        fn drop(&mut self) {
+            let root = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+            if let Ok(key) = root.open_subkey_with_flags(
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                winreg::enums::KEY_SET_VALUE,
+            ) {
+                let _ = key.delete_value(self.name);
+            }
+        }
     }
 
     #[test]

@@ -7,13 +7,13 @@
 
 use std::path::Path;
 
-use raijin_core::db::QueueRepository;
-use raijin_core::download::DownloadManagerHandle;
+use raijin_core::download::{DownloadManagerHandle, QueueId};
 use raijin_core::integration::{
     AddDownloadRequest, DEFAULT_COMMAND_BUFFER, IntegrationCommand, IntegrationHandle,
     IntegrationReply, IntegrationResponder, PreparedItem, QueueSummary, prepare_request,
     summarize_item,
 };
+use raijin_core::queue::QueueManagerHandle;
 use tokio::sync::mpsc;
 
 /// Engine-side dependencies needed to answer requests.
@@ -21,8 +21,8 @@ use tokio::sync::mpsc;
 pub struct IntegrationEngine {
     /// Actor handle used to list and add downloads.
     pub manager: DownloadManagerHandle,
-    /// Queue repository for `GET /queues`.
-    pub queues: QueueRepository,
+    /// Queue actor: admits extension downloads and answers `GET /queues`.
+    pub queues: QueueManagerHandle,
     /// Runtime used to run engine work off the UI thread.
     pub runtime: tokio::runtime::Handle,
     /// Destination folder for extension-originated downloads.
@@ -73,7 +73,10 @@ pub fn validate_confirmation(
     }
 }
 
-/// Adds items without a dialog and resumes each one.
+/// Adds items without a dialog and hands each one to the Main queue.
+///
+/// Leaving a download out of a queue would strand it: admission is the only
+/// path that starts a job, so the membership write is part of the request.
 ///
 /// # Errors
 ///
@@ -90,10 +93,14 @@ pub async fn add_prepared(
             .await
             .map_err(|error| error.to_string())?;
         ids.push(added.id.get());
-        if let Err(error) = engine.manager.resume(added.id).await {
-            // The download exists in `Added`; failing the whole request would
-            // discard ids the extension can still act on.
-            tracing::warn!(?error, id = added.id.get(), "resume after add failed");
+        if let Err(error) = engine.queues.enqueue(QueueId::MAIN, [added.id]).await {
+            // The download row exists; failing the whole request would discard
+            // ids the extension can still act on.
+            tracing::warn!(
+                ?error,
+                id = added.id.get(),
+                "queue enqueue after add failed"
+            );
         }
     }
     Ok(IntegrationReply::Accepted { ids })
@@ -117,30 +124,27 @@ pub async fn list_downloads(engine: &IntegrationEngine) -> Result<IntegrationRep
 
 /// Builds the queue snapshot for `GET /queues`.
 ///
+/// The queue actor answers from its own snapshot, so the payload stays in step
+/// with admission instead of reading membership rows behind its back.
+///
 /// # Errors
 ///
-/// Returns the database message when the queue table cannot be read.
+/// Returns the queue message when the actor has stopped.
 pub async fn list_queues(engine: &IntegrationEngine) -> Result<IntegrationReply, String> {
-    let queues = engine
+    let snapshots = engine
         .queues
-        .list_queues()
+        .list()
         .await
         .map_err(|error| error.to_string())?;
-    let mut summaries = Vec::with_capacity(queues.len());
-    for queue in &queues {
-        let item_count = engine
-            .queues
-            .list_items(queue.id)
-            .await
-            .map_err(|error| error.to_string())?
-            .len();
-        summaries.push(QueueSummary {
-            id: queue.id.get(),
-            name: queue.name.clone(),
-            max_concurrent: queue.max_concurrent.get(),
-            item_count,
-        });
-    }
+    let summaries = snapshots
+        .iter()
+        .map(|snapshot| QueueSummary {
+            id: snapshot.queue.id.get(),
+            name: snapshot.queue.name.clone(),
+            max_concurrent: snapshot.queue.max_concurrent.get(),
+            item_count: snapshot.items.len(),
+        })
+        .collect();
     Ok(IntegrationReply::Queues(summaries))
 }
 

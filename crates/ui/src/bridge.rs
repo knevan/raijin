@@ -1,13 +1,16 @@
 use std::path::PathBuf;
 
-use raijin_core::download::{DownloadId, DownloadManagerHandle, NewDownload};
+use raijin_core::download::{DownloadId, DownloadManagerHandle, NewDownload, QueueId};
 use raijin_core::monitor::DownloadMonitorHandle;
+use raijin_core::queue::QueueManagerHandle;
 
 /// Cloneable engine endpoints owned by GPUI views.
 #[derive(Debug, Clone)]
 pub struct EngineHandles {
     /// Actor handle for pause/resume/remove/reset/add commands.
     pub manager: DownloadManagerHandle,
+    /// Queue actor handle for membership and admission commands.
+    pub queues: QueueManagerHandle,
     /// Projected monitor state subscribed by the polling task.
     pub monitor: DownloadMonitorHandle,
     /// Companion Tokio runtime for spawning engine commands.
@@ -39,6 +42,13 @@ pub enum EngineCommand {
     Add(NewDownload),
     /// Add a download without resuming it (stays `Added` until resumed).
     AddPaused(NewDownload),
+    /// Move downloads into a queue (drag onto a queue).
+    MoveToQueue {
+        /// Destination queue.
+        queue_id: QueueId,
+        /// Downloads to move, in selection order.
+        downloads: Vec<DownloadId>,
+    },
 }
 
 impl EngineHandles {
@@ -48,24 +58,77 @@ impl EngineHandles {
     /// through the monitor projection on the next poll tick.
     pub fn dispatch(&self, command: EngineCommand) {
         let manager = self.manager.clone();
+        let queues = self.queues.clone();
         self.runtime.spawn(async move {
-            let result = match command {
-                EngineCommand::Pause(id) => manager.pause(id).await.map(|_| ()),
-                EngineCommand::Resume(id) => manager.resume(id).await.map(|_| ()),
-                EngineCommand::Remove(id) => manager.remove(id).await.map(|_| ()),
-                EngineCommand::Reset(id) => manager.reset(id).await.map(|_| ()),
-                EngineCommand::PauseAll => manager.pause_all().await.map(|_| ()),
-                EngineCommand::ResumeAll => manager.resume_all().await.map(|_| ()),
-                EngineCommand::Add(request) => match manager.add(request).await {
-                    Ok(item) => manager.resume(item.id).await.map(|_| ()),
-                    Err(error) => Err(error),
-                },
-                EngineCommand::AddPaused(request) => manager.add(request).await.map(|_| ()),
-            };
-            if let Err(error) = result {
-                tracing::warn!(?error, "engine command failed");
+            // Each arm keeps its own error type: queue and engine failures are
+            // different domain errors and must not be flattened into one.
+            match command {
+                EngineCommand::MoveToQueue {
+                    queue_id,
+                    downloads,
+                } => {
+                    if let Err(error) = queues.enqueue(queue_id, downloads).await {
+                        tracing::warn!(?error, "queue move failed");
+                    }
+                }
+                other => {
+                    if let Err(error) = other.dispatch_to(&manager, &queues).await {
+                        tracing::warn!(?error, "engine command failed");
+                    }
+                }
             }
         });
+    }
+}
+
+impl EngineCommand {
+    /// Runs an engine-owned command against the download manager.
+    ///
+    /// # Errors
+    ///
+    /// Returns the manager error when the command could not be applied.
+    async fn dispatch_to(
+        self,
+        manager: &DownloadManagerHandle,
+        queues: &QueueManagerHandle,
+    ) -> raijin_core::download::DownloadManagerResult<()> {
+        match self {
+            Self::Pause(id) => manager.pause(id).await.map(|_| ()),
+            Self::Resume(id) => manager.resume(id).await.map(|_| ()),
+            Self::Remove(id) => manager.remove(id).await.map(|_| ()),
+            Self::Reset(id) => manager.reset(id).await.map(|_| ()),
+            Self::PauseAll => manager.pause_all().await.map(|_| ()),
+            Self::ResumeAll => manager.resume_all().await.map(|_| ()),
+            // Adds must go through the queue: admission is the only path that
+            // starts a job, so an add without membership would never run.
+            Self::Add(request) => Self::add_queued(manager, queues, request, true).await,
+            Self::AddPaused(request) => Self::add_queued(manager, queues, request, false).await,
+            Self::MoveToQueue { .. } => Ok(()),
+        }
+    }
+
+    /// Adds a download, attaches it to Main, and optionally starts it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the manager error when the add fails, or `Stopped` when the
+    /// queue actor is gone.
+    async fn add_queued(
+        manager: &DownloadManagerHandle,
+        queues: &QueueManagerHandle,
+        request: NewDownload,
+        start: bool,
+    ) -> raijin_core::download::DownloadManagerResult<()> {
+        let added = manager.add(request).await?;
+        queues
+            .enqueue(QueueId::MAIN, [added.id])
+            .await
+            .map_err(|_| raijin_core::download::DownloadManagerError::Stopped)?;
+        if start {
+            manager.start(added.id).await.map(|_| ())
+        } else {
+            Ok(())
+        }
     }
 }
 

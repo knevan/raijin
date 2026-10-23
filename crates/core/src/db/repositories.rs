@@ -350,10 +350,18 @@ impl QueueRepository {
 
     /// Creates the reserved default queue when it does not already exist.
     ///
+    /// `max_concurrent` only applies on creation: the main queue mirrors the
+    /// global concurrency setting, so a fresh database starts with the user's
+    /// configured ceiling instead of a hardcoded two.
+    ///
     /// # Errors
     ///
     /// Returns an error when SQLite fails to insert the row.
-    pub async fn ensure_default_queue(&self, now_ms: i64) -> DbResult<QueueId> {
+    pub async fn ensure_default_queue(
+        &self,
+        now_ms: i64,
+        max_concurrent: NonZeroU16,
+    ) -> DbResult<QueueId> {
         sqlx::query(
             r#"
             INSERT OR IGNORE INTO queues (id, name, max_concurrent, stop_on_empty, schedule_json, created_at, updated_at)
@@ -362,7 +370,7 @@ impl QueueRepository {
         )
         .bind(QueueId::MAIN.get())
         .bind("Main")
-        .bind(2_i64)
+        .bind(i64::from(max_concurrent.get()))
         .bind(0_i64)
         .bind(Option::<String>::None)
         .bind(now_ms)
@@ -1130,12 +1138,24 @@ mod tests {
         downloads.add(&sample_download(2)).await?;
         let queues = QueueRepository::new(db.pool.clone());
 
-        queues.ensure_default_queue(10).await?;
-        queues.ensure_default_queue(20).await?;
+        queues
+            .ensure_default_queue(10, NonZeroU16::new(3).unwrap_or(NonZeroU16::MIN))
+            .await?;
+        // Second call must not overwrite the existing row.
+        queues
+            .ensure_default_queue(20, NonZeroU16::new(9).unwrap_or(NonZeroU16::MIN))
+            .await?;
         let default_queue = queues.get_queue(QueueId::MAIN).await?;
         assert_eq!(
             default_queue.as_ref().map(|queue| queue.name.as_str()),
             Some("Main")
+        );
+        assert_eq!(
+            default_queue
+                .as_ref()
+                .map(|queue| queue.max_concurrent.get()),
+            Some(3),
+            "the first creation wins"
         );
 
         queues

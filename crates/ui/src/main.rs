@@ -67,13 +67,12 @@ fn main() {
             eprintln!("failed to start engine runtime: {error}");
             std::process::exit(1);
         });
-    let (handles, tray, integration, settings) =
-        runtime
-            .block_on(bootstrap_engine())
-            .unwrap_or_else(|error| {
-                eprintln!("failed to bootstrap engine: {error}");
-                std::process::exit(1);
-            });
+    let (handles, tray, integration, settings) = runtime
+        .block_on(bootstrap_engine())
+        .unwrap_or_else(|error| {
+            eprintln!("failed to bootstrap engine: {error}");
+            std::process::exit(1);
+        });
     // `run` blocks until explicit quit, so the local runtime stays alive for
     // the whole application lifetime (including windowless tray mode).
     // Views only keep its `Handle`.
@@ -573,10 +572,13 @@ async fn bootstrap_engine() -> Result<Bootstrap, String> {
     let settings_repository = raijin_core::db::SettingsRepository::new(pool.clone());
     let (manager, _manager_task, events) =
         raijin_core::download::DownloadManagerHandle::spawn_with_events(
-            downloads,
+            downloads.clone(),
             parts,
             raijin_core::download::DownloadManagerOptions::default(),
         );
+    // Queue admission and the monitor both need the stream; the manager owns
+    // the sender, so a second receiver costs one clone of the handle.
+    let queue_events = manager.subscribe();
     // The monitor subscribes before boot publishes `BootLoaded`, so the first
     // poll already contains unfinished downloads restored from SQLite.
     let (monitor, _monitor_task) = raijin_core::monitor::DownloadMonitorHandle::spawn(events, None);
@@ -603,13 +605,21 @@ async fn bootstrap_engine() -> Result<Bootstrap, String> {
             .await
             .map_err(|error| format!("integration token unavailable: {error}"))?,
     );
+    // Queue admission is the only path that starts downloads, so the actor
+    // must exist before any add/reorder command can reach the engine.
+    let (queue_manager, _queue_task) = raijin_core::queue::QueueManagerHandle::spawn(
+        downloads,
+        raijin_core::db::QueueRepository::new(pool.clone()),
+        manager.clone(),
+        queue_events,
+        queue_options(&desktop),
+    );
     let integration = if integration_enabled(&desktop) {
-        let queues = raijin_core::db::QueueRepository::new(pool.clone());
         start_integration(
             token_cell.clone(),
             desktop.default_download_folder.clone(),
             manager.clone(),
-            queues,
+            queue_manager.clone(),
         )
         .await
         .map(Some)?
@@ -631,6 +641,7 @@ async fn bootstrap_engine() -> Result<Bootstrap, String> {
             category_root: desktop.category_root.clone(),
             use_category_default: desktop.use_category_by_default,
             manager,
+            queues: queue_manager,
             monitor,
             runtime: tokio::runtime::Handle::current(),
         },
@@ -638,6 +649,19 @@ async fn bootstrap_engine() -> Result<Bootstrap, String> {
         integration,
         settings,
     ))
+}
+
+/// Builds queue runtime options from the persisted concurrency setting.
+///
+/// A zero value would mean "no downloads", so it is floored to one slot.
+fn queue_options(
+    desktop: &raijin_core::config::DesktopSettings,
+) -> raijin_core::queue::QueueManagerOptions {
+    raijin_core::queue::QueueManagerOptions {
+        global_limit: std::num::NonZeroU16::new(desktop.max_concurrent_downloads)
+            .unwrap_or(std::num::NonZeroU16::MIN),
+        ..raijin_core::queue::QueueManagerOptions::default()
+    }
 }
 
 /// Returns whether the localhost integration server should run.
@@ -663,7 +687,7 @@ async fn start_integration(
     token: raijin_core::integration::TokenCell,
     folder: std::path::PathBuf,
     manager: raijin_core::download::DownloadManagerHandle,
-    queues: raijin_core::db::QueueRepository,
+    queue_manager: raijin_core::queue::QueueManagerHandle,
 ) -> Result<crate::integration_bridge::Started, String> {
     let bridge = crate::integration_bridge::bridge();
     let address = raijin_core::integration::serve(bridge.handle.clone(), token, DEFAULT_PORT)
@@ -679,7 +703,7 @@ async fn start_integration(
         port: address.port(),
         engine: crate::integration_bridge::IntegrationEngine {
             manager,
-            queues,
+            queues: queue_manager,
             runtime: tokio::runtime::Handle::current(),
             default_folder: folder,
         },

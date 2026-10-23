@@ -1,21 +1,24 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
-use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
+use gpui_kit::component::sidebar::{Sidebar, SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Root, Sizable as _, TitleBar, h_flex,
-    v_flex,
+    ActiveTheme as _, Collapsible, Disableable as _, Icon, IconName, Root, Sizable as _, TitleBar,
+    h_flex, v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use raijin_core::download::DownloadStatus;
+use raijin_core::download::{DownloadId, DownloadStatus, QueueId};
 use raijin_core::monitor::MonitorState;
 use raijin_core::platform::DiskUsage;
 use raijin_core::platform::tray::CloseDecision;
+use raijin_core::queue::QueueSnapshot;
 
 use crate::add_download::open_add_download_window;
 use crate::bridge::{EngineCommand, EngineHandles};
@@ -29,11 +32,11 @@ use crate::settings::{SettingsHandles, open_settings_window};
 use crate::tray::{TraySession, summarize_monitor};
 
 /// Default sidebar width in pixels, matching the product sketch.
-const SIDEBAR_WIDTH: f32 = 248.0;
+const SIDEBAR_WIDTH: f32 = 220.0;
 /// Sidebar drag limits in pixels.
 const SIDEBAR_MIN_WIDTH: f32 = 200.0;
 /// Sidebar drag limits in pixels.
-const SIDEBAR_MAX_WIDTH: f32 = 360.0;
+const SIDEBAR_MAX_WIDTH: f32 = 300.0;
 /// Disk usage refresh throttle; capacity barely moves at monitor tick rates.
 const STORAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -47,10 +50,13 @@ pub struct MainView {
     table: Entity<TableState<DownloadsDelegate>>,
     /// Last-seen monitor snapshot; compared to skip no-op refreshes.
     last_snapshot: MonitorState,
+    /// Last-seen queue snapshot; supplies row labels and drop targets.
+    queue_state: Vec<QueueSnapshot>,
     /// Unfiltered presentation rows rebuilt on every snapshot change.
     cache: Vec<DownloadRow>,
     category: CategoryFilter,
     status: StatusFilter,
+    selected_queue: Option<QueueId>,
     query: String,
     /// Visible index of the selected row, if any.
     selected: Option<usize>,
@@ -99,6 +105,10 @@ impl MainView {
         ];
 
         let monitor = handles.monitor.clone();
+        // Seed once so the first paint already labels queue members; the poll
+        // loop refreshes it on every snapshot change.
+        let initial_queues = handles.queues.state();
+        let queue_handle = handles.queues.clone();
         let poll_tray = tray.clone();
         cx.spawn(async move |weak, cx| {
             loop {
@@ -112,8 +122,12 @@ impl MainView {
                     continue;
                 }
                 let snapshot = monitor.state();
+                let queues = queue_handle.state();
                 let alive = weak
-                    .update(cx, |view, cx| view.apply_snapshot(snapshot, cx))
+                    .update(cx, |view, cx| {
+                        view.apply_queue_state(queues);
+                        view.apply_snapshot(snapshot, cx)
+                    })
                     .is_ok();
                 if !alive {
                     break;
@@ -129,9 +143,11 @@ impl MainView {
             search,
             table,
             last_snapshot: MonitorState::default(),
+            queue_state: initial_queues,
             cache: Vec::new(),
             category: CategoryFilter::All,
             status: StatusFilter::All,
+            selected_queue: None,
             query: String::new(),
             selected: None,
             loaded: false,
@@ -162,10 +178,37 @@ impl MainView {
             .chain(snapshot.completed.values())
             .collect();
         views.sort_by_key(|view| view.created_at);
+        let labels = self.queue_labels();
         self.cache = build_rows(views, now);
+        for row in &mut self.cache {
+            row.queue_name = labels.get(&row.id).cloned();
+        }
         self.last_snapshot = snapshot;
         self.loaded = true;
         self.recompute(cx);
+    }
+
+    /// Stores the latest queue snapshot and relabels rows when it changed.
+    fn apply_queue_state(&mut self, queues: Vec<QueueSnapshot>) {
+        if queues == self.queue_state {
+            return;
+        }
+        self.queue_state = queues;
+        let labels = self.queue_labels();
+        for row in &mut self.cache {
+            row.queue_name = labels.get(&row.id).cloned();
+        }
+    }
+
+    /// Maps download id to owning queue name for the current snapshot.
+    fn queue_labels(&self) -> HashMap<DownloadId, String> {
+        let mut labels = std::collections::HashMap::new();
+        for snapshot in &self.queue_state {
+            for id in &snapshot.items {
+                labels.insert(*id, snapshot.queue.name.clone());
+            }
+        }
+        labels
     }
 
     /// Refreshes detected disk usage at most every [`STORAGE_REFRESH_INTERVAL`].
@@ -194,7 +237,16 @@ impl MainView {
             .selected
             .and_then(|ix| self.table.read(cx).delegate().row(ix))
             .map(|row| row.id);
-        let filtered = filter_rows(&self.cache, self.category, self.status, &self.query);
+        let mut filtered = filter_rows(&self.cache, self.category, self.status, &self.query);
+        if let Some(queue_id) = self.selected_queue {
+            if let Some(snapshot) = self.queue_state.iter().find(|s| s.queue.id == queue_id) {
+                let member_ids: std::collections::HashSet<_> =
+                    snapshot.items.iter().copied().collect();
+                filtered.retain(|row| member_ids.contains(&row.id));
+            } else {
+                filtered.clear();
+            }
+        }
         self.visible_count = filtered.len();
         self.active_count = self.cache.iter().filter(|row| row.is_active).count();
         self.total_speed_bps = self.cache.iter().map(|row| row.speed_bps).sum();
@@ -310,6 +362,22 @@ impl MainView {
     ) {
         self.status = status;
         self.category = category;
+        self.selected_queue = None;
+        self.selected = None;
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().clear_selection();
+            table.clear_selection(cx);
+        });
+        self.recompute(cx);
+    }
+
+    /// Filters downloads by queue membership or toggles back to all downloads.
+    fn select_queue(&mut self, queue_id: Option<QueueId>, cx: &mut Context<Self>) {
+        if self.selected_queue == queue_id {
+            self.selected_queue = None;
+        } else {
+            self.selected_queue = queue_id;
+        }
         self.selected = None;
         self.table.update(cx, |table, cx| {
             table.delegate_mut().clear_selection();
@@ -420,6 +488,11 @@ impl MainView {
     }
 
     fn header_title(&self) -> String {
+        if let Some(queue_id) = self.selected_queue
+            && let Some(snapshot) = self.queue_state.iter().find(|s| s.queue.id == queue_id)
+        {
+            return format!("Queue: {}", snapshot.queue.name);
+        }
         match (self.category, self.status) {
             (CategoryFilter::All, StatusFilter::All) => "Recent".to_owned(),
             (category, StatusFilter::All) => category.label().to_owned(),
@@ -485,21 +558,21 @@ impl MainView {
             )
     }
 
-    /// Renders the sidebar as a `Sidebar` of collapsible filter dropdowns.
-    ///
-    /// `All`, `Finished`, and `Unfinished` are dropdown parents whose children
-    /// are the file categories scoped to that status, matching the sketch:
-    /// selecting `Finished → Videos` shows finished videos only.
+    /// Renders the sidebar with collapsible filter dropdowns and a dedicated
+    /// Queues section.
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (status, category) = (self.status, self.category);
+        let filter = ActiveSidebarFilter {
+            status: self.status,
+            category: self.category,
+            queue: self.selected_queue,
+        };
         let menu = SidebarMenu::new()
             .child(filter_parent(
                 "All",
                 IconName::Folder,
                 StatusFilter::All,
                 true,
-                status,
-                category,
+                filter,
                 cx,
             ))
             .child(filter_parent(
@@ -507,8 +580,7 @@ impl MainView {
                 IconName::CircleCheck,
                 StatusFilter::Finished,
                 false,
-                status,
-                category,
+                filter,
                 cx,
             ))
             .child(filter_parent(
@@ -516,12 +588,21 @@ impl MainView {
                 IconName::Loader,
                 StatusFilter::Unfinished,
                 false,
-                status,
-                category,
+                filter,
                 cx,
             ));
+
+        let queue_section = QueueSection {
+            queues: self.queue_state.clone(),
+            selected_queue: self.selected_queue,
+            handles: self.handles.clone(),
+            view: cx.entity(),
+            collapsed: false,
+        };
+
         Sidebar::new("main-sidebar")
             .w_full()
+            .collapsible(false)
             .header(
                 Button::new("new-download")
                     .primary()
@@ -533,7 +614,8 @@ impl MainView {
                         this.open_add_window(cx);
                     })),
             )
-            .child(menu)
+            .child(MainSidebarSection::Menu(Box::new(menu)))
+            .child(MainSidebarSection::Queues(Box::new(queue_section)))
             .footer(self.render_storage(cx))
     }
 
@@ -752,36 +834,281 @@ impl Render for MainView {
     }
 }
 
+/// Active sidebar filter state passed to menu builders.
+#[derive(Clone, Copy)]
+struct ActiveSidebarFilter {
+    status: StatusFilter,
+    category: CategoryFilter,
+    queue: Option<QueueId>,
+}
+
 /// Builds one sidebar filter dropdown: a status parent with the file
 /// categories scoped to that status as children.
 ///
-/// Parent clicks select the whole status; child clicks select one category
-/// within it. Chevron toggles collapse without changing the filter.
+/// Parent clicks select the whole status and toggle dropdown expansion;
+/// child clicks select one category within it. Chevron also toggles
+/// collapse without changing the filter.
 fn filter_parent(
     label: &'static str,
     icon: IconName,
     status: StatusFilter,
     open: bool,
-    current_status: StatusFilter,
-    current_category: CategoryFilter,
+    filter: ActiveSidebarFilter,
     cx: &mut Context<MainView>,
 ) -> SidebarMenuItem {
+    let is_parent_active = filter.status == status
+        && matches!(filter.category, CategoryFilter::All)
+        && filter.queue.is_none();
+
+    let parent_text_color = if is_parent_active {
+        cx.theme().sidebar_accent_foreground
+    } else {
+        cx.theme().sidebar_foreground
+    };
+
     SidebarMenuItem::new(label)
-        .icon(icon)
-        .active(current_status == status && matches!(current_category, CategoryFilter::All))
+        .icon(Icon::new(icon).text_color(parent_text_color))
+        .label_style(StyleRefinement::default().text_color(parent_text_color))
+        .active(is_parent_active)
+        .text_color(parent_text_color)
         .default_open(open)
+        .click_to_toggle(true)
         .on_click(cx.listener(move |this, _, _, cx| {
             this.set_filter(status, CategoryFilter::All, cx);
         }))
         .children(FileCategory::all().map(|item| {
+            let is_child_active = filter.status == status
+                && filter.queue.is_none()
+                && matches!(
+                    filter.category,
+                    CategoryFilter::Category(current) if current == item
+                );
+
+            let child_text_color = if is_child_active {
+                cx.theme().sidebar_accent_foreground
+            } else {
+                cx.theme().sidebar_foreground
+            };
+
             SidebarMenuItem::new(item.label())
-                .icon(category_icon(item))
-                .active(
-                    current_status == status
-                        && matches!(current_category, CategoryFilter::Category(current) if current == item),
-                )
+                .icon(Icon::new(category_icon(item)).text_color(child_text_color))
+                .label_style(StyleRefinement::default().text_color(child_text_color))
+                .active(is_child_active)
+                .text_color(child_text_color)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.set_filter(status, CategoryFilter::Category(item), cx);
                 }))
         }))
+}
+
+/// Top-level section items rendered in the main navigation sidebar.
+#[derive(Clone)]
+enum MainSidebarSection {
+    Menu(Box<SidebarMenu>),
+    Queues(Box<QueueSection>),
+}
+
+impl Collapsible for MainSidebarSection {
+    fn is_collapsed(&self) -> bool {
+        match self {
+            Self::Menu(menu) => menu.is_collapsed(),
+            Self::Queues(queues) => queues.is_collapsed(),
+        }
+    }
+
+    fn collapsed(self, collapsed: bool) -> Self {
+        match self {
+            Self::Menu(menu) => Self::Menu(Box::new(menu.collapsed(collapsed))),
+            Self::Queues(queues) => Self::Queues(Box::new(queues.collapsed(collapsed))),
+        }
+    }
+}
+
+impl SidebarItem for MainSidebarSection {
+    fn render(
+        self,
+        id: impl Into<ElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        let id = id.into();
+        match self {
+            Self::Menu(menu) => menu.render(id, window, cx).into_any_element(),
+            Self::Queues(queues) => queues.render(id, window, cx).into_any_element(),
+        }
+    }
+}
+
+/// Dedicated sidebar section for managing and filtering download queues.
+#[derive(Clone)]
+struct QueueSection {
+    queues: Vec<QueueSnapshot>,
+    selected_queue: Option<QueueId>,
+    handles: EngineHandles,
+    view: Entity<MainView>,
+    collapsed: bool,
+}
+
+impl Collapsible for QueueSection {
+    fn is_collapsed(&self) -> bool {
+        self.collapsed
+    }
+
+    fn collapsed(mut self, collapsed: bool) -> Self {
+        self.collapsed = collapsed;
+        self
+    }
+}
+
+impl SidebarItem for QueueSection {
+    fn render(
+        self,
+        id: impl Into<ElementId>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        let id = id.into();
+        let is_collapsed = self.collapsed;
+
+        v_flex()
+            .id(id)
+            .w_full()
+            .gap_1()
+            .pt_2()
+            .when(!is_collapsed, |this| {
+                this.child(
+                    h_flex()
+                        .px_2()
+                        .h_6()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(cx.theme().sidebar_foreground.opacity(0.6))
+                                .child("QUEUES"),
+                        ),
+                )
+            })
+            .when(self.queues.is_empty(), |this| {
+                this.when(!is_collapsed, |this| {
+                    this.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("No queues"),
+                    )
+                })
+            })
+            .children(self.queues.into_iter().map(|snapshot| {
+                let queue_id = snapshot.queue.id;
+                let count = snapshot.items.len();
+                let running = snapshot.active;
+                let is_active = self.selected_queue == Some(queue_id);
+                let name = snapshot.queue.name;
+                let handles = self.handles.clone();
+                let view = self.view.clone();
+
+                let text_color = if is_active {
+                    cx.theme().sidebar_accent_foreground
+                } else {
+                    cx.theme().sidebar_foreground
+                };
+
+                let count_badge_bg = if is_active {
+                    cx.theme().sidebar_accent_foreground.opacity(0.15)
+                } else {
+                    cx.theme().muted.opacity(0.8)
+                };
+
+                let item_id = ElementId::NamedInteger("queue-item".into(), queue_id.get() as u64);
+
+                h_flex()
+                    .id(item_id)
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_2()
+                    .py_1p5()
+                    .rounded(cx.theme().radius)
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(is_active, |this| {
+                        this.font_weight(FontWeight::MEDIUM)
+                            .bg(cx.theme().tokens.sidebar_accent)
+                            .text_color(cx.theme().sidebar_accent_foreground)
+                    })
+                    .when(!is_active, |this| {
+                        this.text_color(cx.theme().sidebar_foreground)
+                            .hover(|this| {
+                                this.bg(cx.theme().sidebar_accent.opacity(0.8))
+                                    .text_color(cx.theme().sidebar_accent_foreground)
+                            })
+                    })
+                    .when(is_collapsed, |this| {
+                        this.justify_center().child(
+                            Icon::new(IconName::Menu)
+                                .size_4()
+                                .text_color(text_color),
+                        )
+                    })
+                    .when(!is_collapsed, |this| {
+                        this.child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .overflow_hidden()
+                                .child(
+                                    Icon::new(IconName::Menu)
+                                        .size_4()
+                                        .text_color(text_color),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_sm()
+                                        .child(name),
+                                )
+                                .when(running, |this| {
+                                    this.child(
+                                        div()
+                                            .size_1p5()
+                                            .rounded_full()
+                                            .bg(cx.theme().accent),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded(px(4.))
+                                .bg(count_badge_bg)
+                                .text_xs()
+                                .text_color(if is_active {
+                                    cx.theme().sidebar_accent_foreground
+                                } else {
+                                    cx.theme().muted_foreground
+                                })
+                                .child(format!("{count}")),
+                        )
+                    })
+                    .on_click(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                        view.update(cx, |this, cx| {
+                            this.select_queue(Some(queue_id), cx);
+                        });
+                    })
+                    .can_drop(|payload, _, _| payload.is::<crate::downloads::QueueDrag>())
+                    .on_drop(move |drag: &crate::downloads::QueueDrag, _, _| {
+                        handles.dispatch(EngineCommand::MoveToQueue {
+                            queue_id,
+                            downloads: drag.downloads.clone(),
+                        });
+                    })
+            }))
+    }
 }

@@ -17,6 +17,42 @@ use crate::format::{
     format_bytes, format_eta, format_relative_time, format_speed, progress_percent,
 };
 
+/// Payload carried while dragging table rows onto a queue.
+///
+/// The drag carries ids, never engine state: the drop handler sends one queue
+/// command, so the UI cannot mutate admission bookkeeping directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueDrag {
+    /// Downloads being dragged, in selection order.
+    pub downloads: Vec<DownloadId>,
+}
+
+/// Floating label shown while dragging rows toward a queue.
+pub struct QueueDragPreview {
+    label: String,
+}
+
+impl QueueDragPreview {
+    /// Creates a preview carrying the drag summary text.
+    #[must_use]
+    pub fn new(label: String) -> Self {
+        Self { label }
+    }
+}
+
+impl Render for QueueDragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_1()
+            .rounded(px(8.))
+            .bg(cx.theme().accent)
+            .text_color(cx.theme().accent_foreground)
+            .text_sm()
+            .child(self.label.clone())
+    }
+}
+
 /// Poll interval for monitor snapshots on the GPUI thread.
 pub const MONITOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -78,6 +114,8 @@ pub struct DownloadRow {
     pub eta_seconds: Option<u64>,
     /// ETA cell text (empty when unknown).
     pub eta_label: String,
+    /// Queue holding this download, when it is a queue member.
+    pub queue_name: Option<String>,
     /// Creation timestamp in Unix milliseconds.
     pub created_at: i64,
     /// Date-added cell text.
@@ -124,6 +162,8 @@ impl DownloadRow {
             speed_label: format_speed(view.speed.get()),
             eta_seconds: view.eta_seconds,
             eta_label: format_eta(view.eta_seconds),
+            // Filled by the view, which owns the queue snapshot.
+            queue_name: None,
             created_at: view.created_at,
             added_label: format_relative_time(now_ms, view.created_at),
         }
@@ -332,6 +372,17 @@ fn directed(ordering: std::cmp::Ordering, descending: bool) -> std::cmp::Orderin
         ordering.reverse()
     } else {
         ordering
+    }
+}
+
+/// Subtitle for the name cell: the owning queue when the row is a member.
+///
+/// A queued row that belongs to an inactive queue looks stuck otherwise, so the
+/// queue name takes precedence over the file category.
+fn queue_subtitle(row: &DownloadRow) -> String {
+    match &row.queue_name {
+        Some(queue) => queue.clone(),
+        None => row.category.label().to_owned(),
     }
 }
 
@@ -866,6 +917,29 @@ impl TableDelegate for DownloadsDelegate {
             .overflow_hidden();
 
         if let Some(id) = id {
+            let drag_ids = {
+                let checked = self.checked_ids();
+                if checked.contains(&id) {
+                    checked
+                } else {
+                    vec![id]
+                }
+            };
+            row_el = row_el.on_drag(
+                QueueDrag {
+                    downloads: drag_ids,
+                },
+                move |drag: &QueueDrag, _offset, _window, cx| {
+                    let label = match drag.downloads.len() {
+                        0 => "Move".to_owned(),
+                        1 => "1 download".to_owned(),
+                        count => format!("{count} downloads"),
+                    };
+                    // The preview is a fresh entity per drag; keeping it
+                    // state-free avoids leaking a view into the table.
+                    cx.new(|_| QueueDragPreview::new(label.clone()))
+                },
+            );
             row_el = row_el.on_click(move |event: &ClickEvent, _: &mut Window, cx: &mut App| {
                 table.update(cx, |table, cx| {
                     table.delegate_mut().select_row(id);
@@ -944,7 +1018,7 @@ impl TableDelegate for DownloadsDelegate {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(row.category.label().to_owned()),
+                                    .child(queue_subtitle(row)),
                             ),
                     )
                     .into_any_element()
@@ -1149,8 +1223,8 @@ mod tests {
     use raijin_core::monitor::DownloadView;
 
     use super::{
-        ColumnDef, DownloadRow, RowChecklist, SortColumn, SortDir, build_rows, can_pause,
-        can_resume, filter_rows, next_sort, sort_rows, toolbar_actions,
+        ColumnDef, DownloadRow, QueueDrag, RowChecklist, SortColumn, SortDir, build_rows,
+        can_pause, can_resume, filter_rows, next_sort, queue_subtitle, sort_rows, toolbar_actions,
     };
     use crate::category::{CategoryFilter, FileCategory, StatusFilter};
     use crate::format::format_bytes;
@@ -1207,6 +1281,34 @@ mod tests {
         assert_eq!(row.status_label, "Error (changed file)");
         assert_eq!(row.progress, None);
         assert_eq!(row.size_label, format_bytes(10));
+    }
+
+    #[test]
+    fn queue_member_row_should_show_its_queue_instead_of_the_category() {
+        let now = 1_700_000_000_000;
+        let mut row = DownloadRow::from_view(&view(1, DownloadStatus::Queued, 0, None, now), now);
+        assert_eq!(
+            queue_subtitle(&row),
+            row.category.label(),
+            "a non-member keeps the file category"
+        );
+
+        row.queue_name = Some("Night".to_owned());
+        assert_eq!(
+            queue_subtitle(&row),
+            "Night",
+            "the queue explains why a queued row is waiting"
+        );
+    }
+
+    #[test]
+    fn drag_payload_should_carry_the_checked_set_for_multi_move() {
+        let drag = QueueDrag {
+            downloads: vec![DownloadId::new(3), DownloadId::new(1)],
+        };
+
+        assert_eq!(drag.downloads.len(), 2);
+        assert_eq!(drag.clone(), drag);
     }
 
     #[test]

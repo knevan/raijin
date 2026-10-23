@@ -101,13 +101,32 @@ pub enum DownloadCommand {
     List {
         reply: oneshot::Sender<DownloadManagerResult<Vec<DownloadItem>>>,
     },
+    /// List downloads that currently have a live worker.
+    ///
+    /// Queue admission uses this instead of persisted status: a status can be
+    /// stale after a crash, while a live job cannot.
+    ListActive {
+        reply: oneshot::Sender<DownloadManagerResult<Vec<DownloadId>>>,
+    },
     /// Pause a download skeleton.
     Pause {
         id: DownloadId,
         reply: oneshot::Sender<DownloadManagerResult<DownloadItem>>,
     },
-    /// Resume a download skeleton.
+    /// Mark a download ready for execution without starting it.
+    ///
+    /// Queue admission is the only caller of [`DownloadCommand::Start`], so
+    /// this never spawns a worker on its own.
     Resume {
+        id: DownloadId,
+        reply: oneshot::Sender<DownloadManagerResult<DownloadItem>>,
+    },
+    /// Start the worker for a download that is already `Queued`.
+    ///
+    /// Issued by queue admission. Starting a download that is not `Queued`
+    /// still spawns the job: the queue owns the decision, the engine owns the
+    /// execution.
+    Start {
         id: DownloadId,
         reply: oneshot::Sender<DownloadManagerResult<DownloadItem>>,
     },
@@ -276,6 +295,22 @@ impl DownloadManagerHandle {
             .map_err(|_| DownloadManagerError::ResponseDropped)?
     }
 
+    /// Lists downloads that currently have a live worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manager stops.
+    pub async fn list_active(&self) -> DownloadManagerResult<Vec<DownloadId>> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(DownloadCommand::ListActive { reply })
+            .await
+            .map_err(|_| DownloadManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| DownloadManagerError::ResponseDropped)?
+    }
+
     /// Pauses a download skeleton.
     ///
     /// # Errors
@@ -292,7 +327,11 @@ impl DownloadManagerHandle {
             .map_err(|_| DownloadManagerError::ResponseDropped)?
     }
 
-    /// Resumes a download skeleton.
+    /// Marks a download `Queued` without starting a worker.
+    ///
+    /// Queue admission turns a `Queued` download into a running job through
+    /// [`DownloadManagerHandle::start`], so a resume request alone must never
+    /// bypass concurrency limits.
     ///
     /// # Errors
     ///
@@ -301,6 +340,22 @@ impl DownloadManagerHandle {
         let (reply, receiver) = oneshot::channel();
         self.commands
             .send(DownloadCommand::Resume { id, reply })
+            .await
+            .map_err(|_| DownloadManagerError::Stopped)?;
+        receiver
+            .await
+            .map_err(|_| DownloadManagerError::ResponseDropped)?
+    }
+
+    /// Starts the worker for a `Queued` download.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the download does not exist or persistence fails.
+    pub async fn start(&self, id: DownloadId) -> DownloadManagerResult<DownloadItem> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(DownloadCommand::Start { id, reply })
             .await
             .map_err(|_| DownloadManagerError::Stopped)?;
         receiver
@@ -474,13 +529,17 @@ impl DownloadManager {
 
     async fn boot(&mut self) -> DownloadManagerResult<()> {
         let stored = self.repository.list().await?;
-        let visible: Vec<DownloadItem> = stored
+        let mut visible: Vec<DownloadItem> = stored
             .into_iter()
             .filter(|item| item.status != DownloadStatus::Removed)
             .collect();
-        for item in &visible {
-            if should_start_on_boot(item.status) {
-                self.start_job(item.clone());
+        // A row persisted as running cannot be running after a restart: no job
+        // survived, so normalize it back to `Queued` and let queue admission
+        // pick it up. Starting here would ignore concurrency limits.
+        for item in &mut visible {
+            if should_requeue_on_boot(item.status) {
+                item.status = DownloadStatus::Queued;
+                self.repository.update(item).await?;
             }
         }
         self.publish(DownloadEvent::BootLoaded { downloads: visible });
@@ -498,6 +557,12 @@ impl DownloadManager {
                 send_reply(reply, self.repository.list().await.map_err(Into::into));
                 Ok(false)
             }
+            DownloadCommand::ListActive { reply } => {
+                let mut ids: Vec<DownloadId> = self.active_jobs.keys().copied().collect();
+                ids.sort_unstable();
+                send_reply(reply, Ok(ids));
+                Ok(false)
+            }
             DownloadCommand::Pause { id, reply } => {
                 let result = self.pause_download(id).await;
                 send_reply(reply, result);
@@ -505,6 +570,11 @@ impl DownloadManager {
             }
             DownloadCommand::Resume { id, reply } => {
                 let result = self.resume_download(id).await;
+                send_reply(reply, result);
+                Ok(false)
+            }
+            DownloadCommand::Start { id, reply } => {
+                let result = self.start_download(id).await;
                 send_reply(reply, result);
                 Ok(false)
             }
@@ -600,6 +670,17 @@ impl DownloadManager {
         self.repository.update(&item).await?;
 
         self.publish(DownloadEvent::DownloadResumed { item: item.clone() });
+        Ok(item)
+    }
+
+    async fn start_download(&mut self, id: DownloadId) -> DownloadManagerResult<DownloadItem> {
+        let mut item = self.item_for_update(id).await?;
+        if item.status != DownloadStatus::Queued {
+            item.status = DownloadStatus::Queued;
+            item.updated_at = now_ms()?;
+            self.repository.update(&item).await?;
+            self.publish(DownloadEvent::DownloadResumed { item: item.clone() });
+        }
         self.start_job(item.clone());
         Ok(item)
     }
@@ -626,6 +707,7 @@ impl DownloadManager {
 
         // Drop stale validators so the next run skips resume validation
         // (`probe` only validates when partial bytes exist) and re-probes fresh.
+        // The row is only re-queued here; admission decides when it runs.
         item.status = DownloadStatus::Queued;
         item.total_bytes = None;
         item.downloaded_bytes = Bytes::ZERO;
@@ -638,7 +720,6 @@ impl DownloadManager {
         self.repository.update(&item).await?;
 
         self.publish(DownloadEvent::DownloadChanged { item: item.clone() });
-        self.start_job(item.clone());
         Ok(item)
     }
 
@@ -678,11 +759,7 @@ impl DownloadManager {
             self.publish(DownloadEvent::DownloadResumed { item: item.clone() });
             resumed.push(item);
         }
-        // Start jobs after the scan so a slow spawn never interleaves with
-        // the repository pass above.
-        for item in &resumed {
-            self.start_job(item.clone());
-        }
+        // No start: queue admission owns when a `Queued` row runs.
         Ok(resumed)
     }
 
@@ -996,13 +1073,11 @@ fn is_active_status(status: DownloadStatus) -> bool {
     )
 }
 
-fn should_start_on_boot(status: DownloadStatus) -> bool {
+/// True for statuses a killed process could not have left behind.
+fn should_requeue_on_boot(status: DownloadStatus) -> bool {
     matches!(
         status,
-        DownloadStatus::Queued
-            | DownloadStatus::Downloading
-            | DownloadStatus::Retrying
-            | DownloadStatus::PreparingFile
+        DownloadStatus::Downloading | DownloadStatus::Retrying | DownloadStatus::PreparingFile
     )
 }
 
@@ -1107,6 +1182,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn boot_should_requeue_rows_that_claimed_to_be_running() -> DownloadManagerResult<()> {
+        let db = test_db().await?;
+        let running = sample_item(DownloadId::new(1), DownloadStatus::Downloading);
+        let retrying = sample_item(DownloadId::new(2), DownloadStatus::Retrying);
+        let queued = sample_item(DownloadId::new(3), DownloadStatus::Queued);
+        db.repository.add(&running).await?;
+        db.repository.add(&retrying).await?;
+        db.repository.add(&queued).await?;
+        let (handle, task, mut events) = DownloadManagerHandle::spawn_with_events(
+            db.repository.clone(),
+            db.part_repository,
+            DownloadManagerOptions {
+                command_buffer: 8,
+                event_buffer: 8,
+            },
+        );
+
+        let event = events
+            .recv()
+            .await
+            .map_err(|_| DownloadManagerError::Stopped)?;
+        let DownloadEvent::BootLoaded { downloads } = event else {
+            return Err(DownloadManagerError::Stopped);
+        };
+
+        assert!(
+            downloads
+                .iter()
+                .all(|item| item.status == DownloadStatus::Queued),
+            "boot must normalize crash-survivor statuses: {downloads:?}"
+        );
+        assert_eq!(
+            db.repository.get(running.id).await?.map(|item| item.status),
+            Some(DownloadStatus::Queued),
+            "normalization must be persisted, not only published"
+        );
+        stop_manager(&handle, task).await
+    }
+
+    #[tokio::test]
     async fn command_channel_should_apply_backpressure() -> DownloadManagerResult<()> {
         let (sender, mut receiver) = mpsc::channel::<DownloadCommand>(1);
         let (reply_a, _rx_a) = oneshot::channel();
@@ -1146,11 +1261,48 @@ mod tests {
 
         let paused = handle.pause(added.id).await?;
         let resumed = handle.resume(added.id).await?;
+        let started = handle.start(added.id).await?;
         let removed = handle.remove(added.id).await?;
 
         assert_eq!(paused.status, DownloadStatus::Paused);
         assert_eq!(resumed.status, DownloadStatus::Queued);
+        assert_eq!(started.status, DownloadStatus::Queued);
         assert!(removed);
+        stop_manager(&handle, task).await
+    }
+
+    #[tokio::test]
+    async fn resume_should_not_spawn_a_job_until_start_is_requested() -> DownloadManagerResult<()> {
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()
+            .map_err(sqlx::Error::Io)
+            .map_err(DbError::from)?;
+        let (handle, task) = DownloadManagerHandle::spawn(
+            db.repository.clone(),
+            db.part_repository,
+            DownloadManagerOptions {
+                command_buffer: 8,
+                event_buffer: 16,
+            },
+        );
+        let added = handle
+            .add(NewDownload::http(
+                "https://127.0.0.1:1/never.bin",
+                "never.bin",
+                folder.path().to_path_buf(),
+            ))
+            .await?;
+
+        handle.resume(added.id).await?;
+        // Give a wrongly spawned job time to fail against the dead URL.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let listed = handle.list().await?;
+
+        assert_eq!(
+            listed.first().map(|item| item.status),
+            Some(DownloadStatus::Queued),
+            "resume alone must leave the row queued for admission"
+        );
         stop_manager(&handle, task).await
     }
 

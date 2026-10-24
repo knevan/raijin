@@ -411,7 +411,10 @@ impl SettingsView {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Starts Raijin minimized in the tray when you log in."),
+                            .child(
+                                "Starts Raijin when you log in: straight to the tray while \
+                                 Close to tray is on, otherwise the main window opens.",
+                            ),
                     ),
             )
     }
@@ -481,7 +484,7 @@ pub(crate) fn apply_autostart(settings: &DesktopSettings) -> Result<(), String> 
     let manager = raijin_core::platform::autostart::system_autostart_manager(
         "Raijin",
         &exe,
-        &["--minimized".to_owned()],
+        &["--startup".to_owned()],
     );
     if manager.is_enabled() == settings.launch_at_startup {
         return Ok(());
@@ -497,6 +500,9 @@ pub(crate) fn apply_autostart(settings: &DesktopSettings) -> Result<(), String> 
                      security policy for the Run key, then toggle again."
                 )
             }
+            // Surfaced verbatim next to the switch: the build-output guard is
+            // the reason a dev run cannot register itself, and the user needs
+            // to know the setting was reverted rather than silently dropped.
             other => format!("autostart toggle failed: {other}"),
         })
 }
@@ -571,5 +577,31 @@ mod tests {
         // What the General section does after the switch flips.
         session.set_behavior(TrayBehavior::new(false, false));
         assert_eq!(session.close_requested(false), CloseDecision::RemoveWindow);
+    }
+
+    /// Regression: enabling the switch from a `cargo run` used to write
+    /// `target\\debug\\raijin.exe` into the Run key and keep it there.
+    #[test]
+    fn autostart_should_refuse_a_build_output_exe() {
+        let exe = std::env::current_exe().expect("test binary path must resolve");
+        assert!(
+            raijin_core::platform::autostart::is_build_output_path(&exe),
+            "test binaries live under target/: {exe:?}"
+        );
+        let manager = raijin_core::platform::autostart::system_autostart_manager(
+            "RaijinAutostartGuardTest",
+            &exe,
+            &["--startup".to_owned()],
+        );
+        let error = manager
+            .set_enabled(true)
+            .expect_err("build output must be rejected");
+        assert!(
+            matches!(
+                error,
+                raijin_core::platform::autostart::AutostartError::BuildOutputPath(_)
+            ),
+            "unexpected error: {error}"
+        );
     }
 }

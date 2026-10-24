@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 #![deny(
     clippy::panic,
     clippy::panicking_unwrap,
@@ -35,7 +36,10 @@ use crate::bridge::{EngineCommand, EngineHandles};
 use crate::integration_bridge::Started;
 use crate::main_view::MainView;
 use crate::settings::{SettingsHandles, apply_autostart, open_settings_window};
-use crate::tray::{OsCloseOutcome, TraySession, parse_add_url, parse_start_minimized};
+use crate::tray::{
+    OsCloseOutcome, TraySession, parse_add_url, parse_start_from_autostart, parse_start_minimized,
+    start_windowless,
+};
 
 gpui_kit::actions!(
     tray,
@@ -52,9 +56,13 @@ gpui_kit::actions!(
 );
 
 fn main() {
-    raijin_core::init_tracing();
+    // The GUI binary has no console (GUI subsystem), so routine logging goes
+    // to a file in debug builds and every crash goes to `crash.log`.
+    raijin_core::logging::install_panic_hook();
+    raijin_core::logging::init_app_tracing();
     let args: Vec<String> = std::env::args().collect();
     let start_minimized = parse_start_minimized(args.iter().cloned());
+    let start_from_autostart = parse_start_from_autostart(args.iter().cloned());
     // Standalone Add Download entry (browser-extension catch without the
     // main table): only the engine + tray icon boot, never `MainView`.
     let add_url = parse_add_url(args.iter().cloned());
@@ -64,13 +72,19 @@ fn main() {
         .thread_name("raijin-engine")
         .build()
         .unwrap_or_else(|error| {
-            eprintln!("failed to start engine runtime: {error}");
+            eprintln!(
+                "{}",
+                raijin_core::logging::record_fatal("failed to start engine runtime", error)
+            );
             std::process::exit(1);
         });
     let (handles, tray, integration, settings) = runtime
         .block_on(bootstrap_engine())
         .unwrap_or_else(|error| {
-            eprintln!("failed to bootstrap engine: {error}");
+            eprintln!(
+                "{}",
+                raijin_core::logging::record_fatal("failed to bootstrap engine", error)
+            );
             std::process::exit(1);
         });
     // `run` blocks until explicit quit, so the local runtime stays alive for
@@ -96,6 +110,7 @@ fn main() {
                 minimize_to_tray = behavior.minimize_to_tray,
                 close_to_tray = behavior.close_to_tray,
                 start_minimized,
+                start_from_autostart,
                 "raijin starting"
             );
             // OS quit requests (dock, taskbar, session end) must stand the
@@ -160,9 +175,16 @@ fn main() {
                     }),
                 );
             }
-            // A degraded (icon-less) start must never go windowless, even
-            // with `--minimized`: there would be no way to restore or quit.
-            let windowless_start = start_minimized && native_tray.is_some();
+            // A windowless start needs a live tray icon; without one there
+            // would be no way to restore or quit. `--startup` (autostart)
+            // additionally defers to `close_to_tray`: with the close button
+            // set to quit, login opens the main window instead of hiding.
+            let windowless_start = start_windowless(
+                start_minimized,
+                start_from_autostart,
+                tray.behavior().close_to_tray,
+                native_tray.is_some(),
+            );
             if let Some(icon) = native_tray {
                 tray.set_tray_icon_live();
                 spawn_tray_sync(cx, icon, tray.clone());

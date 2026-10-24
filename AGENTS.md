@@ -1,240 +1,112 @@
-# Raijin Agent Rulebook
+# raijin
 
-## Project Direction
+Native, multi-platform desktop download manager in Rust inspired by AB Download Manager (ABDM).
 
-Raijin is a Rust desktop download manager inspired by AB Download Manager.
+Key architectural invariants:
 
-Primary architecture:
-
-- Native HTTP download engine first.
-- Aria2 only as optional future adapter behind engine trait.
-- Queue system separate from download engine (ON HOLD — see Queue Rules).
+- Native HTTP download engine first (dynamic multi-connection range splitting).
+- Aria2-next only as optional future adapter behind engine trait.
+- Queue system separate from download engine (ON HOLD — see `docs/queue-rules.md`).
 - Monitor/projection layer separate from engine and UI.
-- `gpui-kit` views render projected monitor state and send
-  commands, never mutate engine internals.
-- SQLite is source of durable state.
-- No Freya anywhere in this repo. Old Freya code lives only in the
-  archived `rnd/raijin` reference.
+- `gpui-kit` views render projected monitor state and send commands, never mutate engine internals.
+- SQLite is the sole durable source of truth (WAL mode). No ad-hoc JSON sidecar files.
+- No Freya anywhere in this repo. Old Freya code lives only in the archived `rnd/raijin` reference.
 
-## Required References
+Current phase: **MVP / active development**. Breaking changes during development are fine: to modify a model or schema, edit the migration directly and reset the local database with `sqlx database reset --force`.
 
-Before changing architecture, read `plan.md`.
+---
 
-When implementation conflicts with this file, follow this priority:
+## Where the rest of the rules live
 
-1. Explicit user instruction in current conversation.
-2. `AGENTS.md`.
-3. `plan.md`.
-4. Existing code conventions.
+This file holds only what applies to every task. Detailed rules are split into an `AGENTS.md` per crate, and design decisions/deferred work are recorded in `docs/`. Before touching an area, read its rulebook and relevant documentation:
 
-`plan.md` Section 7 milestones carry a `Source:` line (COPY from old
-`rnd/raijin` vs REFERENCE ABDM vs BUILD NEW). Obey it; do not copy Freya
-UI code under any circumstance.
+| When you… | Read |
+|---|---|
+| read or touch anything under `crates/core/` | `crates/core/AGENTS.md`, then the skills it lists |
+| read or touch anything under `crates/ui/` | `crates/ui/AGENTS.md`, then the skills it lists |
+| touch the download engine, range splitting, or resume validation | `docs/download-engine.md` |
+| add or change a migration, table, or SQLite repository | `docs/database.md` |
+| touch queue scheduling or queue models | `docs/queue-rules.md` |
+| touch the system tray, window minimize/hide, or autostart lifecycle | `docs/tray.md` and `docs/startup-deferred.md` |
+| touch the Settings view, desktop configuration, or deferred settings | `docs/settings-deferred.md` |
+| touch the local API server (`axum`) or browser extension pairing | `docs/api-and-integration.md` |
+| read or touch the browser extension under `browser-extension/` | `docs/api-and-integration.md` |
+| bump `gpui-kit` or touch GPUI versioning | `docs/gpui-upgrade.md` |
+| check roadmap, milestone status, or overall plan | `plan.md` |
+| assess architectural risks, known gaps, or security boundaries | `risk.md` |
 
-## Tools
+---
 
-> [!IMPORTANT]
-> Always use these tools to create migration file:
->   - `sqlx migrate add <migration_filename>` (empty file)
-
-Do not create another migration file in development environment just write directly, because always reset database manually with `sqlx database reset`.
-
-## Skills
-
-> [!IMPORTANT]
-> Always use these skills:
->   - rust-best-practices
->   - rust-skills
->   - rust-async-patterns
->   - gpui-kit
->   - gpui-kit-design-guides
-
-Use Context7 (`gpui-kit` docs) when touching `gpui-kit` views,
-`TableDelegate`, theming, or window lifecycle. There is no Freya skill in
-this repo.
-
-## Workspace Rules
-
-Current layout:
+## Layout
 
 ```text
-Cargo.toml            # workspace
+Cargo.toml            Cargo workspace (members: crates/core, crates/ui)
 crates/
-  core/               # UI-free: config, db, download, queue, monitor,
-                      # integration models, platform paths
-  ui/                 # gpui-kit shell + component views (depends on core)
-  cli/                # optional headless/debug client (depends on core)
+  core/               UI-free: config, db, download, queue, monitor, integration models, platform
+  ui/                 gpui-kit desktop UI: shell, views, bridge, tray
+browser-extension/    wxt-based cross-browser extension (Chromium + Firefox)
+docs/                 Decisions, architectural invariants, and deferred items
+.agents/skills/       Agent skills, pinned in skills-lock.json
+plan.md               Milestone tracking and overall roadmap
+risk.md               Risk registry and gap analysis
 ```
 
-Rules:
+---
 
-- Core must build and test headless: `cargo test -p core`.
-- `core` must never depend on `gpui-kit`, `gpui`, or any window-system
-  crate. The compiler enforces this; do not work around it.
-- `ui` owns all `gpui-kit` code. `cli` owns flags/subcommands.
-- `ui` depends only on `gpui-kit` (single declaration, e.g.
-  `gpui-kit = "0.6"`); never list `gpui` / `gpui-base` / `gpui-component`
-  separately. Import via `gpui_kit::{*, platform, base, component, assets}`.
-- Pin `gpui-kit` (+ tray crate) to an explicit version/commit and commit
-  `Cargo.lock`. Never float `main`.
-- Binary is named `raijin` (lives in `cli`).
+## Rules for every task
 
-## Module Boundaries
+- **Skills on demand**: Load skills (`rust-skills`, `rust-async-patterns`, `rust-best-practices`, `gpui-kit`, `gpui-kit-design-guides`) on demand as needed for the specific task. Do not preload every skill for small changes or targeted fixes to conserve context window.
+- **Skills are reference, not repo rules. Every `AGENTS.md` file overrides every skill, always.** Where a skill disagrees with an `AGENTS.md` file, the `AGENTS.md` file wins and that part of the skill is ignored.
+- **Design decisions belong in `docs/`**: A design choice made with the user — what was chosen, what was rejected, why, and what was deferred — goes in `docs/`, one file per area, with a row in the routing table above. `AGENTS.md` files say what to do; `docs/` says why.
+- **Core stays UI-free**: `crates/core` must never depend on `gpui-kit`, `gpui`, or any windowing crate. It must build and pass tests completely headless (`cargo test -p raijin-core`).
+- **Tokio ↔ GPUI Bridge**: GPUI owns the main thread. Never update an `Entity` directly from a Tokio worker. Forward data via channels through `crates/ui/src/bridge.rs` and apply inside `entity.update(cx, ...)` + `cx.notify()`.
+- **Never hold locks across `.await`**: Never hold `Mutex` or `RwLock` guards across an `.await` boundary.
+- **No unnecessary comments in source**: Clean, self-documenting code. Explanations belong in chat, commit messages, or markdown documentation. Do not leave commented-out code.
+- **Commit convention**: Every commit follows `type(scope): subject` (e.g. `feat(engine): dynamic range split verification`).
+- **Push back on bad design decisions**: If a request violates `gpui-kit-design-guides`, breaks async safety, or bypasses download validation invariants, say so before or alongside the change: explain the problem, suggest the better alternative, and wait for confirmation.
 
-Boundary rules (inside `core`):
+---
 
-- `download/`: engine traits, manager actor, jobs, parts, destination, retry, validation, speed limiting.
-- `queue/`: queue manager, queue model, scheduler, queue commands.
-- `monitor/`: UI-safe projected state, speed meter, event aggregation.
-- `db/`: SQLite models, repositories, migrations, transaction helpers.
-- `integration/`: local API request/response models and server glue, UI-free.
-- `platform/`: filesystem paths, tray abstraction, autostart, and OS actions
-  usable headless where possible.
+## Verification Rules
 
-Boundary rules (inside `ui`):
+- **Targeted testing**: Run only tests directly related to the touched/relevant module or function (the full test can takes long time). Example:
+  ```bash
+  cargo test -p raijin-core <module/filter_name>
+  ```
+- **No thread limits**: Do not restrict test threads (avoid `--test-threads=1` unless a specific test explicitly requires it). Let cargo test run multi-threaded by default for fast execution.
+- **checks & clippy**:
+  - For `crates/core`:
+    ```bash
+    cargo check -p raijin-core
+    cargo clippy --all-targets -p raijin-core -- -D warnings
+    ```
+  - For `crates/ui`:
+    ```bash
+    cargo check -p raijin-ui
+    cargo clippy --all-targets -p raijin-ui -- -D warnings
+    ```
 
-- `shell/`: GPUI `Application` (via `gpui_kit::application()`), window
-  lifecycle, root/titlebar/statusbar. Call `gpui_kit::init(cx)` first
-  inside the `run` closure, before any component use.
-- `views/`: `DataTable` downloads page, dialogs, settings, sidebar.
-- `bridge/`: Tokio channel -> GPUI `Entity` forwarding. The only place that
-  touches both runtimes.
+For `crates/core`:
+```bash
+cargo test -p raijin-core
+cargo clippy --all-targets -p raijin-core -- -D warnings
+```
 
-## Async Rules
+For `crates/ui`:
+```bash
+cargo check -p raijin-ui
+cargo clippy --all-targets -p raijin-ui -- -D warnings
+```
 
-- Use actor-style managers with bounded `mpsc` commands and `oneshot` replies.
-- Use `broadcast` or `watch` for event/state publication.
-- Use `CancellationToken` for pause/cancel/shutdown.
-- Use `JoinSet` or owned task handles for dynamic worker sets.
-- Never hold `Mutex` or `RwLock` guards across `.await`.
-- Prefer message passing over shared mutable state.
-- Do not spawn unbounded tasks; use limits/backpressure.
-- Use Tokio tasks for engine, API server, DB/network workers.
-- GPUI owns the main thread. Never update an `Entity` from a Tokio worker.
-  Pattern: Tokio produces data -> forward via channel -> GPUI foreground
-  task applies via `entity.update(cx, ...)` + `cx.notify()`.
-- Keep tray event handling + essential timers alive in tray mode; suspend
-  table subscriptions, repaints, and animations.
-
-## GPUI Rules
-
-- Views render from projected monitor state and send commands to `core`
-  handles. Never reach into job/part internals.
-- `DataTable` for the main download list (`TableDelegate`, virtual rows,
-  resizable/sortable columns, persisted widths/order).
-- `VirtualList` for variable-height lists (queue sidebar, logs, details).
-- Wrap `gpui-component` widgets (via `gpui_kit::component`) in local
-  components so upstream churn stays behind one boundary.
-- Window lifecycle: prefer hiding/suspending the main window for tray
-  minimize. Reserve `remove_window()` for the real close/Quit path, where
-  Show must rebuild from monitor state + DB.
-- Tray backend is `domenkozar/gpui-tray` behind `platform::tray` trait.
-  Fallback: `Tryanks/gpui-tray`. Never `Yamrc/gpui-tray` (archived, macOS
-  stub). UI code depends on the trait, not the crate.
-
-## Download Engine Rules
-
-- Native HTTP engine is default implementation target.
-- Download item state and part state must persist separately.
-- Persist progress on interval and on pause/completion, not every chunk.
-- Use incomplete destination file and atomic rename on completion.
-- Validate content length, ETag, range support, content range, and content type when resuming.
-- If remote file changed, pause with validation error instead of silently restarting.
-- If range support disappears after ranged state exists, pause and require reset/manual action.
-- If total size unknown or range unsupported, use single blind/non-resumable part.
-- Keep dynamic + in-flight worker-ack splitting with transactional commits
-  and no-gap/no-overlap tests.
-- Keep adaptive connections with manual `preferred_connections` override.
-- Queue logic must not live inside download jobs.
-- UI state must come from monitor/projection, not direct job internals.
-
-## Queue Rules
-
-- Queue/scheduler (M3 in `plan.md`) is ON HOLD until engine (M2), monitor
-  (M4), main UI (M5), packaging (M8), and browser extension (M7) are robust.
-- Until unheld: downloads run directly via the engine, no scheduling. Do not
-  add queue UI (picker, queue pages).
-- When unheld: port old `rnd/raijin` `src/queue/` as-is, then add the typed
-  `QueueSchedule` boundary + scheduler timer per `plan.md` Section 6.
-
-## SQLite Rules
-
-- Use sqlx with SQLite.
-- Enable WAL mode during DB bootstrap.
-- Use transactions for multi-table state changes.
-- Store durable domain state in SQLite, not ad hoc JSON files.
-- `queues.schedule_json` stays a TEXT column (no migration); the API boundary
-  is the typed `QueueSchedule` (strict on write, tolerant on read).
-- Use typed Rust enums/newtypes at boundaries; avoid stringly typed logic outside DB mapping layer.
-- Avoid per-chunk database writes.
-
-## Error Handling Rules
-
-- Use `thiserror` for core/library error enums.
-- Use `anyhow` only at binary/application boundary if needed.
-- No `unwrap()` in production code.
-- `expect()` only for internal invariants that indicate bugs.
-- Preserve source error chains.
-- Persist last error kind/message for downloads that fail.
-
-## Testing Rules
-
-Minimum verification before marking core work done:
-
-- `cargo test -p core`
-- `cargo clippy --all-targets -p core -- -D warnings`
-
-For UI work, also run when feasible:
-
-- `cargo check -p ui`
-- `cargo clippy --all-targets -p ui -- -D warnings`
-
-Tests should cover:
-
-- Range splitting.
-- Resume validation.
-- Duplicate filename strategy.
-- Queue max-concurrent behavior (when M3 is unheld).
-- Speed limiter behavior.
-- Pause/resume persistence with local HTTP test server.
-- Schedule next-start/stop with fake clock (when M3 is unheld).
-
-## API Rules
-
-- Local API binds to localhost by default.
-- Use token auth for mutating endpoints once API is enabled.
-- MVP endpoints are unversioned: `/add`, `/downloads`, `/queues`, `/ping`.
-- Add `/api/v1` aliases later only when API becomes stable external contract.
-- API must not expose arbitrary file operations.
-
-## Dependency Rules
-
-- Keep core dependencies UI-free.
-- Prefer proven crates: tokio, sqlx, reqwest, tokio-util, serde, thiserror, tracing.
-- Pinned UI deps: `gpui-kit`, `domenkozar/gpui-tray` (+ `cargo tree` must
-  show a single `gpui` version shared by both).
-- Never add Freya (or `rfd`-via-Freya) to this repo.
-- Do not add aria2 integration until native HTTP MVP and engine trait boundary exist.
-- Do not add HLS/ffmpeg before HTTP multi-part engine is stable.
-- Do not add proxy/updater/power-actions before MVP milestones land.
-
-## Code Style
-
-- Prefer small, explicit types and newtypes for IDs/bytes/speeds.
-- Prefer `&str`/slices in parameters where ownership not needed.
-- Prefer enums over strings for domain state.
-- Keep abstractions minimal until duplication proves need.
-- Comments explain why, not what.
-- Public APIs should be documented once stabilized.
-- Use `tracing`, not `println!`, outside temporary debugging.
+---
 
 ## Do Not Do
 
-- Do not bind GPUI views directly to engine jobs.
-- Do not update `Entity` state from Tokio workers.
-- Do not put queue scheduling inside download workers.
+- Do not bind GPUI views directly to download engine jobs.
+- Do not update `Entity` state from Tokio background workers.
+- Do not put queue scheduling logic inside download workers.
 - Do not implement queue UI while M3 is on hold.
-- Do not write migration files manually.
+- Do not write migration files manually; use `sqlx migrate add <name>`.
 - Do not persist download state as JSON sidecars.
 - Do not make window-system crates required for core tests.
 - Do not introduce aria2 as default engine.

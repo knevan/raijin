@@ -16,11 +16,16 @@ pub mod config;
 pub mod db;
 pub mod download;
 pub mod integration;
+pub mod logging;
 pub mod monitor;
 pub mod platform;
 pub mod queue;
 
 /// Initializes process-wide tracing subscriber for headless and UI binaries.
+///
+/// Console output stays on so headless clients (`cli`, tests, `cargo run`)
+/// keep their expected behavior. The GUI binary installs its own file sink
+/// through [`logging::init_app_tracing`] because it runs without a console.
 ///
 /// Safe to call once at startup; subsequent calls are ignored.
 pub fn init_tracing() {

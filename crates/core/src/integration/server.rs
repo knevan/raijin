@@ -1,8 +1,7 @@
 //! Localhost-only integration server.
 //!
-//! Binds `127.0.0.1` and never `0.0.0.0`. Mutating routes require
-//! `Authorization: Bearer <token>`; `POST /ping` stays open so the extension can
-//! distinguish "server down" from "token rejected".
+//! Binds `127.0.0.1` and never `0.0.0.0`. Basic access can only request
+//! confirmation; silent operations and snapshots require a Bearer token.
 //!
 //! The server holds no engine state. It translates HTTP into
 //! [`IntegrationCommand`] values and awaits a [`IntegrationReply`], so the UI
@@ -11,16 +10,18 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::download::{Bytes, DownloadItem, NewDownload};
 use crate::integration::auth::TokenCell;
@@ -44,6 +45,8 @@ pub enum IntegrationCommand {
         items: Vec<DownloadRequestItem>,
         /// Behavior flags from the request.
         options: DownloadRequestOptions,
+        /// Held until all basic confirmation windows close.
+        pending: Option<Arc<OwnedSemaphorePermit>>,
         /// Reply channel.
         reply: IntegrationResponder,
     },
@@ -236,7 +239,8 @@ pub fn summarize_item(item: &DownloadItem) -> DownloadSummary {
 
 fn is_http_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
-    (lower.starts_with("http://") || lower.starts_with("https://")) && url.len() > "https://".len()
+    (lower.starts_with("http://") || lower.starts_with("https://"))
+        && reqwest::Url::parse(url).is_ok_and(|url| url.host_str().is_some())
 }
 
 /// Shared state for the router.
@@ -244,6 +248,9 @@ fn is_http_url(url: &str) -> bool {
 struct ServerState {
     handle: IntegrationHandle,
     token: TokenCell,
+    port: u16,
+    basic_pending: Arc<Semaphore>,
+    basic_last_request: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Binds the server to `127.0.0.1:port` and serves until the task is dropped.
@@ -261,23 +268,31 @@ pub async fn serve(
     token: TokenCell,
     port: u16,
 ) -> std::io::Result<SocketAddr> {
-    let state = ServerState { handle, token };
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    let address = listener.local_addr()?;
+    let state = ServerState {
+        handle,
+        token,
+        port: address.port(),
+        basic_pending: Arc::new(Semaphore::new(1)),
+        basic_last_request: Arc::new(Mutex::new(None)),
+    };
 
-    // The token middleware is applied before `/ping` is merged in, so the
-    // health check stays reachable without credentials.
     let protected = Router::new()
-        .route("/add", post(add))
         .route("/start-headless-download", post(start_headless))
         .route("/downloads", get(list_downloads))
         .route("/queues", get(list_queues))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     let app = Router::new()
         .route("/ping", post(ping))
+        .route("/add", post(add))
         .merge(protected)
+        .layer(DefaultBodyLimit::max(256 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_local_request,
+        ))
         .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
-    let address = listener.local_addr()?;
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             tracing::warn!(?error, "integration server stopped");
@@ -287,30 +302,143 @@ pub async fn serve(
 }
 
 async fn ping() -> Response {
-    StatusCode::OK.into_response()
+    axum::Json(serde_json::json!({"basicAccess": true})).into_response()
+}
+
+async fn require_local_request(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let hosts = request
+        .headers()
+        .get_all(header::HOST)
+        .iter()
+        .collect::<Vec<_>>();
+    let valid_host = hosts.len() == 1
+        && hosts[0].to_str().ok().is_some_and(|host| {
+            host == format!("127.0.0.1:{}", state.port)
+                || host == format!("localhost:{}", state.port)
+        });
+    let valid_authority = request.uri().authority().is_none_or(|authority| {
+        hosts.first().and_then(|host| host.to_str().ok()) == Some(authority.as_str())
+    });
+    let origins = request
+        .headers()
+        .get_all(header::ORIGIN)
+        .iter()
+        .collect::<Vec<_>>();
+    let valid_origin = origins.is_empty()
+        || (origins.len() == 1 && origins[0].to_str().ok().is_some_and(extension_origin));
+    if !valid_host || !valid_authority || !valid_origin {
+        return ApiFailure::new(StatusCode::FORBIDDEN, "untrusted_request").into_response();
+    }
+    next.run(request).await
+}
+
+fn extension_origin(origin: &str) -> bool {
+    if let Some(id) = origin.strip_prefix("chrome-extension://") {
+        return id.len() == 32 && id.bytes().all(|byte| (b'a'..=b'p').contains(&byte));
+    }
+    if let Some(id) = origin.strip_prefix("moz-extension://") {
+        return id.len() == 36
+            && id.bytes().enumerate().all(|(index, byte)| {
+                if [8, 13, 18, 23].contains(&index) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            });
+    }
+    false
+}
+
+fn authenticated(headers: &HeaderMap, token: &TokenCell) -> bool {
+    let expected = token.get();
+    !expected.is_empty()
+        && presented_token(headers)
+            .is_some_and(|presented| crate::integration::auth::verify(&expected, &presented))
 }
 
 async fn add(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     body: Result<axum::Json<AddDownloadRequest>, JsonRejection>,
 ) -> Result<Response, ApiFailure> {
-    let axum::Json(request) = body.map_err(|_| ApiFailure::bad_request("bad_request"))?;
+    let trusted = authenticated(&headers, &state.token);
+    if headers.contains_key(header::AUTHORIZATION) && !trusted {
+        return Err(ApiFailure::new(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let axum::Json(mut request) = body.map_err(json_failure)?;
+    validate_items(&request, if trusted { 32 } else { 8 })?;
+    let pending = if trusted {
+        None
+    } else {
+        let permit = Arc::clone(&state.basic_pending)
+            .try_acquire_owned()
+            .map_err(|_| ApiFailure::new(StatusCode::TOO_MANY_REQUESTS, "confirmation_pending"))?;
+        {
+            let mut last = state
+                .basic_last_request
+                .lock()
+                .map_err(|_| ApiFailure::internal("rate_limit_unavailable"))?;
+            let now = Instant::now();
+            if last.is_some_and(|instant| now.duration_since(instant) < Duration::from_secs(5)) {
+                return Err(ApiFailure::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited",
+                ));
+            }
+            *last = Some(now);
+        }
+        request.options = DownloadRequestOptions::default();
+        Some(Arc::new(permit))
+    };
     let reply = state
         .handle
-        .request(|reply| IntegrationCommand::ConfirmAdd {
-            items: request.items,
-            options: request.options,
-            reply,
+        .request(|reply| {
+            if trusted && request.options.silent_add {
+                IntegrationCommand::HeadlessAdd {
+                    items: request.items,
+                    options: request.options,
+                    reply,
+                }
+            } else {
+                IntegrationCommand::ConfirmAdd {
+                    items: request.items,
+                    options: request.options,
+                    pending,
+                    reply,
+                }
+            }
         })
         .await?;
     accepted(reply)
+}
+
+fn json_failure(rejection: JsonRejection) -> ApiFailure {
+    ApiFailure::new(rejection.status(), "bad_request")
+}
+
+fn validate_items(request: &AddDownloadRequest, limit: usize) -> Result<(), ApiFailure> {
+    if request.items.is_empty() || request.items.len() > limit {
+        return Err(ApiFailure::bad_request("invalid_item_count"));
+    }
+    for item in &request.items {
+        if item.r#type != DownloadType::Http || !is_http_url(item.link.trim()) {
+            return Err(ApiFailure::bad_request("invalid_item"));
+        }
+    }
+    Ok(())
 }
 
 async fn start_headless(
     State(state): State<ServerState>,
     body: Result<axum::Json<AddDownloadRequest>, JsonRejection>,
 ) -> Result<Response, ApiFailure> {
-    let axum::Json(request) = body.map_err(|_| ApiFailure::bad_request("bad_request"))?;
+    let axum::Json(mut request) = body.map_err(json_failure)?;
+    validate_items(&request, 32)?;
+    request.options.silent_start = true;
     let reply = state
         .handle
         .request(|reply| IntegrationCommand::HeadlessAdd {
@@ -379,10 +507,7 @@ struct RejectedBody {
 }
 
 async fn require_token(State(state): State<ServerState>, request: Request, next: Next) -> Response {
-    let expected = state.token.get();
-    if presented_token(request.headers())
-        .is_some_and(|token| crate::integration::auth::verify(&expected, &token))
-    {
+    if authenticated(request.headers(), &state.token) {
         return next.run(request).await;
     }
     (
@@ -395,6 +520,9 @@ async fn require_token(State(state): State<ServerState>, request: Request, next:
 }
 
 fn presented_token(headers: &HeaderMap) -> Option<String> {
+    if headers.get_all(header::AUTHORIZATION).iter().count() != 1 {
+        return None;
+    }
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = value
         .strip_prefix("Bearer ")
@@ -534,7 +662,7 @@ mod tests {
         let body = r#"{"items":[],"options":{"silentAdd":true,"silentStart":false}}"#;
 
         let missing = client
-            .post(format!("{base}/add"))
+            .post(format!("{base}/start-headless-download"))
             .header("Content-Type", "application/json")
             .body(body)
             .send()
@@ -664,6 +792,250 @@ mod tests {
 
         drop(token);
         app.abort();
+    }
+
+    #[test]
+    fn authentication_should_reject_empty_server_tokens_and_duplicate_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer secret".parse().expect("header"),
+        );
+        assert!(!authenticated(&headers, &TokenCell::default()));
+        headers.append(
+            header::AUTHORIZATION,
+            "Bearer secret".parse().expect("header"),
+        );
+        assert!(!authenticated(&headers, &TokenCell::new("secret")));
+    }
+
+    fn valid_body(count: usize) -> String {
+        let items = (0..count)
+            .map(|_| item("https://cdn.example.com/a.zip", DownloadType::Http))
+            .collect();
+        serde_json::to_string(&AddDownloadRequest {
+            items,
+            options: DownloadRequestOptions {
+                silent_add: true,
+                silent_start: true,
+            },
+        })
+        .expect("serialize")
+    }
+
+    #[tokio::test]
+    async fn basic_access_should_force_confirmation_and_bound_pending_requests() {
+        let (base, mut receiver) = spawn_server("secret").await;
+        let app = tokio::spawn(async move {
+            let command = receiver.recv().await.expect("confirmation command");
+            match command {
+                IntegrationCommand::ConfirmAdd {
+                    options,
+                    pending,
+                    reply,
+                    ..
+                } => {
+                    assert!(!options.silent_add);
+                    assert!(!options.silent_start);
+                    reply
+                        .send(IntegrationReply::Accepted { ids: Vec::new() })
+                        .expect("reply");
+                    pending.expect("basic permit")
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        });
+        let client = reqwest::Client::new();
+        let send = || {
+            client
+                .post(format!("{base}/add"))
+                .header("Content-Type", "application/json")
+                .body(valid_body(1))
+                .send()
+        };
+        assert_eq!(
+            send().await.expect("basic add").status(),
+            StatusCode::ACCEPTED
+        );
+        let pending = app.await.expect("app task");
+        assert_eq!(
+            send().await.expect("pending add").status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let semaphore = Arc::clone(pending.semaphore());
+        let second_window = Arc::clone(&pending);
+        drop(pending);
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(second_window);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert_eq!(
+            send().await.expect("rate limited add").status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn basic_access_should_not_expose_private_routes_or_downgrade_bad_credentials() {
+        let (base, mut receiver) = spawn_server("secret").await;
+        let client = reqwest::Client::new();
+        for path in ["downloads", "queues"] {
+            let response = client
+                .get(format!("{base}/{path}"))
+                .send()
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = client
+            .post(format!("{base}/start-headless-download"))
+            .header("Content-Type", "application/json")
+            .body(valid_body(1))
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for value in ["Bearer wrong", "Bearer ", "Basic secret"] {
+            let response = client
+                .post(format!("{base}/add"))
+                .header("Authorization", value)
+                .header("Content-Type", "application/json")
+                .body(valid_body(1))
+                .send()
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_boundary_should_reject_web_origins_and_rebinding_hosts_even_with_a_token() {
+        let (base, mut receiver) = spawn_server("secret").await;
+        let client = reqwest::Client::new();
+        for host in [
+            "attacker.example:35343",
+            "127.0.0.1.evil:35343",
+            "127.0.0.1:0",
+            "localhost",
+        ] {
+            let response = client
+                .post(format!("{base}/ping"))
+                .header("Host", host)
+                .send()
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        for origin in [
+            "https://attacker.example",
+            "null",
+            "http://localhost",
+            "chrome-extension://invalid",
+            "moz-extension://bad",
+        ] {
+            let response = client
+                .post(format!("{base}/add"))
+                .header("Origin", origin)
+                .bearer_auth("secret")
+                .header("Content-Type", "application/json")
+                .body(valid_body(1))
+                .send()
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        assert!(receiver.try_recv().is_err());
+        for origin in [
+            "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "moz-extension://12345678-1234-1234-1234-123456789abc",
+        ] {
+            let response = client
+                .post(format!("{base}/ping"))
+                .header("Origin", origin)
+                .send()
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("access-control-allow-origin")
+            );
+            assert_eq!(
+                response.text().await.expect("body"),
+                "{\"basicAccess\":true}"
+            );
+        }
+        let response = client
+            .post(format!("{base}/ping"))
+            .header("Host", base.replace("http://127.0.0.1", "localhost"))
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn add_should_bound_payloads_before_dispatch() {
+        let (base, mut receiver) = spawn_server("secret").await;
+        let client = reqwest::Client::new();
+        for body in [valid_body(0), valid_body(9)] {
+            let response = client
+                .post(format!("{base}/add"))
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = client
+            .post(format!("{base}/add"))
+            .header("Content-Type", "application/json")
+            .body(" ".repeat(256 * 1024 + 1))
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let response = client
+            .post(format!("{base}/add"))
+            .header("Content-Type", "text/plain")
+            .body(valid_body(1))
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticated_silent_add_should_forward_start_policy() {
+        for start in [false, true] {
+            let (base, mut receiver) = spawn_server("secret").await;
+            let app = tokio::spawn(async move {
+                match receiver.recv().await.expect("command") {
+                    IntegrationCommand::HeadlessAdd { options, reply, .. } => {
+                        assert_eq!(options.silent_start, start);
+                        reply
+                            .send(IntegrationReply::Accepted { ids: vec![1] })
+                            .expect("reply");
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                }
+            });
+            let body =
+                valid_body(1).replace("\"silentStart\":true", &format!("\"silentStart\":{start}"));
+            let response = reqwest::Client::new()
+                .post(format!("{base}/add"))
+                .bearer_auth("secret")
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            app.await.expect("app task");
+        }
     }
 
     #[test]

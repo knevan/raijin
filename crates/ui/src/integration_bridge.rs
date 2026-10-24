@@ -84,6 +84,7 @@ pub fn validate_confirmation(
 pub async fn add_prepared(
     engine: &IntegrationEngine,
     prepared: Vec<PreparedItem>,
+    autostart: bool,
 ) -> Result<IntegrationReply, String> {
     let mut ids = Vec::with_capacity(prepared.len());
     for item in prepared {
@@ -93,6 +94,13 @@ pub async fn add_prepared(
             .await
             .map_err(|error| error.to_string())?;
         ids.push(added.id.get());
+        if !autostart {
+            engine
+                .manager
+                .pause(added.id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         if let Err(error) = engine.queues.enqueue(QueueId::MAIN, [added.id]).await {
             // The download row exists; failing the whole request would discard
             // ids the extension can still act on.
@@ -200,7 +208,13 @@ pub struct Started {
 ///
 /// The dialog owns the download from here; the HTTP request is already answered
 /// with `202 Accepted` because the user still has to confirm.
-pub type DialogOpener = Box<dyn FnMut(&mut gpui_kit::App, &[PreparedItem])>;
+pub type DialogOpener = Box<
+    dyn FnMut(
+        &mut gpui_kit::App,
+        Vec<PreparedItem>,
+        Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ),
+>;
 
 /// Drains integration commands on the GPUI foreground thread.
 ///
@@ -220,6 +234,7 @@ pub fn spawn_dispatcher(cx: &mut gpui_kit::App, started: Started, mut open_dialo
                 IntegrationCommand::ConfirmAdd {
                     items,
                     options,
+                    pending,
                     reply: responder,
                 } => {
                     let request = AddDownloadRequest { items, options };
@@ -230,7 +245,7 @@ pub fn spawn_dispatcher(cx: &mut gpui_kit::App, started: Started, mut open_dialo
                             // Answer first: the extension must not block on a
                             // user who may take minutes to confirm.
                             reply(responder, value);
-                            cx.update(|cx| open_dialog(cx, &prepared));
+                            cx.update(|cx| open_dialog(cx, prepared, pending));
                         }
                         None => reply(responder, value),
                     }
@@ -245,7 +260,7 @@ pub fn spawn_dispatcher(cx: &mut gpui_kit::App, started: Started, mut open_dialo
                         Ok(prepared) => {
                             let engine = engine.clone();
                             reply_async(&runtime, responder, async move {
-                                add_prepared(&engine, prepared).await
+                                add_prepared(&engine, prepared, options.silent_start).await
                             });
                         }
                         Err(failure) => reply(
@@ -306,6 +321,74 @@ mod tests {
             items,
             options: DownloadRequestOptions::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn silent_add_should_keep_membership_and_only_start_when_requested() {
+        use raijin_core::db::{DownloadRepository, PartRepository, QueueRepository};
+        use raijin_core::download::{
+            DownloadManagerHandle, DownloadManagerOptions, DownloadStatus, QueueId,
+        };
+        use raijin_core::queue::{QueueManagerHandle, QueueManagerOptions};
+
+        let pool = raijin_core::db::bootstrap("sqlite::memory:")
+            .await
+            .expect("database");
+        let downloads = DownloadRepository::new(pool.clone());
+        let (manager, manager_task, _) = DownloadManagerHandle::spawn_with_events(
+            downloads.clone(),
+            PartRepository::new(pool.clone()),
+            DownloadManagerOptions::default(),
+        );
+        let (queues, queue_task) = QueueManagerHandle::spawn(
+            downloads,
+            QueueRepository::new(pool.clone()),
+            manager.clone(),
+            manager.subscribe(),
+            QueueManagerOptions::default(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let url = format!(
+            "http://{}/file.zip",
+            listener.local_addr().expect("address")
+        );
+        let engine = super::IntegrationEngine {
+            manager,
+            queues,
+            runtime: tokio::runtime::Handle::current(),
+            default_folder: std::env::temp_dir(),
+        };
+        for start in [false, true] {
+            let prepared = raijin_core::integration::prepare_request(
+                &request(vec![item(&url)]),
+                &engine.default_folder,
+            )
+            .expect("prepared request");
+            let IntegrationReply::Accepted { ids } = super::add_prepared(&engine, prepared, start)
+                .await
+                .expect("added")
+            else {
+                panic!("unexpected reply");
+            };
+            let downloads = engine.manager.list().await.expect("downloads");
+            let added = downloads
+                .iter()
+                .find(|item| item.id.get() == ids[0])
+                .expect("added item");
+            assert_eq!(added.status == DownloadStatus::Paused, !start);
+            let queues = engine.queues.list().await.expect("queues");
+            assert!(queues.iter().any(|queue| queue.queue.id == QueueId::MAIN && queue.items.contains(&added.id)));
+        }
+        engine.queues.shutdown().await.expect("queue shutdown");
+        queue_task.await.expect("queue task").expect("queue result");
+        engine.manager.shutdown().await.expect("manager shutdown");
+        manager_task
+            .await
+            .expect("manager task")
+            .expect("manager result");
+        pool.close().await;
     }
 
     #[test]

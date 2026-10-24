@@ -65,6 +65,8 @@ pub struct AddDownloadView {
     probe_name: Option<String>,
     /// Monotonic id; only the newest probe task may write `probe`.
     probe_gen: u64,
+    integration: Option<raijin_core::integration::PreparedItem>,
+    _pending: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     _subscriptions: [Subscription; 4],
 }
 
@@ -75,6 +77,8 @@ impl AddDownloadView {
         cx: &mut Context<Self>,
         handles: EngineHandles,
         initial_url: &str,
+        integration: Option<raijin_core::integration::PreparedItem>,
+        pending: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> Self {
         let seed_url = if initial_url.trim().is_empty() {
             clipboard_url(cx).unwrap_or_default()
@@ -118,12 +122,20 @@ impl AddDownloadView {
             probe: ProbeState::Idle,
             probe_name: None,
             probe_gen: 0,
+            integration,
+            _pending: pending,
             _subscriptions: subscriptions,
         };
         // Seed category root + checkbox default from engine handles, then run
         // one derivation pass so folder/file/probe match the seeded URL.
         view.category_root = view.handles.category_root.clone();
         view.use_category = view.handles.use_category_default;
+        if let Some(item) = &view.integration {
+            view.file.update(cx, |state, cx| {
+                state.set_value(item.request.file_name.as_str(), window, cx);
+            });
+            view.file_manual = true;
+        }
         view.refresh_derived(window, cx);
         view
     }
@@ -202,7 +214,9 @@ impl AddDownloadView {
                 state.set_value(folder.to_string_lossy().as_ref(), window, cx);
             });
         }
-        self.schedule_probe(url, window, cx);
+        if self.integration.is_none() {
+            self.schedule_probe(url, window, cx);
+        }
         cx.notify();
     }
 
@@ -424,7 +438,8 @@ impl AddDownloadView {
         };
         let folder = self.resolved_folder(cx);
         match build_new_download(url.trim(), &file_name, folder) {
-            Ok(request) => {
+            Ok(mut request) => {
+                preserve_integration_credentials(&mut request, self.integration.as_ref());
                 let command = if autostart {
                     EngineCommand::Add(request)
                 } else {
@@ -709,6 +724,26 @@ impl Render for AddDownloadView {
 /// so tray-only runs and `--add <url>` launches never construct the downloads table.
 /// Failures only mean the window could not open and are logged.
 pub fn open_add_download_window(cx: &mut App, handles: &EngineHandles, initial_url: &str) {
+    open_download_window(cx, handles, initial_url, None, None);
+}
+
+pub fn open_integration_download_window(
+    cx: &mut App,
+    handles: &EngineHandles,
+    item: raijin_core::integration::PreparedItem,
+    pending: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+) {
+    let url = item.request.url.clone();
+    open_download_window(cx, handles, &url, Some(item), pending);
+}
+
+fn open_download_window(
+    cx: &mut App,
+    handles: &EngineHandles,
+    initial_url: &str,
+    integration: Option<raijin_core::integration::PreparedItem>,
+    pending: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+) {
     // Icon-button rows sit at the 32px field height (down from 44px), so the
     // frame shrinks by the same 2 x 12px to stay snug.
     let dialog_size = size(px(500.), px(276.));
@@ -716,16 +751,40 @@ pub fn open_add_download_window(cx: &mut App, handles: &EngineHandles, initial_u
     options.window_bounds = Some(WindowBounds::centered(dialog_size, cx));
     options.window_min_size = Some(dialog_size);
     options.is_resizable = false;
-    options.focus = true;
+    let focus = pending.is_none();
+    options.focus = focus;
     let handles = handles.clone();
     let initial_url = initial_url.to_owned();
     match cx.open_window(options, |window, cx| {
-        cx.new(|cx| AddDownloadView::new(window, cx, handles.clone(), &initial_url))
+        cx.new(|cx| {
+            AddDownloadView::new(
+                window,
+                cx,
+                handles.clone(),
+                &initial_url,
+                integration,
+                pending,
+            )
+        })
     }) {
         Ok(handle) => {
-            let _ = handle.update(cx, |_, window, _| window.activate_window());
+            if focus {
+                let _ = handle.update(cx, |_, window, _| window.activate_window());
+            }
         }
         Err(error) => tracing::error!(?error, "failed to open Add Download window"),
+    }
+}
+
+fn preserve_integration_credentials(
+    request: &mut raijin_core::download::NewDownload,
+    integration: Option<&raijin_core::integration::PreparedItem>,
+) {
+    if let Some(item) = integration
+        && request.url == item.request.url
+    {
+        request.headers = item.request.headers.clone();
+        request.download_page = item.request.download_page.clone();
     }
 }
 
@@ -917,6 +976,29 @@ mod tests {
         sanitize_filename, select_probe_filename,
     };
     use crate::category::FileCategory;
+
+    #[test]
+    fn integration_credentials_should_only_follow_the_approved_original_url() {
+        use raijin_core::integration::{DownloadRequestItem, DownloadType, prepare_item};
+
+        let source = DownloadRequestItem {
+            link: "https://example.com/file.zip".to_owned(),
+            download_page: Some("https://example.com".to_owned()),
+            headers: Some([("Cookie".to_owned(), "session=secret".to_owned())].into()),
+            description: None,
+            suggested_name: None,
+            r#type: DownloadType::Http,
+        };
+        let folder = PathBuf::from("C:/Downloads");
+        let prepared = prepare_item(&source, &folder).expect("prepared");
+        for url in [source.link.as_str(), "https://different.example/file.zip"] {
+            let mut request = crate::bridge::build_new_download(url, "file.zip", folder.clone())
+                .expect("request");
+            super::preserve_integration_credentials(&mut request, Some(&prepared));
+            assert_eq!(request.headers.contains_key("Cookie"), url == source.link);
+            assert_eq!(request.download_page.is_some(), url == source.link);
+        }
+    }
 
     #[test]
     fn sanitize_should_strip_paths_and_reserved_chars() {

@@ -97,7 +97,8 @@ async function test(): Promise<void> {
   const port = normalizePort(Number.parseInt(portText.value, 10));
   try {
     const result = await sendTestPort(port, token.value);
-    if (result.reason === 'ok') status.value = `Connected on port ${port}`;
+    if (result.reason === 'basic') status.value = 'Connected — Basic access. Downloads require desktop confirmation';
+    else if (result.reason === 'ok') status.value = `Connected — Authenticated on port ${port}`;
     else if (result.reason === 'unauthorized') status.value = 'Server is up, but the token was rejected';
     else status.value = 'Server is down. Start Raijin and enable browser integration';
   } catch {
@@ -135,7 +136,8 @@ onMounted(() => {
       <label>Port ({{ MIN_ALLOWED_PORT }}–{{ MAX_ALLOWED_PORT }})
         <input v-model="portText" type="number" :min="MIN_ALLOWED_PORT" :max="MAX_ALLOWED_PORT" />
       </label>
-      <label>Token
+      <p>Without a token, each download requires confirmation in Raijin. Add a token for silent downloads and access to download lists.</p>
+      <label>API token (optional)
         <input v-model="token" type="password" autocomplete="off" placeholder="Paste desktop token" />
       </label>
       <div class="row">
@@ -171,8 +173,8 @@ onMounted(() => {
       <h2>Behavior</h2>
       <label class="check"><input v-model="allowPass" type="checkbox" /> Let browser continue when Raijin is down</label>
       <label class="check"><input v-model="closeNewTab" type="checkbox" /> Close new tab after capture</label>
-      <label class="check"><input v-model="silentAdd" type="checkbox" /> Add downloads silently</label>
-      <label class="check"><input v-model="silentStart" type="checkbox" :disabled="!silentAdd" /> Start downloads silently</label>
+      <label class="check"><input v-model="silentAdd" type="checkbox" :disabled="!token" /> Add downloads silently</label>
+      <label class="check"><input v-model="silentStart" type="checkbox" :disabled="!token || !silentAdd" /> Start downloads silently</label>
       <div class="row">
         <button type="button" :disabled="saving" @click="save">{{ saving ? 'Saving…' : 'Save' }}</button>
       </div>

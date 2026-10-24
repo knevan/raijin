@@ -17,7 +17,8 @@ const adding = ref(false);
 const actionMessage = ref('');
 
 function statusLabel(): string {
-  if (status.value === 'ok') return 'Connected';
+  if (status.value === 'basic') return 'Connected — Basic access';
+  if (status.value === 'ok') return 'Connected — Authenticated';
   if (status.value === 'down') return 'Server down';
   if (status.value === 'unauthorized') return 'Token rejected';
   return 'Checking…';
@@ -46,7 +47,10 @@ async function test(): Promise<void> {
   await setConfigItem('token', token.value);
   try {
     const result = await sendTestPort(port, token.value);
-    if (result.reason === 'ok') {
+    if (result.reason === 'basic') {
+      status.value = 'basic';
+      statusMessage.value = 'Downloads require confirmation in Raijin. Add a token to enable silent downloads';
+    } else if (result.reason === 'ok') {
       status.value = 'ok';
       statusMessage.value = `Connected on port ${port}`;
     } else if (result.reason === 'unauthorized') {
@@ -141,7 +145,7 @@ onMounted(() => {
       <input v-model="portText" type="number" :min="MIN_ALLOWED_PORT" :max="MAX_ALLOWED_PORT" />
     </label>
     <label class="field">
-      <span>Token</span>
+      <span>API token (optional)</span>
       <input v-model="token" type="password" autocomplete="off" placeholder="Paste desktop token" />
     </label>
     <div class="row">

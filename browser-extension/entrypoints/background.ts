@@ -132,8 +132,8 @@ async function submitItems(
   const config = await getAll();
   const api = new BackendApi(config.port, config.token);
   const options = {
-    silentAdd: config.silentAddDownload,
-    silentStart: config.silentAddDownload ? config.silentStartDownload : false,
+    silentAdd: Boolean(config.token) && config.silentAddDownload,
+    silentStart: Boolean(config.token) && config.silentAddDownload && config.silentStartDownload,
   };
   try {
     if (options.silentAdd && options.silentStart) {
@@ -147,7 +147,7 @@ async function submitItems(
     if (err instanceof ApiError) return { ok: false, reason: 'error' };
     throw err;
   }
-  if (config.silentAddDownload && items.length === 1) {
+  if (options.silentAdd && items.length === 1) {
     try {
       await browser.notifications.create({
         type: 'basic',
@@ -167,21 +167,22 @@ async function testPort(port?: number, token?: string): Promise<TestPortResult> 
   const targetPort = port ?? config.port;
   const targetToken = token ?? config.token;
   const pingApi = new BackendApi(targetPort);
+  let basicAccess: boolean;
   try {
-    await pingApi.ping();
+    basicAccess = await pingApi.ping();
   } catch {
     return { ok: false, reason: 'down' };
   }
-  if (!targetToken) return { ok: false, reason: 'unauthorized' };
+  if (!targetToken) return basicAccess
+    ? { ok: true, reason: 'basic' }
+    : { ok: false, reason: 'unauthorized' };
   try {
     await new BackendApi(targetPort, targetToken).probeAuth();
     return { ok: true, reason: 'ok' };
   } catch (err) {
     if (err instanceof UnauthorizedError) return { ok: false, reason: 'unauthorized' };
-    // Auth probe endpoints may not exist on older desktop builds; a
-    // successful ping is enough to report reachable in that case.
-    if (err instanceof NetworkError) return { ok: false, reason: 'down' };
-    return { ok: true, reason: 'ok' };
+    if (err instanceof NetworkError || err instanceof ApiError) return { ok: false, reason: 'down' };
+    throw err;
   }
 }
 

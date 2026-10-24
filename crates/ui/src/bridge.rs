@@ -120,6 +120,9 @@ impl EngineCommand {
         start: bool,
     ) -> raijin_core::download::DownloadManagerResult<()> {
         let added = manager.add(request).await?;
+        if !start {
+            manager.pause(added.id).await?;
+        }
         queues
             .enqueue(QueueId::MAIN, [added.id])
             .await

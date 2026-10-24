@@ -64,13 +64,18 @@ export class BackendApi {
   }
 
   // Health check, intentionally unauthenticated.
-  async ping(): Promise<void> {
+  async ping(): Promise<boolean> {
     const res = await fetchWithTimeout(
       `${this.baseUrl}/ping`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: 'null' },
       PING_TIMEOUT_MS,
     );
     if (!res.ok) throw new ApiError(res.status);
+    const body = await res.text();
+    if (!body.trim()) return false;
+    const status: unknown = JSON.parse(body);
+    return typeof status === 'object' && status !== null
+      && 'basicAccess' in status && status.basicAccess === true;
   }
 
   async add(request: AddDownloadRequest): Promise<void> {
@@ -90,7 +95,7 @@ export class BackendApi {
       PING_TIMEOUT_MS,
     );
     if (res.status === 401) throw new UnauthorizedError();
-    if (!res.ok && res.status !== 404) throw new ApiError(res.status);
+    if (!res.ok) throw new ApiError(res.status);
   }
 
   private async postAuthenticated(path: string, body: unknown): Promise<void> {

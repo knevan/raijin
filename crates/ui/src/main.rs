@@ -166,11 +166,14 @@ fn main() {
                 crate::integration_bridge::spawn_dispatcher(
                     cx,
                     started,
-                    Box::new(move |cx, prepared| {
-                        // One dialog per item keeps the existing single-URL
-                        // form unchanged; batches are rare from the extension.
+                    Box::new(move |cx, prepared, pending| {
                         for item in prepared {
-                            open_add_download_window(cx, &dialog_handles, &item.source.link);
+                            crate::add_download::open_integration_download_window(
+                                cx,
+                                &dialog_handles,
+                                item,
+                                pending.clone(),
+                            );
                         }
                     }),
                 );

@@ -2,31 +2,55 @@
 
 Status: **Active development (M7 partial)**.
 
----
+## 1. Access model
 
-## 1. Local HTTP API (`axum`)
+The `axum` API connects the browser extension, CLI, and third-party tools to the desktop app through commands. The engine and projected monitor state remain separate from HTTP handlers.
 
-The local API server provides IPC between external consumers (the `wxt` browser extension, CLI, and third-party tools) and the Raijin desktop engine.
+**Decision:** enable zero-setup Basic access when browser integration is running, without disabling authentication globally. Basic access may only submit downloads for explicit desktop confirmation. Silent operations and private snapshots require `Authorization: Bearer <token>` matching `integration.api_token`.
 
-### Security Invariants:
-- **Localhost Only**: Binds strictly to loopback (`127.0.0.1:[port]`). Never expose on `0.0.0.0`.
-- **Token Authentication**: All mutating endpoints (such as `POST /add`) require a valid Bearer token matching `integration.api_token`.
-- **No Arbitrary File Operations**: The API must never allow external clients to read, write, or delete arbitrary files outside configured download directories.
+| Endpoint | Basic access (no Authorization header) | Valid token |
+|---|---|---|
+| `POST /ping` | Health check; returns `{"basicAccess":true}` | Same |
+| `POST /add` | Always opens confirmation; ignores silent flags | Confirmation unless `silentAdd` is true |
+| `POST /start-headless-download` | `401` | Adds and starts downloads without confirmation |
+| `GET /downloads` | `401` | Compact projected download list |
+| `GET /queues` | `401` | Read-only queue snapshot |
 
-### Endpoints (Unversioned MVP):
-- `GET /ping` — Health check, returns engine status and version.
-- `POST /add` — Add a new download job (URL, headers, referrer, optional destination).
-- `GET /downloads` — List active downloads (delegates to monitor projection).
-- `GET /queues` — List queues (read-only until queue milestone is unheld).
+An invalid, empty, malformed, or duplicated Authorization header on `/add` is rejected with `401`; it never falls back to Basic access. `/ping` is intentionally public and is not a credential check.
 
-*Note: `/api/v1` aliases may be added in the future once the API contract stabilizes.*
+For authenticated `/add`, `silentAdd: true` bypasses confirmation; `silentStart` determines whether to enqueue immediately. Basic access cannot bypass confirmation through either flag or the headless endpoint. `202 Accepted` for confirmation only acknowledges handing the request to the desktop, not user approval or download creation.
 
----
+## 2. Security boundaries
 
-## 2. Browser Extension (`wxt`)
+- Bind strictly to `127.0.0.1:<port>`, never `0.0.0.0`.
+- Require exactly one Host header matching `127.0.0.1:<bound-port>` or `localhost:<bound-port>`. Reject conflicting absolute request authority. Do not trust forwarded headers. This blocks attacker-controlled hostnames used in DNS rebinding.
+- If Origin is present, require exactly one syntactically valid Chromium or Firefox extension origin. Reject website origins, opaque `null`, malformed origins, and multiple values before dispatch.
+- This is an **extension-origin class restriction**, not an allowlist identifying the official extension. Chromium development IDs vary and Firefox extension origins use installation-specific UUIDs. Requests without Origin remain supported for extension background clients and local tools. Neither Origin nor its absence authenticates local processes; sensitive capabilities always require the token.
+- Do not enable CORS or return wildcard/reflected CORS headers. Extension background requests use browser host permissions. Ordinary web pages are not supported API clients. Test actual Chromium and Firefox builds before release; browser policy is not the sole security boundary.
+- Require JSON for add requests. Limit bodies to 256 KiB, Basic batches to 8 items, and authenticated batches to 32 items. Reject empty batches and unsupported/non-HTTP(S) items before dispatch.
+- Basic access permits only one pending batch across all clients. A shared permit remains held until every confirmation window from that batch closes, including cancellation. Allow at most one accepted Basic batch per five seconds. Excess requests receive `429`, without opening windows.
+- Basic confirmation windows do not steal focus. Integration confirmation does not probe the remote URL or start network activity before user approval. Supplied headers and referrer are retained for the approved URL, but not reused if the user changes it.
+- External clients cannot select arbitrary destination paths. Desktop confirmation shows the URL and resolved destination; existing filename and engine validation still apply. Authentication does not authorize arbitrary file operations.
+- Generate tokens with OS-backed cryptographic randomness and persist them in SQLite. Token rotation invalidates existing credentials immediately. Never place tokens in URLs, query strings, logs, or JSON sidecars.
 
-- Located in `browser-extension/`.
-- Single codebase targeting both Chromium and Firefox using `wxt`.
-- Stores the local API port and Bearer token in extension storage.
-- Handles browser download interception and context menu triggers ("Download with Raijin").
+Basic access still trusts local clients to request user attention. Limits reduce confirmation spam but do not sandbox malicious software running as the user. No download is approved merely because its request reached loopback.
 
+## 3. Browser extension
+
+The `wxt` extension lives in `browser-extension/` and targets Chromium and Firefox. Network calls run in its background context, not in page content scripts.
+
+- Empty token: show **Connected — Basic access**, disable silent options, and submit through `/add` for desktop confirmation.
+- Valid token: show **Connected — Authenticated** after an authenticated snapshot probe.
+- Rejected token: report the error without silently clearing it or retrying unauthenticated.
+- Only advertise Basic connectivity when `/ping` explicitly reports support; older desktop builds do not gain unauthenticated capability merely by answering ping.
+- Store the port and optional token in extension-local storage, never browser sync.
+
+## 4. Rationale and deferred work
+
+Rejected: a global authentication-OFF toggle that exposes silent downloads and private lists to every local client. It simplifies setup by removing the security boundary rather than narrowing the unauthenticated capability.
+
+Chosen: Basic submission plus mandatory confirmation. This makes the core browser action usable without copying a token, while automation and private data retain authentication. The existing token copy/paste flow remains available for advanced access.
+
+Deferred: Native Messaging, automatic pairing, per-client credentials, and official extension identity pinning. These are not required for Basic access and must not be simulated by an endpoint that gives out the API token.
+
+No schema changes are required. The existing integration token and extension configuration remain valid.

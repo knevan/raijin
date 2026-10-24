@@ -34,9 +34,9 @@ export interface RaijinConfig {
   bypassShortcut: string;
 }
 
-export type ConnectionStatus = 'unknown' | 'ok' | 'down' | 'unauthorized';
+export type ConnectionStatus = 'unknown' | 'basic' | 'ok' | 'down' | 'unauthorized';
 
-export type TestPortReason = 'ok' | 'down' | 'unauthorized';
+export type TestPortReason = 'basic' | 'ok' | 'down' | 'unauthorized';
 
 export interface TestPortResult {
   ok: boolean;

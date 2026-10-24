@@ -8,7 +8,7 @@ Status server: `crates/core/src/integration/mod.rs` masih stub; kontrak di bawah
 
 - Scaffold: `wxt@^0.21.3` + `@wxt-dev/module-vue`, Vue `^3.5`. Config tulis format MV3 saja; `wxt` auto-convert ke MV2 saat target Firefox butuh.
 - Default port Raijin: `35343`. Valid: `1024 <= 35343 <= 65535`, di luar well-known `0-1023` dan di luar ephemeral `49152-65535`. Berbeda dari default ABDM `15151`; jangan hardcode ganda — satu konstanta di tiap sisi + bisa diubah di Settings/options.
-- Auth: satu cara saja — header `Authorization: Bearer <token>` untuk semua route mutasi. `POST /ping` terbuka tanpa auth (health check). Tanpa token di URL/query. Token salah/hilang → `401` JSON, tanpa bocor detail.
+- Access: Basic access may submit `POST /add` without a token, with mandatory desktop confirmation. Silent operations and private snapshots require `Authorization: Bearer <token>`. Invalid credentials never fall back to Basic access. `POST /ping` returns `{"basicAccess":true}` without authentication. See `docs/api-and-integration.md` for the authoritative security contract.
 - Token format: random 256-bit, encode base64url (43 char) atau hex (64 char). Generate first-run di desktop, tampil sekali, bisa regenerate/revoke. Extension simpan di `browser.storage.local` saja (jangan `sync`).
 - State: `wxt/storage` sebagai source of truth config. Tanpa Pinia untuk MVP; tambah Pinia hanya bila state transient popup/options terbukti kompleks.
 - Messaging: native `browser.runtime` via `wxt` (typed wrapper tipis sendiri). Tanpa `webext-bridge` untuk MVP.
@@ -48,7 +48,7 @@ Base: `http://127.0.0.1:35343/`. Bind `127.0.0.1` saja, jangan `0.0.0.0`.
 | Method + Path | Auth | Body | Perilaku |
 |---|---|---|---|
 | `POST /ping` | tidak | `null` | health check, selalu `200` bila server hidup |
-| `POST /add` | Bearer wajib | `AddDownloadRequest` | angkat GPUI confirm dialog; `silentAdd` lewati dialog |
+| `POST /add` | Basic or Bearer | `AddDownloadRequest` | Basic always requires desktop confirmation; only authenticated `silentAdd` bypasses it |
 | `POST /start-headless-download` | Bearer wajib | sama dengan `/add` | langsung enqueue tanpa dialog |
 | `GET /queues` | Bearer wajib | — | daftar queue (Main `id 0` saat M3 aktif) |
 | `GET /downloads` | Bearer wajib | — | ekstensi MVP, list ringkas untuk popup |
@@ -77,7 +77,7 @@ interface DownloadRequestOptions {
 Aturan server:
 
 - Timeout client: `ping` 2000ms (ikut ABDM), `add` 8000ms.
-- `401` untuk token hilang/salah. `400` untuk payload buruk. `500` tanpa stack trace.
+- `401` for invalid credentials or protected routes without a token; Basic `/add` is allowed. `400` for invalid payloads, `413` for oversized bodies, `429` for Basic submission limits. `500` without stack traces.
 - `POST /add` non-silent wajib dialog GPUI; jangan auto-start diam-diam.
 - Server default OFF; aktif via Settings desktop. Extension tampilkan "server mati" bukan "token salah" bila `fetch` network-error.
 
@@ -135,7 +135,7 @@ Mulai: `contextMenus`, `storage`, `tabs`, `downloads`, `cookies` (wajib untuk `s
 ## 8. Token Provisioning UX
 
 1. Desktop Settings → Integration: tampilkan `port`, tombol `Regenerate`, `Copy`, status server ON/OFF.
-2. Popup ext: field `port` + `token` (password input) + tombol `Test` (`test_port`) + status hijau/merah + pesan bedakan "server mati" vs "token ditolak".
+2. Extension popup: port, optional token, and Test action. Distinguish Basic access, authenticated access, unreachable server, and rejected token. Without a token, silent settings are disabled; ordinary submissions still work with desktop confirmation.
 3. Jangan simpan token di `sync`, log, atau screenshot. Sediakan `Clear token`.
 
 ## 9. Build, Test, Rilis

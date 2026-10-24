@@ -14,6 +14,13 @@ pub enum AutostartError {
     /// Executable path is empty.
     #[error("autostart executable path is empty")]
     EmptyExePath,
+    /// The executable lives in a build output directory.
+    #[error(
+        "refusing to register a build output as the startup entry: {}; \
+         install Raijin (or run the installed binary) first",
+        .0.display()
+    )]
+    BuildOutputPath(PathBuf),
     /// Platform has no supported autostart mechanism.
     #[error("autostart is not supported on this platform")]
     Unsupported,
@@ -289,6 +296,7 @@ fn default_launch_agents_dir() -> PathBuf {
 pub struct WindowsRunKeyAutostartManager {
     app_name: String,
     command: String,
+    exe_path: PathBuf,
 }
 
 impl WindowsRunKeyAutostartManager {
@@ -298,6 +306,7 @@ impl WindowsRunKeyAutostartManager {
         Self {
             app_name: app_name.to_owned(),
             command: build_exec_line(exe_path, args),
+            exe_path: exe_path.to_path_buf(),
         }
     }
 
@@ -306,6 +315,31 @@ impl WindowsRunKeyAutostartManager {
     pub fn command(&self) -> &str {
         &self.command
     }
+
+    /// True when the configured executable is a cargo build output.
+    #[must_use]
+    pub fn is_build_output(&self) -> bool {
+        is_build_output_path(&self.exe_path)
+    }
+}
+
+/// True when `path` sits inside a cargo build directory (`.../target/...`).
+///
+/// Registering a build output as the login entry is what makes a developer
+/// machine point its Run key at `target\debug\raijin.exe`; the guard turns
+/// that into a visible error instead of silent corruption. Matching only the
+/// `target` component keeps legitimate installs such as `~/.cargo/bin` valid.
+///
+/// shortcut: path heuristic only, upgrade to an explicit "installed" marker
+/// once packaging (M8) owns the install layout.
+#[must_use]
+pub fn is_build_output_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("target"))
+    })
 }
 
 #[cfg(windows)]
@@ -349,6 +383,11 @@ mod windows_impl {
         }
 
         fn set_enabled(&self, enabled: bool) -> AutostartResult<()> {
+            // Refuse before touching the key: a build output must never
+            // replace a valid install entry that is already registered.
+            if enabled && self.is_build_output() {
+                return Err(AutostartError::BuildOutputPath(self.exe_path.clone()));
+            }
             let key = self
                 .writable_run_key()
                 .map_err(|error| AutostartError::Registry(error.to_string()))?;
@@ -590,5 +629,47 @@ mod tests {
     fn sanitize_should_replace_unsafe_filename_chars() {
         assert_eq!(sanitize_file_stem("Raijin Dev/Test"), "Raijin-Dev-Test");
         assert_eq!(sanitize_file_stem(""), "raijin");
+    }
+
+    #[test]
+    fn build_output_path_should_match_cargo_target_dirs() {
+        assert!(is_build_output_path(Path::new(
+            "C:/dev/raijin/target/debug/raijin.exe"
+        )));
+        assert!(is_build_output_path(Path::new("target/release/raijin")));
+        assert!(is_build_output_path(Path::new(
+            "C:/dev/raijin/TARGET/Release/raijin.exe"
+        )));
+    }
+
+    #[test]
+    fn build_output_path_should_allow_installed_locations() {
+        assert!(!is_build_output_path(Path::new(
+            "C:/Program Files/Raijin/raijin.exe"
+        )));
+        // `cargo install` output is a real install, not a build tree.
+        assert!(!is_build_output_path(Path::new(
+            "C:/Users/u/.cargo/bin/raijin.exe"
+        )));
+        assert!(!is_build_output_path(Path::new("/usr/bin/raijin")));
+    }
+
+    #[test]
+    fn windows_install_should_reject_build_output_on_every_os() {
+        let manager = WindowsRunKeyAutostartManager::new(
+            "RaijinBuildGuardTest",
+            Path::new("C:/dev/raijin/target/debug/raijin.exe"),
+            &["--startup".to_owned()],
+        );
+        let error = manager.set_enabled(true).expect_err("must be rejected");
+        assert!(
+            matches!(error, AutostartError::BuildOutputPath(ref path)
+                if path.ends_with("raijin.exe")),
+            "unexpected error: {error}"
+        );
+        // Disabling never writes, so it must stay allowed (and is a no-op
+        // through the non-Windows stub).
+        #[cfg(not(windows))]
+        assert!(manager.set_enabled(false).is_err());
     }
 }

@@ -281,6 +281,33 @@ pub fn parse_start_minimized(args: impl IntoIterator<Item = String>) -> bool {
     args.into_iter().any(|arg| arg == "--minimized")
 }
 
+/// Reports whether `--startup` was passed (launched by the OS at login).
+///
+/// Separate from `--minimized`: `--minimized` is an explicit command to stay
+/// hidden, while `--startup` only describes the launch context and defers the
+/// window decision to [`start_windowless`].
+#[must_use]
+pub fn parse_start_from_autostart(args: impl IntoIterator<Item = String>) -> bool {
+    args.into_iter().any(|arg| arg == "--startup")
+}
+
+/// Decides whether the shell should start without opening the main window.
+///
+/// `--minimized` always wins (explicit hide). An autostart launch hides only
+/// while the close button also hides to tray: with `close_to_tray` off there
+/// is no tray-first workflow, so login shows the window instead of leaving the
+/// app invisible. A missing native icon forces a window on every path because
+/// a windowless run would have no way back.
+#[must_use]
+pub const fn start_windowless(
+    start_minimized: bool,
+    start_from_autostart: bool,
+    close_to_tray: bool,
+    has_tray_icon: bool,
+) -> bool {
+    (start_minimized || (start_from_autostart && close_to_tray)) && has_tray_icon
+}
+
 /// Extracts the `--add` URL for the standalone Add Download window.
 ///
 /// Accepted forms: `--add <url>`, `--add=<url>`, and bare `--add` (empty
@@ -318,7 +345,8 @@ mod tests {
     };
 
     use super::{
-        OsCloseOutcome, TraySession, parse_add_url, parse_start_minimized, summarize_monitor,
+        OsCloseOutcome, TraySession, parse_add_url, parse_start_from_autostart,
+        parse_start_minimized, start_windowless, summarize_monitor,
     };
 
     fn session() -> TraySession {
@@ -455,6 +483,38 @@ mod tests {
             "raijin".to_owned(),
             "--minimized=true".to_owned()
         ]));
+    }
+
+    #[test]
+    fn startup_flag_should_require_exact_match() {
+        assert!(parse_start_from_autostart([
+            "raijin".to_owned(),
+            "--startup".to_owned()
+        ]));
+        assert!(!parse_start_from_autostart(["raijin".to_owned()]));
+        assert!(!parse_start_from_autostart([
+            "raijin".to_owned(),
+            "--startup=true".to_owned()
+        ]));
+        // The old autostart flag must not be read as the new one.
+        assert!(!parse_start_from_autostart([
+            "raijin".to_owned(),
+            "--minimized".to_owned()
+        ]));
+    }
+
+    #[test]
+    fn windowless_decision_should_follow_flag_and_close_behavior() {
+        // Explicit `--minimized` hides regardless of close_to_tray.
+        assert!(start_windowless(true, false, false, true));
+        assert!(start_windowless(true, false, true, true));
+        // Autostart hides only while the close button hides to tray.
+        assert!(start_windowless(false, true, true, true));
+        assert!(!start_windowless(false, true, false, true));
+        // A plain launch always shows the window.
+        assert!(!start_windowless(false, false, true, true));
+        // No tray icon: never windowless, there would be no way back.
+        assert!(!start_windowless(true, true, true, false));
     }
 
     #[test]

@@ -1,24 +1,41 @@
 <script lang="ts" setup>
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { browser } from 'wxt/browser';
-import { getAll, normalizePort, setConfigItem } from '@/utils/config';
-import { MAX_ALLOWED_PORT, MIN_ALLOWED_PORT } from '@/utils/constants';
+import { getAll, setConfigItem } from '@/utils/config';
 import { sendAddDownload, sendTestPort } from '@/utils/messaging';
 import type { ConnectionStatus } from '@/utils/types';
 
-const portText = ref(String(35343));
-const token = ref('');
 const autoCapture = ref(true);
 const sendHeaders = ref(true);
 const status = ref<ConnectionStatus>('unknown');
-const statusMessage = ref('Not checked yet');
+const statusMessage = ref('Checking…');
 const testing = ref(false);
 const adding = ref(false);
 const actionMessage = ref('');
 
-function statusLabel(): string {
-  if (status.value === 'basic') return 'Connected — Basic access';
-  if (status.value === 'ok') return 'Connected — Authenticated';
+let currentPort = 35343;
+let currentToken = '';
+
+const isConnected = computed(() => status.value === 'basic' || status.value === 'ok');
+
+const statusBadge = computed(() => {
+  if (status.value === 'basic') {
+    return {
+      label: 'Basic',
+      tooltip: 'Downloads require desktop confirmation. Get token in Raijin App: Settings → Browser Integration.',
+    };
+  }
+  if (status.value === 'ok') {
+    return {
+      label: 'Full',
+      tooltip: 'Silent downloads enabled via authenticated desktop token.',
+    };
+  }
+  return null;
+});
+
+function statusMainLabel(): string {
+  if (isConnected.value) return 'Connected';
   if (status.value === 'down') return 'Server down';
   if (status.value === 'unauthorized') return 'Token rejected';
   return 'Checking…';
@@ -26,53 +43,36 @@ function statusLabel(): string {
 
 async function load(): Promise<void> {
   const config = await getAll();
-  portText.value = String(config.port);
-  token.value = config.token;
+  currentPort = config.port;
+  currentToken = config.token;
   autoCapture.value = config.autoCaptureLinks;
   sendHeaders.value = config.sendHeaders;
 }
 
-function currentPort(): number {
-  const parsed = Number.parseInt(portText.value, 10);
-  if (Number.isNaN(parsed)) return 35343;
-  return normalizePort(parsed);
-}
-
-async function test(): Promise<void> {
+async function checkConnection(): Promise<void> {
   testing.value = true;
   actionMessage.value = '';
-  const port = currentPort();
-  portText.value = String(port);
-  await setConfigItem('port', port);
-  await setConfigItem('token', token.value);
   try {
-    const result = await sendTestPort(port, token.value);
+    const result = await sendTestPort(currentPort, currentToken);
     if (result.reason === 'basic') {
       status.value = 'basic';
-      statusMessage.value = 'Downloads require confirmation in Raijin. Add a token to enable silent downloads';
+      statusMessage.value = 'Downloads require confirmation in Raijin. Add a token in Options to enable silent downloads.';
     } else if (result.reason === 'ok') {
       status.value = 'ok';
-      statusMessage.value = `Connected on port ${port}`;
+      statusMessage.value = `Connected on port ${currentPort}`;
     } else if (result.reason === 'unauthorized') {
       status.value = 'unauthorized';
-      statusMessage.value = 'Server is up, but the token was rejected';
+      statusMessage.value = 'Server is up, but the token was rejected. Update token in Options.';
     } else {
       status.value = 'down';
-      statusMessage.value = 'Server is down. Start Raijin and enable browser integration';
+      statusMessage.value = 'Server is down. Start Raijin and enable browser integration.';
     }
   } catch {
     status.value = 'down';
-    statusMessage.value = 'Server is down. Start Raijin and enable browser integration';
+    statusMessage.value = 'Server is down. Start Raijin and enable browser integration.';
   } finally {
     testing.value = false;
   }
-}
-
-async function clearToken(): Promise<void> {
-  token.value = '';
-  await setConfigItem('token', '');
-  status.value = 'unknown';
-  statusMessage.value = 'Token cleared';
 }
 
 async function toggleAutoCapture(): Promise<void> {
@@ -124,7 +124,7 @@ async function addActiveTab(): Promise<void> {
 
 onMounted(() => {
   void load().then(() => {
-    void test();
+    void checkConnection();
   });
 });
 </script>
@@ -133,27 +133,26 @@ onMounted(() => {
   <div class="popup">
     <header class="header">
       <img src="/icon/48.png" alt="Raijin" class="icon" />
-      <div>
+      <div class="header-text">
         <div class="title">Raijin</div>
-        <div class="status" :data-state="status">{{ statusLabel() }}</div>
+        <div class="status" :data-state="status">
+          <span class="status-dot"></span>
+          <span class="status-text">{{ statusMainLabel() }}</span>
+          <span
+            v-if="statusBadge"
+            class="badge"
+            :class="statusBadge.label === 'Full' ? 'badge-full' : 'badge-basic'"
+            :title="statusBadge.tooltip"
+          >
+            {{ statusBadge.label }}
+          </span>
+        </div>
       </div>
     </header>
-    <p class="hint">{{ statusMessage }}</p>
 
-    <label class="field">
-      <span>Port ({{ MIN_ALLOWED_PORT }}–{{ MAX_ALLOWED_PORT }})</span>
-      <input v-model="portText" type="number" :min="MIN_ALLOWED_PORT" :max="MAX_ALLOWED_PORT" />
-    </label>
-    <label class="field">
-      <span>API token (optional)</span>
-      <input v-model="token" type="password" autocomplete="off" placeholder="Paste desktop token" />
-    </label>
-    <div class="row">
-      <button type="button" :disabled="testing" @click="test">
-        {{ testing ? 'Testing…' : 'Test' }}
-      </button>
-      <button type="button" @click="clearToken">Clear token</button>
-    </div>
+    <p v-if="status === 'down' || status === 'unauthorized'" class="hint hint-error">
+      {{ statusMessage }}
+    </p>
 
     <div class="toggles">
       <button type="button" class="toggle" @click="toggleAutoCapture">
@@ -173,18 +172,18 @@ onMounted(() => {
         {{ adding ? 'Sending…' : 'Add active tab' }}
       </button>
     </div>
-    <p v-if="actionMessage" class="hint">{{ actionMessage }}</p>
+    <p v-if="actionMessage" class="action-msg">{{ actionMessage }}</p>
   </div>
 </template>
 
 <style scoped>
 .popup {
   width: 300px;
-  padding: 12px;
+  padding: 14px;
   font-size: 13px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 12px;
 }
 .header {
   display: flex;
@@ -195,49 +194,90 @@ onMounted(() => {
   width: 32px;
   height: 32px;
 }
+.header-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
 .title {
   font-weight: 700;
   font-size: 15px;
+  line-height: 1.2;
 }
 .status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 12px;
+  font-weight: 500;
   color: #888;
 }
-.status[data-state='ok'] {
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: #888;
+  flex-shrink: 0;
+}
+.status-text {
+  line-height: 1;
+}
+
+/* Connected states: green dot and green 'Connected' text */
+.status[data-state='ok'],
+.status[data-state='basic'] {
   color: #2da44e;
 }
+.status[data-state='ok'] .status-dot,
+.status[data-state='basic'] .status-dot {
+  background-color: #2da44e;
+}
+
+/* Error states */
 .status[data-state='down'],
 .status[data-state='unauthorized'] {
   color: #cf222e;
 }
+.status[data-state='down'] .status-dot,
+.status[data-state='unauthorized'] .status-dot {
+  background-color: #cf222e;
+}
+
+/* Badges / Pills */
+.badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 999px;
+  cursor: help;
+  user-select: none;
+  line-height: 1.4;
+  letter-spacing: 0.02em;
+}
+.badge-basic {
+  color: #d29922;
+  background-color: rgba(210, 153, 34, 0.15);
+  border: 1px solid rgba(210, 153, 34, 0.4);
+}
+.badge-full {
+  color: #2da44e;
+  background-color: rgba(45, 164, 78, 0.15);
+  border: 1px solid rgba(45, 164, 78, 0.4);
+}
+
 .hint {
   margin: 0;
-  color: #888;
   font-size: 12px;
+  line-height: 1.4;
 }
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+.hint-error {
+  color: #cf222e;
 }
-.field input {
-  padding: 6px 8px;
-  border-radius: 6px;
-  border: 1px solid #444;
-  background: inherit;
-  color: inherit;
-}
-.row {
-  display: flex;
-  gap: 8px;
-}
-.row button {
-  flex: 1;
-}
+
 .toggles {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 .toggle {
   display: flex;
@@ -258,5 +298,18 @@ onMounted(() => {
   margin: 0;
   font-size: 11px;
   color: #2da44e;
+}
+.row {
+  display: flex;
+  gap: 8px;
+}
+.row button {
+  flex: 1;
+}
+.action-msg {
+  margin: 0;
+  font-size: 12px;
+  color: #888;
+  text-align: center;
 }
 </style>

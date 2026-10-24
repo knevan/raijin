@@ -576,7 +576,7 @@ fn tray_icon_rgba() -> Vec<u8> {
 /// `HICON` / SNI pixmap / `NSImage`.
 fn tray_icon() -> gpui_tray::Result<gpui_tray::Icon> {
     const SIZE: u32 = 32;
-    gpui_tray::Icon::from_rgba(tray_icon_rgba(), SIZE, SIZE)
+    gpui_tray::Icon::from_rgba(tray_icon_rgba(), SIZE, SIZE).build()
 }
 
 /// Bootstraps persistence, settings, the download manager actor, and the monitor.

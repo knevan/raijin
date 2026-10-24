@@ -132,7 +132,7 @@ impl DownloadRow {
         let total = view.total_bytes.map(|bytes| bytes.get());
         let downloaded = view.downloaded_bytes.get();
         let progress = progress_percent(downloaded, total);
-        let is_active = matches!(view.status, DownloadStatus::Downloading);
+        let is_active = is_transferring(view.status);
         let show_progress = matches!(
             view.status,
             DownloadStatus::Downloading | DownloadStatus::Paused
@@ -219,6 +219,19 @@ fn failure_kind_label(kind: FailureKind) -> &'static str {
 #[must_use]
 pub const fn can_resume(status: DownloadStatus) -> bool {
     matches!(status, DownloadStatus::Paused | DownloadStatus::Error)
+}
+
+/// True when the engine is still working on `status`.
+///
+/// Counts as active for the status bar, the tray tooltip, and the
+/// "Pause all" row: these states hold a live slot even when no bytes move
+/// (a retry backoff, or file preallocation).
+#[must_use]
+pub const fn is_transferring(status: DownloadStatus) -> bool {
+    matches!(
+        status,
+        DownloadStatus::Downloading | DownloadStatus::Retrying | DownloadStatus::PreparingFile
+    )
 }
 
 /// True when Pause (and Pause-all) applies to `status`.
@@ -1224,7 +1237,8 @@ mod tests {
 
     use super::{
         ColumnDef, DownloadRow, QueueDrag, RowChecklist, SortColumn, SortDir, build_rows,
-        can_pause, can_resume, filter_rows, next_sort, queue_subtitle, sort_rows, toolbar_actions,
+        can_pause, can_resume, filter_rows, is_transferring, next_sort, queue_subtitle, sort_rows,
+        toolbar_actions,
     };
     use crate::category::{CategoryFilter, FileCategory, StatusFilter};
     use crate::format::format_bytes;
@@ -1449,6 +1463,15 @@ mod tests {
         assert!(!can_pause(DownloadStatus::Completed));
         assert!(!can_pause(DownloadStatus::Paused));
         assert!(!can_pause(DownloadStatus::Error));
+
+        // A live engine slot even when no bytes move; the status bar, the
+        // tooltip and "Pause all" all count these.
+        assert!(is_transferring(DownloadStatus::Downloading));
+        assert!(is_transferring(DownloadStatus::Retrying));
+        assert!(is_transferring(DownloadStatus::PreparingFile));
+        assert!(!is_transferring(DownloadStatus::Paused));
+        assert!(!is_transferring(DownloadStatus::Completed));
+        assert!(!is_transferring(DownloadStatus::Error));
 
         let mixed = toolbar_actions(
             &[DownloadStatus::Completed, DownloadStatus::Paused],

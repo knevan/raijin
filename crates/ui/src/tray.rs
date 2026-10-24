@@ -6,6 +6,8 @@ use raijin_core::platform::tray::{
     CloseDecision, MinimizeDecision, TrayBehavior, WindowVisibility, tray_tooltip,
 };
 
+use crate::downloads::is_transferring;
+
 /// Shared tray session handle (cloneable across views and callbacks).
 ///
 /// All locks guard a single enum/flag copy and are never held across
@@ -275,21 +277,26 @@ pub enum OsCloseOutcome {
 /// Returns `(active_count, paused_count, total_speed_bps)`. Pure over the
 /// projected snapshot, so the hidden tray tick can call it without entity
 /// access.
+///
+/// Both counts are read from `active`, because
+/// [`Projection::place_view`](raijin_core::monitor) files every non-terminal
+/// status there; `completed` only ever holds `Completed` and `Error`.
 #[must_use]
 pub fn summarize_monitor(snapshot: &raijin_core::monitor::MonitorState) -> (usize, usize, u64) {
     let mut active = 0usize;
+    let mut paused = 0usize;
     let mut speed = 0u64;
     for view in snapshot.active.values() {
-        if view.status == DownloadStatus::Downloading {
+        // Shares `is_transferring` with `DownloadRow::is_active` so the tooltip
+        // and the "Pause all" row agree whether the window is open or hidden.
+        if is_transferring(view.status) {
             active += 1;
+        }
+        if view.status == DownloadStatus::Paused {
+            paused += 1;
         }
         speed = speed.saturating_add(view.speed.get());
     }
-    let paused = snapshot
-        .completed
-        .values()
-        .filter(|view| view.status == DownloadStatus::Paused)
-        .count();
     (active, paused, speed)
 }
 
@@ -628,18 +635,74 @@ mod tests {
                 updated_at: now,
             },
         );
+        // Non-terminal statuses live in `active` (see `Projection::place_view`),
+        // so `Paused`, `Retrying` and `PreparingFile` must be seeded here.
+        active.insert(
+            DownloadId::new(3),
+            DownloadView {
+                id: DownloadId::new(3),
+                url: "https://example.com/c.zip".to_owned(),
+                file_name: "c.zip".to_owned(),
+                folder: std::path::PathBuf::from("C:/Downloads"),
+                status: DownloadStatus::Paused,
+                downloaded_bytes: Bytes::new(5),
+                total_bytes: Some(Bytes::new(50)),
+                speed: BytesPerSecond::ZERO,
+                eta_seconds: None,
+                active_part_count: 0,
+                failure: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        active.insert(
+            DownloadId::new(4),
+            DownloadView {
+                id: DownloadId::new(4),
+                url: "https://example.com/d.zip".to_owned(),
+                file_name: "d.zip".to_owned(),
+                folder: std::path::PathBuf::from("C:/Downloads"),
+                status: DownloadStatus::Retrying,
+                downloaded_bytes: Bytes::new(7),
+                total_bytes: Some(Bytes::new(70)),
+                speed: BytesPerSecond::ZERO,
+                eta_seconds: None,
+                active_part_count: 0,
+                failure: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        active.insert(
+            DownloadId::new(5),
+            DownloadView {
+                id: DownloadId::new(5),
+                url: "https://example.com/e.zip".to_owned(),
+                file_name: "e.zip".to_owned(),
+                folder: std::path::PathBuf::from("C:/Downloads"),
+                status: DownloadStatus::PreparingFile,
+                downloaded_bytes: Bytes::ZERO,
+                total_bytes: Some(Bytes::new(90)),
+                speed: BytesPerSecond::ZERO,
+                eta_seconds: None,
+                active_part_count: 0,
+                failure: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
         let snapshot = MonitorState {
             active,
             completed: std::collections::BTreeMap::from([(
-                DownloadId::new(3),
+                DownloadId::new(6),
                 DownloadView {
-                    id: DownloadId::new(3),
-                    url: "https://example.com/c.zip".to_owned(),
-                    file_name: "c.zip".to_owned(),
+                    id: DownloadId::new(6),
+                    url: "https://example.com/f.zip".to_owned(),
+                    file_name: "f.zip".to_owned(),
                     folder: std::path::PathBuf::from("C:/Downloads"),
-                    status: DownloadStatus::Paused,
-                    downloaded_bytes: Bytes::new(5),
-                    total_bytes: Some(Bytes::new(50)),
+                    status: DownloadStatus::Completed,
+                    downloaded_bytes: Bytes::new(100),
+                    total_bytes: Some(Bytes::new(100)),
                     speed: BytesPerSecond::ZERO,
                     eta_seconds: None,
                     active_part_count: 0,
@@ -650,7 +713,9 @@ mod tests {
             )]),
         };
 
-        assert_eq!(summarize_monitor(&snapshot), (2, 1, 3072));
+        // 2 downloading + retrying + preparing counts as transferring; the
+        // completed entry contributes nothing to any counter or speed.
+        assert_eq!(summarize_monitor(&snapshot), (4, 1, 3072));
         assert_eq!(summarize_monitor(&MonitorState::default()), (0, 0, 0));
     }
 }

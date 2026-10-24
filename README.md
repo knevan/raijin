@@ -103,13 +103,17 @@ A companion extension source is located in the [`browser-extension/`](./browser-
    ```bash
    cd browser-extension
    pnpm install
-   pnpm build          # Builds Chromium-compatible extension (Manifest V3)
-   pnpm build:firefox  # Builds Firefox-compatible extension (Manifest V2/V3)
+   pnpm build          # Builds both Chromium (MV3) and Firefox (MV2)
+   pnpm build:firefox  # Builds only the Firefox-compatible extension
    ```
 
 3. **Load in Browser:**
    - **Chromium (Chrome, Brave, Edge):** Navigate to `chrome://extensions`, enable **Developer mode**, select **Load unpacked**, and choose `browser-extension/.output/chrome-mv3`.
-   - **Firefox:** Navigate to `about:debugging#/runtime/this-firefox`, select **Load Temporary Add-on**, and choose the manifest file in `browser-extension/.output/firefox-mv2`.
+   - **Firefox (development):** Navigate to `about:debugging#/runtime/this-firefox`, select **Load Temporary Add-on**, and choose `browser-extension/.output/firefox-mv2/manifest.json`. Alternatively run `pnpm dev:firefox`, which loads it automatically.
+   - **Firefox (permanent):** Firefox release only installs signed add-ons; loading the unsigned zip from `pnpm zip` fails with "appears to be corrupt". Sign it with your AMO credentials first:
+     ```bash
+     WEB_EXT_API_KEY=... WEB_EXT_API_SECRET=... pnpm build:firefox && pnpm sign:firefox
+     ```
 
 ---
 

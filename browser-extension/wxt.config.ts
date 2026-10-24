@@ -13,7 +13,7 @@ export default defineConfig({
       chrome: bravePath
     }
   },
-  manifest: {
+  manifest: ({ browser }) => ({
     name: 'Raijin Browser Integration',
     description: 'Capture browser downloads and send them to the Raijin download manager.',
     default_locale: 'en',
@@ -26,5 +26,23 @@ export default defineConfig({
       96: 'icon/96.png',
       128: 'icon/128.png',
     },
-  },
+    // Firefox needs a stable add-on ID for signing and declares the data it
+    // forwards to the local Raijin app for built-in consent on AMO.
+    ...(browser === 'firefox'
+      ? {
+          browser_specific_settings: {
+            gecko: {
+              id: 'raijin-browser@raijin.app',
+              strict_min_version: '140.0',
+              data_collection_permissions: {
+                required: ['browsingActivity', 'websiteContent'],
+              },
+            },
+            gecko_android: {
+              strict_min_version: '142.0',
+            },
+          },
+        }
+      : {}),
+  }),
 });

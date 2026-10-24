@@ -634,6 +634,7 @@ async fn bootstrap_engine() -> Result<Bootstrap, String> {
         port,
         tray: tray.clone(),
         desktop: std::sync::Arc::new(std::sync::RwLock::new(desktop.clone())),
+        window: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
     Ok((
         EngineHandles {

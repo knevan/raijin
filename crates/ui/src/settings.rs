@@ -4,7 +4,7 @@
 //! renders the selected section. v1 covers Browser Integration (pairing token)
 //! and General (tray close behavior + launch at startup).
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::clipboard::Clipboard;
@@ -66,6 +66,8 @@ pub struct SettingsHandles {
     pub tray: TraySession,
     /// Last loaded settings, shared so each toggle edits the whole document.
     pub desktop: Arc<RwLock<DesktopSettings>>,
+    /// Live Settings window, reused instead of spawning duplicates.
+    pub window: Arc<Mutex<Option<AnyWindowHandle>>>,
 }
 
 /// Settings window state.
@@ -504,6 +506,20 @@ pub(crate) fn apply_autostart(settings: &DesktopSettings) -> Result<(), String> 
 /// Wired to the tray menu and the toolbar gear; failures only mean the window
 /// could not open and are logged.
 pub fn open_settings_window(cx: &mut App, handles: &SettingsHandles) {
+    let existing = *handles
+        .window
+        .lock()
+        .expect("settings window lock poisoned");
+    if let Some(existing) = existing {
+        // A closed window makes `update` fail; fall through and reopen.
+        if existing
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+        {
+            return;
+        }
+    }
+
     // Settings is a two-pane shell (persistent nav + detail), so it needs more
     // room than the single-section dialog it replaced.
     let dialog_size = size(px(SETTINGS_WIDTH), px(SETTINGS_HEIGHT));
@@ -518,7 +534,12 @@ pub fn open_settings_window(cx: &mut App, handles: &SettingsHandles) {
         cx.new(|cx| Root::new(view, window, cx))
     }) {
         Ok(handle) => {
-            let _ = handle.update(cx, |_, window, _| window.activate_window());
+            let any = AnyWindowHandle::from(handle);
+            *handles
+                .window
+                .lock()
+                .expect("settings window lock poisoned") = Some(any);
+            let _ = any.update(cx, |_, window, _| window.activate_window());
         }
         Err(error) => tracing::error!(?error, "failed to open Settings window"),
     }

@@ -7,10 +7,12 @@
   "scripts": {
     "dev": "wxt",
     "dev:firefox": "wxt -b firefox",
-    "build": "wxt build",
+    "build": "wxt build && wxt build -b firefox",
     "build:firefox": "wxt build -b firefox",
-    "zip": "wxt zip",
+    "zip": "wxt zip && wxt zip -b firefox",
     "zip:firefox": "wxt zip -b firefox",
+    "lint:firefox": "web-ext lint --source-dir .output/firefox-mv2",
+    "sign:firefox": "web-ext sign --source-dir .output/firefox-mv2",
     "compile": "vue-tsc --noEmit",
     "test": "node --test utils/*.test.mjs",
     "postinstall": "wxt prepare"

@@ -45,9 +45,11 @@ impl Render for QueueDragPreview {
         div()
             .px_3()
             .py_1()
-            .rounded(px(8.))
-            .bg(cx.theme().accent)
-            .text_color(cx.theme().accent_foreground)
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
             .text_sm()
             .child(self.label.clone())
     }
@@ -509,7 +511,8 @@ fn checkbox_frame(checkbox: Checkbox, cx: &App) -> impl IntoElement {
         .flex_shrink_0()
         .border_1()
         .border_color(cx.theme().border)
-        .rounded(px(4.))
+        .rounded_sm()
+        .bg(cx.theme().background)
         .child(checkbox)
 }
 
@@ -557,7 +560,7 @@ pub struct DownloadsDelegate {
 }
 
 impl DownloadsDelegate {
-    /// Creates a delegate with the default column layout from the sketch.
+    /// Creates a delegate with the default column layout for the downloads table.
     #[must_use]
     pub fn new(commands: EngineHandles) -> Self {
         Self {
@@ -760,9 +763,10 @@ impl TableDelegate for DownloadsDelegate {
         div()
             .id("downloads-table-header")
             .mb(px(3.))
-            .rounded(px(8.))
+            .rounded(cx.theme().radius)
             .border_1()
             .border_color(cx.theme().border)
+            .bg(cx.theme().muted)
             .overflow_hidden()
     }
 
@@ -774,8 +778,8 @@ impl TableDelegate for DownloadsDelegate {
     ) -> impl IntoElement {
         let key = self.column_key(col_ix);
         let name = self.columns[col_ix].name;
-        // Sketch header: sort glyph left of the label in `$text-muted`, label
-        // in `$text-secondary`. The table's built-in right-side glyph is
+        // Header: sort glyph left of the label in muted text, label in the
+        // secondary foreground. The table's built-in right-side glyph is
         // disabled, so this is the single sort affordance; the whole header
         // content is clickable and cycles the sort (see `cycle_sort`).
         // NOTE: per-cell card backgrounds were tried and reverted — the row
@@ -910,7 +914,7 @@ impl TableDelegate for DownloadsDelegate {
             .id(SharedString::from(format!("download-row-{id_num}")))
             .my(px(2.))
             .h(px(48.))
-            .rounded(px(8.))
+            .rounded(cx.theme().radius)
             .border_1()
             .border_color(border_color)
             .bg(bg)
@@ -1036,7 +1040,8 @@ impl TableDelegate for DownloadsDelegate {
             col::STATUS => {
                 let color = match row.status {
                     DownloadStatus::Completed => cx.theme().success,
-                    DownloadStatus::Error | DownloadStatus::Paused => cx.theme().danger,
+                    DownloadStatus::Error => cx.theme().danger,
+                    DownloadStatus::Paused => cx.theme().warning,
                     _ => cx.theme().foreground,
                 };
                 let mut cell = v_flex().h_full().justify_center().gap_1().child(
@@ -1052,7 +1057,7 @@ impl TableDelegate for DownloadsDelegate {
                     .value(progress)
                     .small();
                     if row.status == DownloadStatus::Paused {
-                        bar = bar.color(cx.theme().danger);
+                        bar = bar.color(cx.theme().warning);
                     }
                     cell = cell.child(bar);
                 }
@@ -1114,7 +1119,7 @@ impl TableDelegate for DownloadsDelegate {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Use New Download to add your first link."),
+                    .child("Use New Download… to add your first link."),
             )
             .into_any_element()
     }

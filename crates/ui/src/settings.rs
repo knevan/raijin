@@ -1,7 +1,7 @@
 //! Settings window.
 //!
 //! Sections are navigation entries in a persistent left sidebar; the right pane
-//! renders the selected section. v1 covers Browser Integration (pairing token)
+//! renders the selected section. v1 covers browser integration (pairing token)
 //! and General (tray close behavior + launch at startup).
 
 use std::sync::{Arc, Mutex, RwLock};
@@ -38,7 +38,7 @@ impl Section {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::BrowserIntegration => "Browser Integration",
+            Self::BrowserIntegration => "Browser integration",
             Self::General => "General",
         }
     }
@@ -314,7 +314,7 @@ impl SettingsView {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Browser Integration"),
+                    .child("Browser integration"),
             )
             .child(
                 h_flex()

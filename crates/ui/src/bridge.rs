@@ -19,7 +19,7 @@ pub struct EngineHandles {
     pub default_folder: PathBuf,
     /// Root folder that holds one subfolder per file category.
     pub category_root: PathBuf,
-    /// Whether new-download forms check "Use Category" by default.
+    /// Whether new-download forms check "Use category" by default.
     pub use_category_default: bool,
 }
 

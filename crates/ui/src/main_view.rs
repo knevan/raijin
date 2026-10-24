@@ -1047,11 +1047,8 @@ impl SidebarItem for QueueSection {
                             })
                     })
                     .when(is_collapsed, |this| {
-                        this.justify_center().child(
-                            Icon::new(IconName::Menu)
-                                .size_4()
-                                .text_color(text_color),
-                        )
+                        this.justify_center()
+                            .child(Icon::new(IconName::Menu).size_4().text_color(text_color))
                     })
                     .when(!is_collapsed, |this| {
                         this.child(
@@ -1059,23 +1056,11 @@ impl SidebarItem for QueueSection {
                                 .items_center()
                                 .gap_2()
                                 .overflow_hidden()
-                                .child(
-                                    Icon::new(IconName::Menu)
-                                        .size_4()
-                                        .text_color(text_color),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_sm()
-                                        .child(name),
-                                )
+                                .child(Icon::new(IconName::Menu).size_4().text_color(text_color))
+                                .child(div().truncate().text_sm().child(name))
                                 .when(running, |this| {
                                     this.child(
-                                        div()
-                                            .size_1p5()
-                                            .rounded_full()
-                                            .bg(cx.theme().accent),
+                                        div().size_1p5().rounded_full().bg(cx.theme().accent),
                                     )
                                 }),
                         )

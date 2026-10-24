@@ -13,7 +13,7 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Root, Sizable as _, TitleBar,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar,
     WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::*;
@@ -467,9 +467,6 @@ impl Render for SettingsView {
                             }),
                     ),
             )
-            .children(Root::render_dialog_layer(_window, cx))
-            .children(Root::render_sheet_layer(_window, cx))
-            .children(Root::render_notification_layer(_window, cx))
     }
 }
 
@@ -520,8 +517,7 @@ pub fn open_settings_window(cx: &mut App, handles: &SettingsHandles) {
     options.focus = true;
     let handles = handles.clone();
     match cx.open_window(options, |window, cx| {
-        let view = cx.new(|cx| SettingsView::new(window, cx, handles.clone()));
-        cx.new(|cx| Root::new(view, window, cx))
+        cx.new(|cx| SettingsView::new(window, cx, handles.clone()))
     }) {
         Ok(handle) => {
             let _ = handle.update(cx, |_, window, _| window.activate_window());

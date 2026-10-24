@@ -26,7 +26,7 @@ mod tray;
 
 use std::time::Duration;
 
-use gpui_kit::component::{Root, Theme, ThemeMode, TitleBar};
+use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
 use raijin_core::integration::DEFAULT_PORT;
 use raijin_core::platform::tray::CloseDecision;
@@ -207,7 +207,7 @@ fn main() {
                     cx.update(|cx| {
                         let options = main_window_options(cx);
                         cx.open_window(options, |window, cx| {
-                            build_main_root(
+                            build_main_view(
                                 window,
                                 cx,
                                 handles.clone(),
@@ -449,7 +449,7 @@ fn open_main_window(
     let root_tray = tray.clone();
     let root_settings = settings.clone();
     match cx.open_window(main_window_options(cx), |window, cx| {
-        build_main_root(
+        build_main_view(
             window,
             cx,
             root_handles.clone(),
@@ -477,20 +477,19 @@ fn main_window_options(cx: &App) -> WindowOptions {
     options
 }
 
-/// Builds the main window root view and wires the close veto.
+/// Builds the main window view and wires the close veto.
 ///
 /// Every opened main window (initial + rebuilds) goes through here so the
 /// close behavior stays identical across the app lifetime.
-fn build_main_root(
+fn build_main_view(
     window: &mut Window,
     cx: &mut App,
     handles: EngineHandles,
     session: TraySession,
     settings: SettingsHandles,
-) -> Entity<Root> {
+) -> Entity<MainView> {
     register_should_close(window, cx, &session);
-    let view = cx.new(|cx| MainView::new(window, cx, handles, session, settings));
-    cx.new(|cx| Root::new(view, window, cx))
+    cx.new(|cx| MainView::new(window, cx, handles, session, settings))
 }
 
 /// Vetoes the OS close for tray hides (X, Alt+F4, taskbar close) and converts

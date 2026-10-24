@@ -6,7 +6,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Root, Sizable as _, TitleBar,
+    ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _, TitleBar,
     WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -700,7 +700,6 @@ impl Render for AddDownloadView {
                             ),
                     ),
             )
-            .children(Root::render_notification_layer(_window, cx))
     }
 }
 
@@ -721,8 +720,7 @@ pub fn open_add_download_window(cx: &mut App, handles: &EngineHandles, initial_u
     let handles = handles.clone();
     let initial_url = initial_url.to_owned();
     match cx.open_window(options, |window, cx| {
-        let view = cx.new(|cx| AddDownloadView::new(window, cx, handles.clone(), &initial_url));
-        cx.new(|cx| Root::new(view, window, cx))
+        cx.new(|cx| AddDownloadView::new(window, cx, handles.clone(), &initial_url))
     }) {
         Ok(handle) => {
             let _ = handle.update(cx, |_, window, _| window.activate_window());

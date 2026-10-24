@@ -9,7 +9,7 @@ use gpui_kit::component::sidebar::{Sidebar, SidebarItem, SidebarMenu, SidebarMen
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Collapsible, Disableable as _, Icon, IconName, Root, Sizable as _, TitleBar,
+    ActiveTheme as _, Collapsible, Disableable as _, Icon, IconName, Sizable as _, TitleBar,
     h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -828,9 +828,6 @@ impl Render for MainView {
                 ),
             )
             .child(self.render_statusbar(cx))
-            .children(Root::render_dialog_layer(window, cx))
-            .children(Root::render_sheet_layer(window, cx))
-            .children(Root::render_notification_layer(window, cx))
     }
 }
 

@@ -1,22 +1,29 @@
 # gpui-kit Upgrade Discussion
 
-Status: **deferred** (not scheduled). This document records the analysis so a
-future upgrade starts from evidence instead of re-deriving it.
+Status: **done** (landed). Sections 1-5 are the analysis that was written
+before the upgrade; §6 records what actually changed when it shipped.
 
 Scope: upgrading the UI stack from the pinned `gpui-kit` 0.6.1 to 0.8.0, and
 whether `gpui-tray` needs a fork to allow it.
 
-## 1. Current pins
+## 1. Pins after the upgrade
 
 ```toml
-gpui-kit  = { version = "0.6", features = ["component", "assets"] }
-gpui-tray = { version = "0.1.3", default-features = false, features = ["gpui-kit"] }
+gpui-kit  = { version = "0.8", features = ["component", "assets"] }
+gpui-tray = { version = "0.3", default-features = false, features = ["gpui-kit", "menu-state"] }
 ```
 
-Resolved today: `gpui-kit` 0.6.1, `gpui-base`/`gpui-component` 0.6.1,
-`gpui-pre` 0.3.5, `gpui-tray` 0.1.3.
+Resolved: `gpui-kit` 0.8.0, `gpui-base`/`gpui-component`/`gpui-kit-assets`
+0.8.0, `gpui-pre` 0.3.9, `gpui-tray` 0.3.0. Exactly one `gpui-pre` in the
+lockfile, verified with `cargo tree -i gpui-pre`.
 
-Available: `gpui-kit` 0.8.0 (released), `gpui-tray` 0.1.4 (latest).
+`gpui-tray` 0.3.0 is functionally identical to 0.2.0 for the `gpui-kit`
+backend: the whole 0.2.0 -> 0.3.0 diff is an `gpui-ce` dependency bump plus a
+test-only change in `icon.rs`. Every breaking change arrived in 0.2.0.
+
+`gpui-tray` pulls `zbus` 6 on Linux while `gpui-pre-linux` still uses `zbus` 5,
+so `cargo tree --target all` shows both. The constraint is
+`cfg(target_os = "linux")`, so Windows and macOS builds are untouched.
 
 ## 2. Fork question: not needed
 
@@ -29,10 +36,10 @@ uses an exact pin (`=0.3.9`).
 Verified with a throwaway crate, not by reading manifests:
 
 ```text
-$ cargo generate-lockfile   # gpui-kit 0.8 + gpui-tray 0.1.4
+$ cargo generate-lockfile   # gpui-kit 0.8 + gpui-tray 0.3.0
 gpui-pre  → 0.3.9     (single version)
 gpui-kit  → 0.8.0
-gpui-tray → 0.1.4
+gpui-tray → 0.3.0
 
 $ cargo check
 Finished `dev` profile
@@ -94,14 +101,44 @@ Net: the upgrade is expected to be mechanical, not architectural.
 - No runtime check. Window startup, tray lifecycle, and the close-veto path
   are behavior-sensitive (`window.on_window_should_close`, deferred
   `remove_window`, `on_window_closed` observers) and were not exercised.
-- Cross-platform build unverified; only Windows was probed.
+- Cross-platform build unverified; only Windows was probed. (Resolved when the
+  upgrade landed: `cargo check`, `cargo clippy -D warnings` and 59 UI tests
+  passed on Windows.)
+
+## 6. What actually changed when it landed
+
+Three code changes, everything else was the dependency bump:
+
+| Change | Why |
+| --- | --- |
+| `Root::new` / `Root::render_dialog_layer|sheet|notification_layer` removed from all four views | In 0.8 `Root` is `gpui_base::Root`; the dialog/sheet/notification layers are mounted by the `RootPlugin` registered in `gpui_component::init`. The `.children(...)` calls were deleted, not renamed. |
+| `build_main_root` -> `build_main_view`, now returns `Entity<MainView>` | Nothing wraps `Root` in application code any more, so the name no longer described the result. |
+| `tray_icon()` calls `.build()` on `Icon::from_rgba` | `gpui-tray` 0.2.0 turned `Icon::from_rgba`/`from_gpui` into builders that validate at `.build()`. |
+
+Decisions taken, recorded so a future upgrade does not relitigate them:
+
+- **`gpui_kit::open_window` was not adopted.** It wraps the build view in
+  `base::Root` itself, while the application already passes a `Root`-free view
+  straight to `cx.open_window`. Adopting it would only add an import.
+- **The Add Download window now hosts dialog/sheet layers too**, because the
+  plugin is registered per application, not per window. Accepted: it was the
+  only window that previously mounted notifications alone.
+- **`menu-state` is enabled.** Without it `gpui-tray` hardcodes
+  `enabled: true` in `compile_menu`, so every `MenuItem::disabled(...)` in
+  `main.rs` was silently discarded. The `has_window` row also needed a
+  rebuild signal: `TraySession::mark_shown`/`mark_closed` set `menu_dirty` and
+  the existing 1 s sync loop consumes it, so the menu rebuilds on window
+  transitions without polling `App::windows()` every tick.
+- **`on_activate_with` (Wayland activation token) is deferred to Q3.**
+  `gpui-pre` 0.3.9 exposes no API that consumes an external activation token,
+  so wiring it now would drop the token on the floor.
 
 ## 5. Recommended procedure when it is scheduled
 
 1. Do it as a standalone change. Never combined with a feature landing: a
    mixed diff makes a compile failure impossible to attribute.
 2. Branch, then `cargo update -p gpui-kit --precise 0.8.0` and
-   `cargo update -p gpui-tray --precise 0.1.4`.
+   `cargo update -p gpui-tray --precise 0.3.0`.
 3. `cargo tree -i gpui-pre` and confirm exactly one version before fixing any
    code. If two appear, stop and re-read the manifests rather than patching.
 4. `cargo check -p raijin-ui`, then inventory errors by category

@@ -27,6 +27,11 @@ pub struct TraySession {
     activity: std::sync::Arc<Mutex<(usize, usize)>>,
     /// Last tooltip text for the 1s tray sync loop (views write, loop reads).
     last_tooltip: std::sync::Arc<Mutex<String>>,
+    /// Set by every window-visibility transition so the 1s tray sync loop
+    /// rebuilds the menu even when the activity flags are unchanged. The
+    /// `has_window` menu row is derived from `App::windows()`, which only the
+    /// sync loop can read without borrowing `App` on every tick.
+    menu_dirty: std::sync::Arc<AtomicBool>,
 }
 
 impl TraySession {
@@ -41,6 +46,7 @@ impl TraySession {
             tray_icon_live: std::sync::Arc::new(AtomicBool::new(false)),
             activity: std::sync::Arc::new(Mutex::new((0, 0))),
             last_tooltip: std::sync::Arc::new(Mutex::new(tray_tooltip("Raijin", 0, 0))),
+            menu_dirty: std::sync::Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -129,10 +135,13 @@ impl TraySession {
     /// can be reused (hide path) vs a full rebuild from monitor + DB
     /// (closed path, see `plan.md` M6 window rule).
     pub fn mark_shown(&self) -> bool {
-        self.visibility
+        let preserved = self
+            .visibility
             .lock()
             .expect("tray visibility lock poisoned")
-            .show()
+            .show();
+        self.menu_dirty.store(true, Ordering::Relaxed);
+        preserved
     }
 
     /// Marks the window destroyed via `remove_window`.
@@ -141,6 +150,15 @@ impl TraySession {
             .lock()
             .expect("tray visibility lock poisoned")
             .close();
+        self.menu_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Consumes a pending window-transition signal.
+    ///
+    /// Lets the tray sync loop rebuild the menu when the window set changed
+    /// without polling `App::windows()` on every tick.
+    pub fn take_menu_dirty(&self) -> bool {
+        self.menu_dirty.swap(false, Ordering::Relaxed)
     }
 
     /// Called from the `on_window_closed` observer (OS chrome close or the
@@ -461,6 +479,23 @@ mod tests {
         assert_eq!(tray.last_tooltip(), tooltip);
         assert!(tray.has_active());
         assert!(tray.has_paused());
+    }
+
+    #[test]
+    fn window_transitions_should_signal_a_menu_rebuild() {
+        let tray = session();
+        assert!(!tray.take_menu_dirty(), "a fresh session is clean");
+
+        tray.note_hidden_to_tray();
+        assert!(!tray.take_menu_dirty(), "an in-place hide keeps the window");
+
+        tray.mark_closed();
+        assert!(tray.take_menu_dirty(), "a destroyed window changes the menu");
+        assert!(!tray.take_menu_dirty(), "the signal is consumed once");
+
+        tray.mark_shown();
+        assert!(tray.take_menu_dirty(), "a reopened window changes the menu");
+        assert!(!tray.take_menu_dirty());
     }
 
     #[test]

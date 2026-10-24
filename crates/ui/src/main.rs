@@ -411,7 +411,10 @@ fn spawn_tray_sync(cx: &mut App, icon: gpui_tray::Tray, session: TraySession) {
             let tooltip = session.last_tooltip();
             let flags = (session.has_active(), session.has_paused());
             let tooltip_changed = tooltip != last_tooltip;
-            let menu_changed = flags != last_flags;
+            // `has_window` is read by the menu builder, which already holds
+            // `App`; the session only reports that a transition happened, so
+            // this loop never borrows `App` while nothing changed.
+            let menu_changed = flags != last_flags || session.take_menu_dirty();
             if tooltip_changed {
                 last_tooltip = tooltip;
             }

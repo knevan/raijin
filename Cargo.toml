@@ -8,7 +8,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 getrandom = "0.4"
 encoding_rs = "0.8"
 gpui-kit = { version = "0.8", features = ["component", "assets"] }
-gpui-tray = { version = "0.3", default-features = false, features = ["gpui-kit"] }
+gpui-tray = { version = "0.3", default-features = false, features = ["gpui-kit", "menu-state"] }
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 sqlx = { version = "0.9", default-features = false, features = ["macros", "migrate", "runtime-tokio", "sqlite"] }

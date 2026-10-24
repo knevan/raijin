@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
@@ -57,6 +57,12 @@ impl Render for QueueDragPreview {
 
 /// Poll interval for monitor snapshots on the GPUI thread.
 pub const MONITOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Trailing gutter `DataTable` reserves after the last column.
+///
+/// Kept out of the fitted width so the table never overflows horizontally by
+/// the gutter alone.
+pub const TABLE_TRAILING_GUTTER_PX: f32 = 12.0;
 
 /// Fixed table body slot height in pixels.
 ///
@@ -535,11 +541,72 @@ impl ColumnDef {
             min_width,
         }
     }
+}
 
-    /// Floors a dragged width at this column's readable minimum.
-    fn clamp_width(&self, raw: f32) -> f32 {
-        raw.max(self.min_width)
+/// Every column the delegate can show, in catalog order.
+const ALL_COLUMNS: [ColumnDef; 6] = [
+    ColumnDef::new(col::NAME, "Name", 390.0, 160.0),
+    ColumnDef::new(col::SIZE, "Size", 110.0, 64.0),
+    ColumnDef::new(col::STATUS, "Status", 210.0, 96.0),
+    ColumnDef::new(col::SPEED, "Speed", 130.0, 56.0),
+    ColumnDef::new(col::ETA, "Time Left", 130.0, 56.0),
+    ColumnDef::new(col::ADDED, "Date Added", 150.0, 72.0),
+];
+
+/// One checkable entry in the header's "columns" context menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnToggle {
+    /// Stable column key used by [`DownloadsDelegate::toggle_column`].
+    pub key: &'static str,
+    /// Human-readable column name.
+    pub label: &'static str,
+    /// Whether the column is currently visible.
+    pub visible: bool,
+    /// Columns that cannot be hidden because the table needs them.
+    pub required: bool,
+}
+
+/// Catalog position of a column key, used to restore display order.
+fn catalog_index(key: &str) -> usize {
+    ALL_COLUMNS
+        .iter()
+        .position(|def| def.key == key)
+        .unwrap_or(ALL_COLUMNS.len())
+}
+
+/// Fits preferred column widths into the measured table width.
+///
+/// When the width is unknown or everything fits, preferred widths are kept.
+/// Between the total minimum and total preferred, columns interpolate from
+/// minimum to preferred so the row sums to `available`. Below the total
+/// minimum, every column squeezes proportionally and no field is dropped.
+fn fit_column_widths(preferred: &[f32], minimums: &[f32], available: Option<f32>) -> Vec<f32> {
+    let total_preferred: f32 = preferred.iter().sum();
+    let total_minimum: f32 = minimums.iter().sum();
+    let Some(width) = available else {
+        return preferred.to_vec();
+    };
+    if width >= total_preferred || total_preferred <= 0.0 || total_minimum <= 0.0 {
+        return preferred.to_vec();
     }
+    if width <= total_minimum {
+        let scale = width / total_minimum;
+        return minimums.iter().map(|min| min * scale).collect();
+    }
+    let surplus = width - total_minimum;
+    let weight: f32 = preferred
+        .iter()
+        .zip(minimums.iter())
+        .map(|(pref, min)| (pref - min).max(0.0))
+        .sum();
+    if weight <= 0.0 {
+        return minimums.to_vec();
+    }
+    preferred
+        .iter()
+        .zip(minimums.iter())
+        .map(|(pref, min)| min + (pref - min).max(0.0) * surplus / weight)
+        .collect()
 }
 
 /// `DataTable` delegate rendering [`DownloadRow`]s.
@@ -550,7 +617,12 @@ impl ColumnDef {
 /// [`DownloadId`] so checks survive re-sorting, filtering, and monitor polls.
 pub struct DownloadsDelegate {
     rows: Vec<DownloadRow>,
+    /// Visible columns in display order.
     columns: Vec<ColumnDef>,
+    /// Column keys hidden through the header context menu.
+    hidden: BTreeSet<&'static str>,
+    /// Measured table width; `None` before the first prepaint.
+    available_width: Option<f32>,
     sort_column: SortColumn,
     sort_dir: SortDir,
     loaded: bool,
@@ -565,14 +637,9 @@ impl DownloadsDelegate {
     pub fn new(commands: EngineHandles) -> Self {
         Self {
             rows: Vec::new(),
-            columns: vec![
-                ColumnDef::new(col::NAME, "Name", 390.0, 180.0),
-                ColumnDef::new(col::SIZE, "Size", 110.0, 80.0),
-                ColumnDef::new(col::STATUS, "Status", 210.0, 140.0),
-                ColumnDef::new(col::SPEED, "Speed", 130.0, 80.0),
-                ColumnDef::new(col::ETA, "Time Left", 130.0, 90.0),
-                ColumnDef::new(col::ADDED, "Date Added", 150.0, 110.0),
-            ],
+            columns: ALL_COLUMNS.to_vec(),
+            hidden: BTreeSet::new(),
+            available_width: None,
             sort_column: SortColumn::DateAdded,
             sort_dir: SortDir::Descending,
             loaded: false,
@@ -606,8 +673,84 @@ impl DownloadsDelegate {
     /// refresh keeps the user's layout instead of resetting to defaults.
     pub fn set_column_widths(&mut self, widths: &[Pixels]) {
         for (def, width) in self.columns.iter_mut().zip(widths.iter()) {
-            def.width = def.clamp_width(f32::from(*width));
+            // Keep the preferred width at or above the readable floor so a
+            // drag during a squeezed layout cannot ratchet every later fit.
+            def.width = f32::from(*width).max(def.min_width).max(24.0);
         }
+    }
+
+    /// Stores the measured table width and reports whether it changed.
+    ///
+    /// Callers refresh the table when this returns true. The small tolerance
+    /// keeps sub-pixel layout churn from scheduling endless frames.
+    pub fn set_available_width(&mut self, width: f32) -> bool {
+        if width <= 0.0 {
+            return false;
+        }
+        if self
+            .available_width
+            .is_some_and(|current| (current - width).abs() < 1.0)
+        {
+            return false;
+        }
+        self.available_width = Some(width);
+        true
+    }
+
+    /// Returns the columns offered by the header context menu.
+    #[must_use]
+    pub fn column_toggles(&self) -> Vec<ColumnToggle> {
+        ALL_COLUMNS
+            .iter()
+            .map(|def| ColumnToggle {
+                key: def.key,
+                label: def.name,
+                visible: !self.hidden.contains(def.key),
+                required: def.key == col::NAME,
+            })
+            .collect()
+    }
+
+    /// Shows or hides one column, keeping the required Name column visible.
+    ///
+    /// Returns false when the key is unknown or required, so the caller can
+    /// skip the refresh.
+    pub fn toggle_column(&mut self, key: &'static str) -> bool {
+        if key == col::NAME || catalog_index(key) == ALL_COLUMNS.len() {
+            return false;
+        }
+        if self.hidden.remove(key) {
+            let order = catalog_index(key);
+            let insert_at = self
+                .columns
+                .iter()
+                .position(|def| catalog_index(def.key) > order)
+                .unwrap_or(self.columns.len());
+            self.columns.insert(insert_at, ALL_COLUMNS[order].clone());
+        } else {
+            self.hidden.insert(key);
+            self.columns.retain(|def| def.key != key);
+            if SortColumn::from_key(key) == self.sort_column {
+                let (column, dir) = if self.columns.iter().any(|def| def.key == col::ADDED) {
+                    (SortColumn::DateAdded, SortDir::Descending)
+                } else {
+                    (SortColumn::Name, SortDir::Ascending)
+                };
+                self.apply_sort(column, dir);
+            }
+        }
+        true
+    }
+
+    /// Distributes the measured width across visible columns.
+    ///
+    /// Preferred widths are used when they fit. As the table narrows, each
+    /// column interpolates toward its readable minimum, and below the total
+    /// minimum every column squeezes proportionally so no field disappears.
+    fn effective_widths(&self) -> Vec<f32> {
+        let preferred: Vec<f32> = self.columns.iter().map(|def| def.width).collect();
+        let minimums: Vec<f32> = self.columns.iter().map(|def| def.min_width).collect();
+        fit_column_widths(&preferred, &minimums, self.available_width)
     }
 
     /// Returns the row at a visible index, if any.
@@ -728,9 +871,18 @@ impl TableDelegate for DownloadsDelegate {
 
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
         let def = &self.columns[col_ix];
+        let width = self
+            .effective_widths()
+            .get(col_ix)
+            .copied()
+            .unwrap_or(def.width);
+        // The fitted width can sit below the readable minimum on very narrow
+        // windows; cap the drag floor there so `Column::min_width` cannot undo
+        // the fit.
+        let min_width = def.min_width.min(width).max(16.0);
         Column::new(def.key, def.name)
-            .width(px(def.width))
-            .min_width(px(def.min_width))
+            .width(px(width))
+            .min_width(px(min_width))
             .sortable()
     }
 
@@ -825,11 +977,36 @@ impl TableDelegate for DownloadsDelegate {
                 cx.stop_propagation();
             })
             .child(sort_icon)
-            .child(name)
-            .into_any_element();
+            .child(name);
+        // Right-clicking any header cell offers the column visibility list.
+        // The checkmark reflects the current visibility; Name is required so
+        // the table always has an identity column.
+        let menu_table = cx.entity();
+        let clear_row_menu = menu_table.clone();
+        let menu_builder = move |menu: PopupMenu, _: &mut Window, cx: &mut Context<PopupMenu>| {
+            let toggles = menu_table.read(cx).delegate().column_toggles();
+            let mut menu = menu;
+            for toggle in toggles {
+                let table = menu_table.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(toggle.label)
+                        .checked(toggle.visible)
+                        .disabled(toggle.required)
+                        .on_click(move |_, _, cx| {
+                            table.update(cx, |table, cx| {
+                                if table.delegate_mut().toggle_column(toggle.key) {
+                                    table.refresh(cx);
+                                    cx.notify();
+                                }
+                            });
+                        }),
+                );
+            }
+            menu
+        };
         // ABDM-style header select-all box. It lives outside the sort-click
         // area so checking all rows never re-sorts the table.
-        if key == col::NAME {
+        let cell = if key == col::NAME {
             let header_table = cx.entity();
             let all_checked = self.all_visible_checked();
             let has_rows = !self.rows.is_empty();
@@ -868,17 +1045,18 @@ impl TableDelegate for DownloadsDelegate {
                     cx,
                 ))
                 .child(sort_label)
-                .into_any_element()
         } else if key == col::ADDED {
-            h_flex()
-                .h_full()
-                .items_center()
-                .pr_3()
-                .child(sort_label)
-                .into_any_element()
+            h_flex().h_full().items_center().pr_3().child(sort_label)
         } else {
-            sort_label
-        }
+            h_flex().h_full().items_center().child(sort_label)
+        };
+        cell.on_mouse_down(MouseButton::Right, move |_, _, cx| {
+            // The table's own row context menu reads this flag deferred; clear
+            // it so a stale row menu cannot open alongside the column menu.
+            clear_row_menu.update(cx, |table, cx| table.set_right_clicked_row(None, cx));
+        })
+        .context_menu(menu_builder)
+        .into_any_element()
     }
 
     fn render_tr(
@@ -1228,8 +1406,9 @@ mod tests {
     use raijin_core::monitor::DownloadView;
 
     use super::{
-        ColumnDef, DownloadRow, QueueDrag, RowChecklist, SortColumn, SortDir, build_rows,
-        can_pause, can_resume, filter_rows, next_sort, queue_subtitle, sort_rows, toolbar_actions,
+        DownloadRow, QueueDrag, RowChecklist, SortColumn, SortDir, build_rows, can_pause,
+        can_resume, filter_rows, fit_column_widths, next_sort, queue_subtitle, sort_rows,
+        toolbar_actions,
     };
     use crate::category::{CategoryFilter, FileCategory, StatusFilter};
     use crate::format::format_bytes;
@@ -1480,12 +1659,43 @@ mod tests {
     }
 
     #[test]
-    fn column_widths_should_floor_at_readable_minimum() {
-        let def = ColumnDef::new("size", "Size", 110.0, 80.0);
+    fn widths_should_stay_preferred_when_they_fit() {
+        let widths = fit_column_widths(&[390.0, 110.0], &[160.0, 64.0], Some(800.0));
 
-        // The old 20px floor let columns collapse to a sliver.
-        assert_eq!(def.clamp_width(20.0), 80.0);
-        assert_eq!(def.clamp_width(200.0), 200.0);
+        assert_eq!(widths, vec![390.0, 110.0]);
+        assert_eq!(
+            fit_column_widths(&[390.0, 110.0], &[160.0, 64.0], None),
+            vec![390.0, 110.0]
+        );
+    }
+
+    #[test]
+    fn widths_should_interpolate_between_minimum_and_preferred() {
+        let preferred = [390.0, 110.0];
+        let minimums = [160.0, 64.0];
+        let available = 389.0;
+
+        let widths = fit_column_widths(&preferred, &minimums, Some(available));
+
+        let total: f32 = widths.iter().sum();
+        assert!((total - available).abs() < 0.01, "total was {total}");
+        for (width, min) in widths.iter().zip(minimums.iter()) {
+            assert!(*width >= *min, "width {width} fell below {min}");
+        }
+        assert!(widths[0] > widths[1], "Name keeps the larger share");
+    }
+
+    #[test]
+    fn widths_should_squeeze_below_minimums_instead_of_hiding_fields() {
+        let preferred = [390.0, 210.0, 150.0];
+        let minimums = [160.0, 96.0, 72.0];
+        let available = 164.0;
+
+        let widths = fit_column_widths(&preferred, &minimums, Some(available));
+
+        let total: f32 = widths.iter().sum();
+        assert!((total - available).abs() < 0.01, "total was {total}");
+        assert!(widths.iter().all(|width| *width > 0.0));
     }
 
     #[test]

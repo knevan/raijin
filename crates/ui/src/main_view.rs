@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
@@ -803,11 +804,28 @@ impl Render for MainView {
                                     // an independent card with smooth borders and a 4px vertical gap.
                                     .child({
                                         let view = cx.entity();
+                                        let width_table = self.table.clone();
                                         div()
                                             .id("downloads-table-wrap")
                                             .flex_1()
                                             .min_h_0()
                                             .overflow_hidden()
+                                            // Fit the visible columns to the measured table
+                                            // width so every field stays on screen instead
+                                            // of scrolling off the right edge.
+                                            .on_prepaint(move |bounds, _window, cx| {
+                                                let width = f32::from(bounds.size.width)
+                                                    - crate::downloads::TABLE_TRAILING_GUTTER_PX;
+                                                width_table.update(cx, |table, cx| {
+                                                    if table
+                                                        .delegate_mut()
+                                                        .set_available_width(width)
+                                                    {
+                                                        table.refresh(cx);
+                                                        cx.notify();
+                                                    }
+                                                });
+                                            })
                                             // Empty table space clears the row highlight.
                                             // Row clicks stop propagation in the framework
                                             // (`set_selected_row`) and header clicks stop

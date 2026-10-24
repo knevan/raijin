@@ -17,7 +17,7 @@ use crate::category::{FileCategory, infer_category};
 use crate::downloads::category_icon;
 use crate::format::format_bytes;
 
-/// Width of the category dropdown, matching the sketch (300).
+/// Width of the category dropdown in the compact utility layout.
 const CATEGORY_DROP_WIDTH: f32 = 300.0;
 /// Size of the square icon buttons (+, reset, gear). Matches the `h_8`
 /// (= 32px) that medium `Input`/`Select`/text buttons render at, so the icon
@@ -514,12 +514,11 @@ impl Render for AddDownloadView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let valid = self.is_valid(cx);
         let url_invalid = !self.url_text(cx).is_empty() && !valid;
-        // Frame background is the sketch `$panel` (theme `sidebar`), so the
-        // default input boxes (`$bg`) read as dark cards like the sketch and
-        // the ABDM reference. `background` ($bg) would swallow them whole.
+        // Light utility window: the canvas stays quiet and fields/buttons own
+        // their hairline boundaries through the component theme.
         v_flex()
             .size_full()
-            .bg(cx.theme().sidebar)
+            .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
                 TitleBar::new().child(
@@ -562,7 +561,7 @@ impl Render for AddDownloadView {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().danger)
-                                .child("Enter a valid http(s) URL"),
+                                .child("Enter a valid http(s) URL."),
                         )
                     })
                     .child(
@@ -571,7 +570,7 @@ impl Render for AddDownloadView {
                             .items_center()
                             .child(
                                 Checkbox::new("add-use-category")
-                                    .label("Use Category")
+                                    .label("Use category")
                                     .checked(self.use_category)
                                     .on_click(cx.listener(|this, checked, window, cx| {
                                         this.use_category = *checked;
@@ -841,7 +840,7 @@ fn initial_category(url: &str) -> FileCategory {
 
 /// Resolves the destination folder for the form.
 ///
-/// A checked "Use Category" stores into `<root>/<Label>` (sketch example:
+/// A checked "Use category" stores into `<root>/<Label>` (legacy example:
 /// `…\ABDM\Programs`); unchecked it stores into the default folder. An
 /// empty root falls back to the default folder so the form never proposes
 /// a bare relative label.

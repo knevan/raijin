@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
@@ -31,7 +32,7 @@ use crate::format::{format_bytes, format_speed, now_ms};
 use crate::settings::{SettingsHandles, open_settings_window};
 use crate::tray::{TraySession, summarize_monitor};
 
-/// Default sidebar width in pixels, matching the product sketch.
+/// Default sidebar width in pixels for the desktop shell.
 const SIDEBAR_WIDTH: f32 = 220.0;
 /// Sidebar drag limits in pixels.
 const SIDEBAR_MIN_WIDTH: f32 = 200.0;
@@ -83,7 +84,7 @@ impl MainView {
         tray: TraySession,
         settings: SettingsHandles,
     ) -> Self {
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search downloads..."));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search downloads…"));
         let table = cx.new(|cx| {
             // `sortable(false)` hides the table's built-in right-side sort
             // glyph; sorting is driven by the sketch's left-side header
@@ -481,8 +482,8 @@ impl MainView {
         }
     }
 
-    /// Opens the standalone Add Download window (sketch: New Download opens
-    /// a new window, also spawnable from tray / `--add` without main cost).
+    /// Opens the standalone Add Download window (`New Download…` opens a new
+    /// window, also spawnable from tray / `--add` without main cost).
     fn open_add_window(&self, cx: &mut App) {
         open_add_download_window(cx, &self.handles, "");
     }
@@ -549,12 +550,18 @@ impl MainView {
             )
             .child(div().flex_1())
             .child(
-                div().w(px(240.)).child(
-                    Input::new(&self.search)
-                        .prefix(Icon::new(IconName::Search).small())
-                        .cleanable(true)
-                        .small(),
-                ),
+                div()
+                    .w(px(240.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .child(
+                        Input::new(&self.search)
+                            .prefix(Icon::new(IconName::Search).small())
+                            .cleanable(true)
+                            .small(),
+                    ),
             )
     }
 
@@ -609,7 +616,7 @@ impl MainView {
                     .small()
                     .w_full()
                     .icon(IconName::Plus)
-                    .label("New Download")
+                    .label("New Download…")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.open_add_window(cx);
                     })),
@@ -635,9 +642,11 @@ impl MainView {
         v_flex()
             .w_full()
             .gap_1()
-            .p_2()
-            .rounded_md()
-            .bg(cx.theme().muted)
+            .p_3()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
             .child(
                 div()
                     .text_sm()
@@ -716,7 +725,7 @@ impl MainView {
             )
             .child(
                 Button::new("toolbar-remove")
-                    .secondary()
+                    .danger()
                     .outline()
                     .small()
                     .w(px(36.))
@@ -795,11 +804,28 @@ impl Render for MainView {
                                     // an independent card with smooth borders and a 4px vertical gap.
                                     .child({
                                         let view = cx.entity();
+                                        let width_table = self.table.clone();
                                         div()
                                             .id("downloads-table-wrap")
                                             .flex_1()
                                             .min_h_0()
                                             .overflow_hidden()
+                                            // Fit the visible columns to the measured table
+                                            // width so every field stays on screen instead
+                                            // of scrolling off the right edge.
+                                            .on_prepaint(move |bounds, _window, cx| {
+                                                let width = f32::from(bounds.size.width)
+                                                    - crate::downloads::TABLE_TRAILING_GUTTER_PX;
+                                                width_table.update(cx, |table, cx| {
+                                                    if table
+                                                        .delegate_mut()
+                                                        .set_available_width(width)
+                                                    {
+                                                        table.refresh(cx);
+                                                        cx.notify();
+                                                    }
+                                                });
+                                            })
                                             // Empty table space clears the row highlight.
                                             // Row clicks stop propagation in the framework
                                             // (`set_selected_row`) and header clicks stop
@@ -1036,9 +1062,10 @@ impl SidebarItem for QueueSection {
                     .py_1p5()
                     .rounded(cx.theme().radius)
                     .text_sm()
-                    .cursor_pointer()
                     .when(is_active, |this| {
                         this.font_weight(FontWeight::MEDIUM)
+                            .border_1()
+                            .border_color(cx.theme().border)
                             .bg(cx.theme().tokens.sidebar_accent)
                             .text_color(cx.theme().sidebar_accent_foreground)
                     })
@@ -1050,11 +1077,8 @@ impl SidebarItem for QueueSection {
                             })
                     })
                     .when(is_collapsed, |this| {
-                        this.justify_center().child(
-                            Icon::new(IconName::Menu)
-                                .size_4()
-                                .text_color(text_color),
-                        )
+                        this.justify_center()
+                            .child(Icon::new(IconName::Menu).size_4().text_color(text_color))
                     })
                     .when(!is_collapsed, |this| {
                         this.child(
@@ -1062,23 +1086,11 @@ impl SidebarItem for QueueSection {
                                 .items_center()
                                 .gap_2()
                                 .overflow_hidden()
-                                .child(
-                                    Icon::new(IconName::Menu)
-                                        .size_4()
-                                        .text_color(text_color),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_sm()
-                                        .child(name),
-                                )
+                                .child(Icon::new(IconName::Menu).size_4().text_color(text_color))
+                                .child(div().truncate().text_sm().child(name))
                                 .when(running, |this| {
                                     this.child(
-                                        div()
-                                            .size_1p5()
-                                            .rounded_full()
-                                            .bg(cx.theme().accent),
+                                        div().size_1p5().rounded_full().bg(cx.theme().accent),
                                     )
                                 }),
                         )

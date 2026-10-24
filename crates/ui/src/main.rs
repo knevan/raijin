@@ -92,7 +92,7 @@ fn main() {
     // Views only keep its `Handle`.
     //
     // `with_assets` is required: without the icon bundle every `Icon` renders
-    // blank. Dark mode matches the product sketch until a theme setting lands.
+    // blank. The product theme starts from GPUI Kit's light preset.
     //
     // `QuitMode::Explicit` is required for tray mode: the event loop must
     // survive `remove_window` (Windows/Linux hide path) and run windowless
@@ -102,7 +102,7 @@ fn main() {
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             gpui_kit::init(cx);
-            Theme::change(ThemeMode::Dark, None, cx);
+            Theme::change(ThemeMode::Light, None, cx);
             crate::theme::apply_product_theme(cx);
             // Freshness marker + effective behavior for close-path diagnosis.
             let behavior = tray.behavior();
@@ -656,6 +656,7 @@ async fn bootstrap_engine() -> Result<Bootstrap, String> {
         port,
         tray: tray.clone(),
         desktop: std::sync::Arc::new(std::sync::RwLock::new(desktop.clone())),
+        window: std::sync::Arc::new(std::sync::Mutex::new(None)),
     };
     Ok((
         EngineHandles {

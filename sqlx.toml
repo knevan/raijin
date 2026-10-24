@@ -1,0 +1,2 @@
+[migrate]
+migrations-dir = "crates/core/migrations"

@@ -23,6 +23,13 @@ pub enum PlatformError {
     /// Path cannot be represented as UTF-8 for SQLite URL use.
     #[error("path is not valid UTF-8: {0}")]
     NonUtf8Path(PathBuf),
+    /// File manager target could not be accessed.
+    #[error("cannot access {}: {source}", path.display())]
+    PathAccess {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Returns Raijin's application data directory.
@@ -193,51 +200,120 @@ pub fn open_file_command(path: &Path) -> OpenCommand {
     }
 }
 
-/// Builds the OS command that reveals a file in its folder.
+/// Builds the OS command that reveals a file, or opens its folder if missing.
 ///
-/// On Linux there is no portable "select file" verb, so the parent folder is
-/// opened instead.
-#[must_use]
-pub fn reveal_in_folder_command(path: &Path) -> OpenCommand {
-    let path = path.to_string_lossy().into_owned();
-    #[cfg(windows)]
-    {
-        OpenCommand {
-            program: "explorer".to_owned(),
-            args: vec![format!("/select,{path}")],
-        }
+/// Existing directories are opened directly. Linux opens the containing folder
+/// without selecting the file.
+///
+/// # Errors
+///
+/// Returns an error when the target or its containing folder cannot be accessed.
+pub fn reveal_in_folder_command(path: &Path) -> PlatformResult<OpenCommand> {
+    if path.as_os_str().is_empty() {
+        return Err(PlatformError::PathAccess {
+            path: path.to_owned(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "target path is empty"),
+        });
     }
-    #[cfg(target_os = "macos")]
-    {
-        OpenCommand {
-            program: "open".to_owned(),
-            args: vec!["-R".to_owned(), path],
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let folder = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            return open_folder_command(folder);
         }
+        Err(source) => {
+            return Err(PlatformError::PathAccess {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    if metadata.is_dir() {
+        return open_folder_command(path);
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let folder = path
-            .rsplit_once(std::path::MAIN_SEPARATOR)
-            .map(|(parent, _)| {
-                if parent.is_empty() {
-                    "/".to_owned()
-                } else {
-                    parent.to_owned()
-                }
-            })
-            .unwrap_or(path.clone());
-        OpenCommand {
-            program: "xdg-open".to_owned(),
-            args: vec![folder],
-        }
+        open_folder_command(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )
     }
-    #[cfg(not(any(windows, unix)))]
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
     {
-        OpenCommand {
+        let path = shell_path(path)?.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let command = OpenCommand {
+            program: "explorer".to_owned(),
+            args: vec!["/select,".to_owned(), path],
+        };
+        #[cfg(target_os = "macos")]
+        let command = OpenCommand {
+            program: "open".to_owned(),
+            args: vec!["-R".to_owned(), path],
+        };
+        #[cfg(not(any(windows, unix)))]
+        let command = OpenCommand {
             program: String::new(),
             args: vec![path],
-        }
+        };
+        Ok(command)
     }
+}
+
+fn shell_path(path: &Path) -> PlatformResult<PathBuf> {
+    std::fs::canonicalize(path)
+        .map(normalize_canonical)
+        .map_err(|source| PlatformError::PathAccess {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+/// Builds the OS command that opens a directory without selecting it.
+///
+/// # Errors
+///
+/// Returns an error when the target is missing, inaccessible, or not a directory.
+pub fn open_folder_command(path: &Path) -> PlatformResult<OpenCommand> {
+    let target = shell_path(path)?;
+    let metadata = std::fs::metadata(&target).map_err(|source| PlatformError::PathAccess {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.is_dir() {
+        return Err(PlatformError::PathAccess {
+            path: path.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "target is not a directory",
+            ),
+        });
+    }
+    #[cfg(windows)]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+    #[cfg(not(any(windows, unix)))]
+    let program = "";
+    Ok(OpenCommand {
+        program: program.to_owned(),
+        args: vec![target.to_string_lossy().into_owned()],
+    })
+}
+
+/// Opens a directory in the system file manager (detached).
+///
+/// # Errors
+///
+/// Returns an error when the directory is inaccessible or the OS helper cannot be spawned.
+pub fn open_folder(path: &Path) -> PlatformResult<()> {
+    open_folder_command(path)?.spawn()
 }
 
 /// Opens a file with its default application (detached).
@@ -254,9 +330,9 @@ pub fn open_file(path: &Path) -> PlatformResult<()> {
 ///
 /// # Errors
 ///
-/// Returns an error when the OS helper cannot be spawned.
+/// Returns an error when the target folder is inaccessible or the OS helper cannot be spawned.
 pub fn reveal_in_folder(path: &Path) -> PlatformResult<()> {
-    reveal_in_folder_command(path).spawn()
+    reveal_in_folder_command(path)?.spawn()
 }
 
 /// Disk capacity snapshot for the filesystem holding a path.
@@ -380,10 +456,12 @@ mod tests {
 
     #[test]
     fn open_commands_should_reference_target_path() {
-        let path = PathBuf::from("C:/Downloads/raijin/file.zip");
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("file.zip");
+        std::fs::write(&path, b"download").expect("download file");
 
         let open = open_file_command(&path);
-        let reveal = reveal_in_folder_command(&path);
+        let reveal = reveal_in_folder_command(&path).expect("reveal command");
 
         assert!(!open.program.is_empty());
         assert!(!reveal.program.is_empty());
@@ -392,11 +470,107 @@ mod tests {
             "open command must reference the file: {open:?}"
         );
         assert!(
-            reveal
-                .args
-                .iter()
-                .any(|arg| arg.contains("file.zip") || arg.contains("raijin")),
+            reveal.args.iter().any(|arg| arg.contains("file.zip")
+                || arg
+                    == shell_path(dir.path())
+                        .expect("folder path")
+                        .to_string_lossy()
+                        .as_ref()),
             "reveal command must reference the file or its folder: {reveal:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reveal_command_should_separate_select_switch_from_spaced_unicode_path() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("Antigravity IDE 日本語.exe");
+        std::fs::write(&path, b"download").expect("download file");
+        let expected = normalize_canonical(std::fs::canonicalize(&path).expect("canonical path"));
+
+        let command = reveal_in_folder_command(&path).expect("reveal command");
+
+        assert_eq!(command.program, "explorer");
+        assert_eq!(
+            command.args,
+            vec![
+                "/select,".to_owned(),
+                expected.to_string_lossy().into_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn reveal_command_should_open_parent_when_file_is_missing() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("missing download.exe");
+
+        let command = reveal_in_folder_command(&path).expect("fallback command");
+
+        assert_eq!(
+            command,
+            open_folder_command(dir.path()).expect("folder command")
+        );
+    }
+
+    #[test]
+    fn reveal_command_should_open_existing_directory_without_selecting_it() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let expected =
+            normalize_canonical(std::fs::canonicalize(dir.path()).expect("canonical path"));
+
+        let command = reveal_in_folder_command(dir.path()).expect("folder command");
+
+        assert_eq!(command.args, vec![expected.to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn reveal_command_should_fail_when_destination_folder_is_missing() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let folder = dir.path().join("missing folder");
+
+        let error =
+            reveal_in_folder_command(&folder.join("download.exe")).expect_err("missing folder");
+
+        assert!(matches!(&error, PlatformError::PathAccess { path, source }
+            if path == &folder && source.kind() == std::io::ErrorKind::NotFound));
+        assert!(error.to_string().contains("missing folder"));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn open_folder_command_should_not_fall_back_to_parent_for_missing_directory() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("missing folder");
+
+        assert!(open_folder_command(&path).is_err());
+    }
+
+    #[test]
+    fn open_folder_command_should_reject_file_targets() {
+        let file = tempfile::NamedTempFile::new().expect("temporary file");
+
+        let error = open_folder_command(file.path()).expect_err("not a directory");
+
+        assert!(matches!(error, PlatformError::PathAccess { source, .. }
+            if source.kind() == std::io::ErrorKind::NotADirectory));
+    }
+
+    #[test]
+    fn reveal_command_should_reject_empty_path() {
+        assert!(reveal_in_folder_command(Path::new("")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_paths_should_strip_verbatim_prefixes() {
+        assert_eq!(
+            normalize_canonical(PathBuf::from(r"\\?\C:\Downloads\file.exe")),
+            PathBuf::from(r"C:\Downloads\file.exe")
+        );
+        assert_eq!(
+            normalize_canonical(PathBuf::from(r"\\?\UNC\server\share\file.exe")),
+            PathBuf::from(r"\\server\share\file.exe")
         );
     }
 

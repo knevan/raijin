@@ -5,7 +5,8 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::*;
 use raijin_core::download::{DownloadId, DownloadStatus, FailureKind};
@@ -1210,9 +1211,10 @@ impl TableDelegate for DownloadsDelegate {
         menu = menu.item(
             PopupMenuItem::new("Open folder")
                 .icon(Icon::new(IconName::Folder))
-                .on_click(move |_: &ClickEvent, _: &mut Window, _: &mut App| {
+                .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                     if let Err(error) = raijin_core::platform::reveal_in_folder(&folder_path) {
-                        tracing::warn!(?error, "reveal in folder failed");
+                        tracing::warn!(?error, path = %folder_path.display(), "reveal in folder failed");
+                        window.push_notification(format!("Could not open download folder: {error}"), cx);
                     }
                 }),
         );

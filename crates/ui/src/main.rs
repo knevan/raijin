@@ -345,8 +345,7 @@ fn register_tray_actions(
 
     let folder_handles = handles.clone();
     cx.on_action(move |_: &OpenDownloadsFolder, _: &mut App| {
-        if let Err(error) = raijin_core::platform::reveal_in_folder(&folder_handles.default_folder)
-        {
+        if let Err(error) = raijin_core::platform::open_folder(&folder_handles.default_folder) {
             tracing::warn!(?error, "tray open folder failed");
         }
     });

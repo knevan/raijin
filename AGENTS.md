@@ -29,6 +29,7 @@ This file holds only what applies to every task. Detailed rules are split into a
 | touch queue scheduling or queue models | `docs/queue-rules.md` |
 | touch the system tray, window minimize/hide, or autostart lifecycle | `docs/tray.md` and `docs/startup-deferred.md` |
 | touch app links, protocol registration, or single-instance forwarding | `docs/app-links.md` |
+| touch opening download folders or revealing downloaded files | `docs/file-actions.md` |
 | touch the Settings view, desktop configuration, or deferred settings | `docs/settings-deferred.md` |
 | touch the local API server (`axum`) or browser extension pairing | `docs/api-and-integration.md` |
 | read or touch the browser extension under `browser-extension/` | `docs/api-and-integration.md` |

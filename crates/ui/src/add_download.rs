@@ -660,12 +660,16 @@ impl Render for AddDownloadView {
                                     .h(px(ICON_BUTTON))
                                     .icon(IconName::Settings)
                                     .tooltip("Reveal folder in file manager")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         let folder = this.resolved_folder(cx);
                                         if let Err(error) =
-                                            raijin_core::platform::reveal_in_folder(&folder)
+                                            raijin_core::platform::open_folder(&folder)
                                         {
                                             tracing::warn!(?error, "reveal folder failed");
+                                            window.push_notification(
+                                                format!("Could not open folder: {error}"),
+                                                cx,
+                                            );
                                         }
                                     })),
                             ),

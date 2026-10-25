@@ -18,6 +18,51 @@ run = "cargo fmt --all"
 dir = "."
 run = "cargo run -p raijin-ui"
 
+[tasks."cli:min"]
+description = "Run Raijin minimized directly to system tray"
+dir = "."
+run = "cargo run -p raijin-ui -- --minimized"
+
+[tasks."dev:register"]
+alias = ["register", "app:install"]
+description = "Build, copy to LocalAppData, and register raijin:// protocol handler"
+dir = "."
+shell = "powershell -c"
+run = """
+$ErrorActionPreference = 'Stop'
+cargo build -p raijin-ui
+
+$dir = Join-Path $env:LOCALAPPDATA 'Programs\\Raijin'
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Copy-Item .\\target\\debug\\raijin.exe (Join-Path $dir 'raijin.exe') -Force
+
+$exe = Join-Path $dir 'raijin.exe'
+$p = Start-Process -FilePath $exe -ArgumentList '--register-protocol' -Wait -PassThru
+if ($p.ExitCode -ne 0) {
+    throw "Protocol registration failed with exit code $($p.ExitCode)"
+}
+
+Write-Host "Successfully registered raijin:// protocol handler" -ForegroundColor Green
+"""
+
+[tasks."dev:unregister"]
+alias = ["unregister", "app:uninstall"]
+description = "Unregister raijin:// protocol handler and remove LocalAppData installation"
+dir = "."
+shell = "powershell -c"
+run = """
+$dir = Join-Path $env:LOCALAPPDATA 'Programs\\Raijin'
+$exe = Join-Path $dir 'raijin.exe'
+
+if (Test-Path $exe) {
+    $p = Start-Process -FilePath $exe -ArgumentList '--unregister-protocol' -Wait -PassThru
+    Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+    Write-Host "Successfully unregistered and removed Raijin from LocalAppData" -ForegroundColor Green
+} else {
+    Write-Host "Raijin is not installed in LocalAppData" -ForegroundColor Yellow
+}
+"""
+
 [tasks."ext:dev"]
 alias = ["chrome"]
 dir = "browser-extension"

@@ -34,20 +34,17 @@ surface) and `risk.md` (which tracks known gaps per milestone).
 
 ## Deferred
 
-### 1. Single instance — no guard at all
+### 1. Single instance — implemented on Windows only
 
-**Deferred, deliberately.** With `--startup` plus `close_to_tray = true`, a
-second launch stays windowless: two tray icons, a losing `:35343` bind for the
-integration server, two writers on one SQLite database, and an `--add` request
-that opens on whichever process won the race.
+Windows now claims an exclusive local named pipe before engine/database
+bootstrap. Later launches forward navigation or the existing confirmation-only
+`--add` command and exit; `--startup` and `--minimized` do not raise windows
+on an existing instance. See `app-links.md` for lifecycle and security details.
 
-Preferred design when it lands: a loopback lock (bind a dedicated port; when
-the bind fails, forward a command to the live instance and exit). `axum`,
-`reqwest`, and the existing Bearer `TokenCell` are already in the tree, so no
-new dependency is needed. Any `--add` forwarding endpoint **must** require the
-token, otherwise a local process could force arbitrary downloads. If a
-firewall or AV blocks the second loopback bind, add a Win32 named mutex as a
-fast path in front of the port.
+macOS/Linux single-instance behavior remains deferred. The earlier loopback
+lock proposal was not selected for Windows: a named pipe avoids a second
+network listener and works while browser integration is disabled. No HTTP
+forwarding endpoint or unauthenticated silent-download capability was added.
 
 ### 2. `minimize_to_tray` — blocked upstream by GPUI
 

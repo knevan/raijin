@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { browser } from 'wxt/browser';
 import { getAll, setConfigItem } from '@/utils/config';
 import { sendAddDownload, sendTestPort } from '@/utils/messaging';
@@ -9,12 +9,11 @@ const autoCapture = ref(true);
 const sendHeaders = ref(true);
 const status = ref<ConnectionStatus>('unknown');
 const statusMessage = ref('Checking…');
-const testing = ref(false);
 const adding = ref(false);
 const actionMessage = ref('');
 
-let currentPort = 35343;
-let currentToken = '';
+let popupClosed = false;
+let connectionTimer: ReturnType<typeof setTimeout> | undefined;
 
 const isConnected = computed(() => status.value === 'basic' || status.value === 'ok');
 
@@ -43,23 +42,22 @@ function statusMainLabel(): string {
 
 async function load(): Promise<void> {
   const config = await getAll();
-  currentPort = config.port;
-  currentToken = config.token;
   autoCapture.value = config.autoCaptureLinks;
   sendHeaders.value = config.sendHeaders;
 }
 
 async function checkConnection(): Promise<void> {
-  testing.value = true;
-  actionMessage.value = '';
   try {
-    const result = await sendTestPort(currentPort, currentToken);
+    const config = await getAll();
+    if (popupClosed) return;
+    const result = await sendTestPort(config.port, config.token);
+    if (popupClosed) return;
     if (result.reason === 'basic') {
       status.value = 'basic';
       statusMessage.value = 'Downloads require confirmation in Raijin. Add a token in Options to enable silent downloads.';
     } else if (result.reason === 'ok') {
       status.value = 'ok';
-      statusMessage.value = `Connected on port ${currentPort}`;
+      statusMessage.value = `Connected on port ${config.port}`;
     } else if (result.reason === 'unauthorized') {
       status.value = 'unauthorized';
       statusMessage.value = 'Server is up, but the token was rejected. Update token in Options.';
@@ -67,11 +65,15 @@ async function checkConnection(): Promise<void> {
       status.value = 'down';
       statusMessage.value = 'Server is down. Start Raijin and enable browser integration.';
     }
-  } catch {
+  } catch (error) {
+    if (popupClosed) return;
+    console.error('Could not check Raijin connection', error);
     status.value = 'down';
     statusMessage.value = 'Server is down. Start Raijin and enable browser integration.';
   } finally {
-    testing.value = false;
+    if (!popupClosed) {
+      connectionTimer = setTimeout(() => { void checkConnection(); }, 250);
+    }
   }
 }
 
@@ -122,10 +124,18 @@ async function addActiveTab(): Promise<void> {
   }
 }
 
-onMounted(() => {
-  void load().then(() => {
-    void checkConnection();
-  });
+onMounted(async () => {
+  try {
+    await load();
+  } catch (error) {
+    console.error('Could not load popup settings', error);
+  }
+  if (!popupClosed) void checkConnection();
+});
+
+onUnmounted(() => {
+  popupClosed = true;
+  clearTimeout(connectionTimer);
 });
 </script>
 

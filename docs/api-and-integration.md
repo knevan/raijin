@@ -44,6 +44,7 @@ The `wxt` extension lives in `browser-extension/` and targets Chromium and Firef
 - Rejected token: report the error without silently clearing it or retrying unauthenticated.
 - Only advertise Basic connectivity when `/ping` explicitly reports support; older desktop builds do not gain unauthenticated capability merely by answering ping.
 - Store the port and optional token in extension-local storage, never browser sync.
+- While the popup is open, check connectivity immediately and schedule the next check 250 ms after the previous check completes. Read the latest port/token each time, preserve the last status while checking, and do not clear download action messages. Closing/unmounting the popup stops scheduling; an already-dispatched background request may finish, but cannot restart polling. No persistent background polling, WebSocket, or new endpoint is introduced. The short interval is chosen for responsive app-start detection; request latency and timeouts still affect detection time.
 
 ## 4. Rationale and deferred work
 

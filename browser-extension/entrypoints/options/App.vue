@@ -1,9 +1,12 @@
 <script lang="ts" setup>
 import { computed, onMounted, ref } from 'vue';
+import { browser } from 'wxt/browser';
 import { defaultConfig, getAll, isValidPort, normalizePort, setAll } from '@/utils/config';
 import { MAX_ALLOWED_PORT, MIN_ALLOWED_PORT } from '@/utils/constants';
 import { sendTestPort } from '@/utils/messaging';
 
+const windowsAppLinks = ref(false);
+const appLinkAttempted = ref(false);
 const portText = ref(String(defaultConfig.port));
 const portError = ref('');
 const token = ref('');
@@ -158,6 +161,10 @@ async function resetDefaults(): Promise<void> {
 
 onMounted(() => {
   void load();
+  void browser.runtime.getPlatformInfo().then(
+    (platform) => { windowsAppLinks.value = platform.os === 'win'; },
+    (error: unknown) => { console.error('Could not determine app-link platform', error); },
+  );
 });
 </script>
 
@@ -249,6 +256,16 @@ onMounted(() => {
         <span class="guide-icon">💡</span>
         <span>Get API token in Raijin Desktop: <strong>Settings &rarr; Browser Integration</strong></span>
       </div>
+      <a
+        v-if="windowsAppLinks"
+        class="btn-action app-link"
+        href="raijin://settings/browser-integration"
+        @click="appLinkAttempted = true"
+      >Open Raijin Settings</a>
+      <p v-if="appLinkAttempted" class="hint" role="status">
+        Raijin didn’t open? Make sure Raijin is installed and its app-link handler is registered.
+        You can also open Settings → Browser Integration manually.
+      </p>
       <label>API token (optional)
         <input v-model="token" type="password" autocomplete="off" placeholder="Paste token from Raijin App (Settings → Browser Integration)" @change="save" @blur="save" />
       </label>
@@ -389,6 +406,9 @@ textarea {
   color: inherit;
   font: inherit;
   cursor: pointer;
+}
+.app-link {
+  text-decoration: none;
 }
 .btn-action:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.15);

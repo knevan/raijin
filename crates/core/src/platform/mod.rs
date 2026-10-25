@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub mod autostart;
+pub mod deeplink;
+#[cfg(windows)]
+pub mod instance;
 pub mod tray;
 
 /// Result type for platform helpers.

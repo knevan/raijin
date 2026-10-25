@@ -4,6 +4,45 @@ use raijin_core::download::{DownloadId, DownloadManagerHandle, NewDownload, Queu
 use raijin_core::monitor::DownloadMonitorHandle;
 use raijin_core::queue::QueueManagerHandle;
 
+#[cfg(windows)]
+pub fn spawn_launch_dispatcher(
+    cx: &mut gpui_kit::App,
+    mut receiver: tokio::sync::mpsc::Receiver<raijin_core::platform::instance::DesktopCommand>,
+    handles: EngineHandles,
+    tray: crate::tray::TraySession,
+    settings: crate::settings::SettingsHandles,
+) {
+    use raijin_core::platform::instance::DesktopCommand;
+
+    cx.spawn(async move |cx| {
+        while let Some(command) = receiver.recv().await {
+            cx.update(|cx| match command {
+                DesktopCommand::BrowserIntegration => {
+                    crate::settings::open_browser_integration(cx, &settings)
+                }
+                DesktopCommand::Activate => {
+                    if cx.windows().is_empty() {
+                        crate::open_main_window(cx, &handles, &tray, &settings);
+                    } else {
+                        for window in cx.windows() {
+                            if let Err(error) =
+                                window.update(cx, |_, window, _| window.activate_window())
+                            {
+                                tracing::warn!(%error, "could not activate desktop window");
+                            }
+                        }
+                    }
+                }
+                DesktopCommand::Add(url) => {
+                    crate::add_download::open_add_download_window(cx, &handles, &url)
+                }
+                DesktopCommand::Background => {}
+            });
+        }
+    })
+    .detach();
+}
+
 /// Cloneable engine endpoints owned by GPUI views.
 #[derive(Debug, Clone)]
 pub struct EngineHandles {

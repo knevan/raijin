@@ -13,8 +13,8 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar,
-    WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar, WindowExt as _,
+    h_flex, v_flex,
 };
 use gpui_kit::*;
 use raijin_core::config::DesktopSettings;
@@ -509,14 +509,28 @@ pub(crate) fn apply_autostart(settings: &DesktopSettings) -> Result<(), String> 
 /// Wired to the tray menu and the toolbar gear; failures only mean the window
 /// could not open and are logged.
 pub fn open_settings_window(cx: &mut App, handles: &SettingsHandles) {
+    open_settings_at(cx, handles, None);
+}
+
+pub fn open_browser_integration(cx: &mut App, handles: &SettingsHandles) {
+    open_settings_at(cx, handles, Some(Section::BrowserIntegration));
+}
+
+fn open_settings_at(cx: &mut App, handles: &SettingsHandles, section: Option<Section>) {
     let existing = *handles
         .window
         .lock()
         .expect("settings window lock poisoned");
-    if let Some(existing) = existing {
+    if let Some(existing) = existing.and_then(|handle| handle.downcast::<SettingsView>()) {
         // A closed window makes `update` fail; fall through and reopen.
         if existing
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |view, window, cx| {
+                if let Some(section) = section {
+                    view.section = section;
+                    cx.notify();
+                }
+                window.activate_window();
+            })
             .is_ok()
         {
             return;

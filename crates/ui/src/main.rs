@@ -95,6 +95,7 @@ fn main() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("raijin-engine")
+        .worker_threads(4)
         .build()
         .unwrap_or_else(|error| {
             eprintln!(
@@ -251,7 +252,7 @@ fn main() {
             );
             if let Some(icon) = native_tray {
                 tray.set_tray_icon_live();
-                spawn_tray_sync(cx, icon, tray.clone());
+                spawn_tray_sync(cx, icon, tray.clone(), handles.monitor.clone());
             }
             // `--add` opens only the Add Download window: the main table
             // (DataTable, monitor poll, storage scan) never loads, so an
@@ -464,7 +465,12 @@ fn build_native_tray(cx: &mut App, session: &TraySession) -> gpui_tray::Result<g
 /// pushing the cached text every second is cheap; menu rebuilds are gated on
 /// activity-flag changes. The loop exits on explicit quit; dropping the last
 /// window does not stop it ([`QuitMode::Explicit`]).
-fn spawn_tray_sync(cx: &mut App, icon: gpui_tray::Tray, session: TraySession) {
+fn spawn_tray_sync(
+    cx: &mut App,
+    icon: gpui_tray::Tray,
+    session: TraySession,
+    monitor: raijin_core::monitor::DownloadMonitorHandle,
+) {
     cx.spawn(async move |cx| {
         let mut last_flags = (false, false);
         let mut last_tooltip = String::new();
@@ -472,6 +478,10 @@ fn spawn_tray_sync(cx: &mut App, icon: gpui_tray::Tray, session: TraySession) {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             if session.is_quitting() {
                 break;
+            }
+            if !session.should_poll() {
+                let (active, paused, speed) = crate::tray::summarize_monitor(&monitor.state());
+                session.update_activity(active, paused, speed);
             }
             let tooltip = session.last_tooltip();
             let flags = (session.has_active(), session.has_paused());

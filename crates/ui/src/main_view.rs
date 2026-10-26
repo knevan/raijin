@@ -29,7 +29,7 @@ use crate::downloads::{
 };
 use crate::format::{format_bytes, format_speed, now_ms};
 use crate::settings::{SettingsHandles, open_settings_window};
-use crate::tray::{TraySession, summarize_monitor};
+use crate::tray::TraySession;
 
 /// Default sidebar width in pixels, matching the product sketch.
 const SIDEBAR_WIDTH: f32 = 220.0;
@@ -49,7 +49,7 @@ pub struct MainView {
     search: Entity<InputState>,
     table: Entity<TableState<DownloadsDelegate>>,
     /// Last-seen monitor snapshot; compared to skip no-op refreshes.
-    last_snapshot: MonitorState,
+    last_snapshot: std::sync::Arc<MonitorState>,
     /// Last-seen queue snapshot; supplies row labels and drop targets.
     queue_state: Vec<QueueSnapshot>,
     /// Unfiltered presentation rows rebuilt on every snapshot change.
@@ -117,8 +117,10 @@ impl MainView {
                 // UI sheds table/storage work. Only activity + tooltip
                 // (essential timers) refresh; no entity is touched here.
                 if !poll_tray.should_poll() {
-                    let (active, paused, speed) = summarize_monitor(&monitor.state());
-                    poll_tray.update_activity(active, paused, speed);
+                    let is_alive = weak.update(cx, |_, _| ()).is_ok();
+                    if !is_alive {
+                        break;
+                    }
                     continue;
                 }
                 let snapshot = monitor.state();
@@ -142,7 +144,7 @@ impl MainView {
             settings,
             search,
             table,
-            last_snapshot: MonitorState::default(),
+            last_snapshot: std::sync::Arc::new(MonitorState::default()),
             queue_state: initial_queues,
             cache: Vec::new(),
             category: CategoryFilter::All,
@@ -166,9 +168,13 @@ impl MainView {
     /// The first poll always applies, even when the database is empty, so the
     /// table leaves its skeleton loading state on a fresh install. Disk
     /// detection runs on its own throttle and can force a refresh alone.
-    fn apply_snapshot(&mut self, snapshot: MonitorState, cx: &mut Context<Self>) {
+    fn apply_snapshot(&mut self, snapshot: std::sync::Arc<MonitorState>, cx: &mut Context<Self>) {
         let storage_changed = self.maybe_refresh_storage();
-        if self.loaded && !storage_changed && snapshot == self.last_snapshot {
+        if self.loaded
+            && !storage_changed
+            && (std::sync::Arc::ptr_eq(&snapshot, &self.last_snapshot)
+                || *snapshot == *self.last_snapshot)
+        {
             return;
         }
         let now = now_ms();

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -30,7 +31,7 @@ pub enum DownloadMonitorError {
 /// Cloneable handle for observing projected monitor state.
 #[derive(Debug, Clone)]
 pub struct DownloadMonitorHandle {
-    state: watch::Receiver<MonitorState>,
+    state: watch::Receiver<Arc<MonitorState>>,
 }
 
 impl DownloadMonitorHandle {
@@ -56,8 +57,7 @@ impl DownloadMonitorHandle {
                 projection.apply_item(item, now);
             }
         }
-        let (state_tx, state_rx) = watch::channel(MonitorState::default());
-        let _sent = state_tx.send(projection.state().clone());
+        let (state_tx, state_rx) = watch::channel(Arc::new(projection.state().clone()));
         let monitor = DownloadMonitor {
             events,
             state: state_tx,
@@ -69,20 +69,20 @@ impl DownloadMonitorHandle {
 
     /// Returns a receiver for monitor state snapshots.
     #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<MonitorState> {
+    pub fn subscribe(&self) -> watch::Receiver<Arc<MonitorState>> {
         self.state.clone()
     }
 
     /// Returns latest monitor state snapshot.
     #[must_use]
-    pub fn state(&self) -> MonitorState {
-        self.state.borrow().clone()
+    pub fn state(&self) -> Arc<MonitorState> {
+        Arc::clone(&self.state.borrow())
     }
 }
 
 struct DownloadMonitor {
     events: broadcast::Receiver<DownloadEvent>,
-    state: watch::Sender<MonitorState>,
+    state: watch::Sender<Arc<MonitorState>>,
     projection: Projection,
 }
 
@@ -146,7 +146,7 @@ impl DownloadMonitor {
 
     fn publish(&self) -> DownloadMonitorResult<()> {
         self.state
-            .send(self.projection.state().clone())
+            .send(Arc::new(self.projection.state().clone()))
             .map_err(|_| DownloadMonitorError::StateSubscribersDropped)
     }
 }

@@ -7,7 +7,12 @@ edition = "2024"
 name = "raijin"
 path = "src/main.rs"
 
+[features]
+hotpath = ["hotpath/hotpath", "raijin-core/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "raijin-core/hotpath-alloc"]
+
 [dependencies]
+hotpath = { workspace = true }
 gpui-kit = { workspace = true }
 gpui-tray = { workspace = true }
 tokio = { workspace = true }

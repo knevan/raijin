@@ -2,9 +2,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use sqlx::migrate::Migrator;
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{ConnectOptions, SqlitePool};
 
 pub mod repositories;
@@ -28,7 +26,6 @@ pub async fn connect(database_url: &str) -> DbResult<SqlitePool> {
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(5))
         .pragma("cache_size", "-1024")
-        .pragma("temp_store", "MEMORY")
         .disable_statement_logging();
 
     let pool = SqlitePoolOptions::new()

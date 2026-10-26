@@ -1,4 +1,5 @@
 /target
+/hotpath-*.json
 .env
 *.sqlite
 *.sqlite-wal

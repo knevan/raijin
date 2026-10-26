@@ -1066,6 +1066,28 @@ mod tests {
             .await?;
 
         assert_eq!(journal_mode, "wal");
+        let mut connection = db.pool.acquire().await?;
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut *connection)
+            .await?;
+        let cache_size: i64 = sqlx::query_scalar("PRAGMA cache_size")
+            .fetch_one(&mut *connection)
+            .await?;
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&mut *connection)
+            .await?;
+        let temp_store: i64 = sqlx::query_scalar("PRAGMA temp_store")
+            .fetch_one(&mut *connection)
+            .await?;
+        assert_eq!(temp_store, 0);
+        assert_eq!(synchronous, 1);
+        assert_eq!(cache_size, -1024);
+        assert_eq!(busy_timeout, 5_000);
+        assert_eq!(db.pool.options().get_max_connections(), 4);
+        assert_eq!(
+            db.pool.options().get_idle_timeout(),
+            Some(std::time::Duration::from_secs(30)),
+        );
         Ok(())
     }
 

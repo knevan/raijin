@@ -80,3 +80,7 @@ run = "pnpm test"
 [tasks."ext:build"]
 dir = "browser-extension"
 run = "pnpm build"
+
+[tasks."ext:zip"]
+dir = "browser-extension"
+run = "pnpm zip"

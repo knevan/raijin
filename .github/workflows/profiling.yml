@@ -1,0 +1,29 @@
+name: Profiling
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      HOTPATH_METRICS_SERVER_OFF: "true"
+      HOTPATH_OUTPUT_PATH: hotpath-monitor.json
+      HOTPATH_OUTPUT_FORMAT: json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Profile monitor workload
+        run: cargo run --locked --release -p raijin-core --example profile_monitor --features hotpath-alloc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hotpath-monitor-${{ matrix.os }}
+          path: hotpath-monitor.json
+          if-no-files-found: error

@@ -3,7 +3,16 @@ name = "raijin-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+
+[[example]]
+name = "profile_monitor"
+required-features = ["hotpath"]
+
 [dependencies]
+hotpath = {workspace = true}
 axum = {workspace = true}
 base64 = {workspace = true}
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }

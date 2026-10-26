@@ -106,6 +106,7 @@ impl DownloadMonitor {
         Ok(())
     }
 
+    #[hotpath::measure(impl_type = "DownloadMonitor")]
     fn apply_event(&mut self, event: DownloadEvent) -> DownloadMonitorResult<()> {
         let now = now_ms()?;
         match event {
@@ -144,6 +145,7 @@ impl DownloadMonitor {
         Ok(())
     }
 
+    #[hotpath::measure(impl_type = "DownloadMonitor")]
     fn publish(&self) -> DownloadMonitorResult<()> {
         self.state
             .send(Arc::new(self.projection.state().clone()))
@@ -208,6 +210,46 @@ mod tests {
                 .map(|view| view.downloaded_bytes),
             Some(Bytes::new(100))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshots_should_share_storage_and_preserve_previous_versions()
+    -> DownloadMonitorResult<()> {
+        let (events, receiver) = broadcast::channel(16);
+        let initial_item = item(1, DownloadStatus::Downloading, Bytes::ZERO);
+        let (handle, task) =
+            DownloadMonitorHandle::spawn_with_downloads(receiver, None, vec![initial_item.clone()]);
+        let mut subscriber = handle.subscribe();
+        let initial = handle.state();
+        assert!(Arc::ptr_eq(&initial, &handle.state()));
+        assert!(Arc::ptr_eq(&initial, &subscriber.borrow()));
+
+        events
+            .send(DownloadEvent::DownloadChanged {
+                item: item(1, DownloadStatus::Paused, Bytes::new(100)),
+            })
+            .map_err(|_| DownloadMonitorError::EventStreamClosed)?;
+        subscriber
+            .changed()
+            .await
+            .map_err(|_| DownloadMonitorError::EventStreamClosed)?;
+        let updated = handle.state();
+        assert!(!Arc::ptr_eq(&initial, &updated));
+        assert_eq!(
+            initial.active[&initial_item.id].downloaded_bytes,
+            Bytes::ZERO
+        );
+        assert_eq!(
+            updated.active[&initial_item.id].downloaded_bytes,
+            Bytes::new(100)
+        );
+
+        events
+            .send(DownloadEvent::Shutdown)
+            .map_err(|_| DownloadMonitorError::EventStreamClosed)?;
+        task.await
+            .map_err(|_| DownloadMonitorError::EventStreamClosed)??;
         Ok(())
     }
 

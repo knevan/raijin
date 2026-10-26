@@ -10,7 +10,6 @@
     clippy::trivially_copy_pass_by_ref,
     clippy::clone_on_ref_ptr
 )]
-// Tests may panic on violated assumptions; the deny above stays for production code.
 #![cfg_attr(test, allow(clippy::panic))]
 
 mod add_download;
@@ -61,6 +60,7 @@ fn startup_failed(context: &str, error: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+#[hotpath::main(format = "json", output_path = "hotpath-ui.json")]
 fn main() {
     // The GUI binary has no console (GUI subsystem), so routine logging goes
     // to a file in debug builds and every crash goes to `crash.log`.
@@ -479,10 +479,7 @@ fn spawn_tray_sync(
             if session.is_quitting() {
                 break;
             }
-            if !session.should_poll() {
-                let (active, paused, speed) = crate::tray::summarize_monitor(&monitor.state());
-                session.update_activity(active, paused, speed);
-            }
+            session.update_from_monitor(&monitor.state());
             let tooltip = session.last_tooltip();
             let flags = (session.has_active(), session.has_paused());
             let tooltip_changed = tooltip != last_tooltip;

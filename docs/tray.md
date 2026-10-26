@@ -13,6 +13,7 @@ Status: **Active implementation (M6 complete, polish ongoing)**.
 - **Resource Conservation**:
   - When the window is hidden/suspended in the tray, immediately suspend expensive table subscriptions, animations, and periodic view repaints.
   - Keep tray event loops, background engine workers, and essential IPC timers alive.
+  - The app-level 1s tray sync owns activity summaries in every visibility state, including fresh windowless and Settings/Add-only startup. `MainView` does not update tray activity; its detached polling task exits on the next tick after view teardown.
 
 ---
 

@@ -27,7 +27,7 @@ pub struct TraySession {
     tray_icon_live: std::sync::Arc<AtomicBool>,
     /// Last activity counts feeding the tray menu enabled-flags.
     activity: std::sync::Arc<Mutex<(usize, usize)>>,
-    /// Last tooltip text for the 1s tray sync loop (views write, loop reads).
+    /// Last tooltip text maintained by the app-level tray sync loop.
     last_tooltip: std::sync::Arc<Mutex<String>>,
     /// Set by every window-visibility transition so the 1s tray sync loop
     /// rebuilds the menu even when the activity flags are unchanged. The
@@ -220,10 +220,13 @@ impl TraySession {
         self.quitting.load(Ordering::SeqCst)
     }
 
+    /// Refreshes tray activity independently of main-window visibility.
+    pub fn update_from_monitor(&self, snapshot: &raijin_core::monitor::MonitorState) {
+        let (active, paused, speed) = summarize_monitor(snapshot);
+        self.update_activity(active, paused, speed);
+    }
+
     /// Records engine activity and returns the new tooltip text.
-    ///
-    /// Called on every monitor tick (visible) and every hidden tick, so the
-    /// tray menu enabled-flags and tooltip track downloads in both modes.
     pub fn update_activity(
         &self,
         active_count: usize,
@@ -282,6 +285,7 @@ pub enum OsCloseOutcome {
 /// [`Projection::place_view`](raijin_core::monitor) files every non-terminal
 /// status there; `completed` only ever holds `Completed` and `Error`.
 #[must_use]
+#[hotpath::measure]
 pub fn summarize_monitor(snapshot: &raijin_core::monitor::MonitorState) -> (usize, usize, u64) {
     let mut active = 0usize;
     let mut paused = 0usize;
@@ -497,7 +501,10 @@ mod tests {
         assert!(!tray.take_menu_dirty(), "an in-place hide keeps the window");
 
         tray.mark_closed();
-        assert!(tray.take_menu_dirty(), "a destroyed window changes the menu");
+        assert!(
+            tray.take_menu_dirty(),
+            "a destroyed window changes the menu"
+        );
         assert!(!tray.take_menu_dirty(), "the signal is consumed once");
 
         tray.mark_shown();
@@ -717,5 +724,22 @@ mod tests {
         // completed entry contributes nothing to any counter or speed.
         assert_eq!(summarize_monitor(&snapshot), (4, 1, 3072));
         assert_eq!(summarize_monitor(&MonitorState::default()), (0, 0, 0));
+
+        let tray = session();
+        for visibility in [
+            WindowVisibility::Visible,
+            WindowVisibility::HiddenToTray,
+            WindowVisibility::Closed,
+        ] {
+            *tray.visibility.lock().expect("visibility lock") = visibility;
+            tray.update_from_monitor(&snapshot);
+            assert!(tray.has_active());
+            assert!(tray.has_paused());
+            assert!(tray.last_tooltip().contains("4 downloads"));
+            tray.update_from_monitor(&MonitorState::default());
+            assert!(!tray.has_active());
+            assert!(!tray.has_paused());
+            assert_eq!(tray.last_tooltip(), "Raijin — Idle");
+        }
     }
 }

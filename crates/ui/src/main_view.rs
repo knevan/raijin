@@ -113,9 +113,6 @@ impl MainView {
         cx.spawn(async move |weak, cx| {
             loop {
                 cx.background_executor().timer(MONITOR_POLL_INTERVAL).await;
-                // Low-resource tray mode: the engine keeps running, but the
-                // UI sheds table/storage work. Only activity + tooltip
-                // (essential timers) refresh; no entity is touched here.
                 if !poll_tray.should_poll() {
                     let is_alive = weak.update(cx, |_, _| ()).is_ok();
                     if !is_alive {
@@ -168,6 +165,7 @@ impl MainView {
     /// The first poll always applies, even when the database is empty, so the
     /// table leaves its skeleton loading state on a fresh install. Disk
     /// detection runs on its own throttle and can force a refresh alone.
+    #[hotpath::measure(impl_type = "MainView")]
     fn apply_snapshot(&mut self, snapshot: std::sync::Arc<MonitorState>, cx: &mut Context<Self>) {
         let storage_changed = self.maybe_refresh_storage();
         if self.loaded
@@ -256,15 +254,6 @@ impl MainView {
         self.visible_count = filtered.len();
         self.active_count = self.cache.iter().filter(|row| row.is_active).count();
         self.total_speed_bps = self.cache.iter().map(|row| row.speed_bps).sum();
-        // Keep tray activity + tooltip in step with the visible totals; the
-        // hidden tick calls `update_activity` directly (see the poll loop).
-        let paused_count = self
-            .cache
-            .iter()
-            .filter(|row| matches!(row.status, DownloadStatus::Paused))
-            .count();
-        self.tray
-            .update_activity(self.active_count, paused_count, self.total_speed_bps);
         self.table.update(cx, |table, cx| {
             table.delegate_mut().set_rows(filtered);
             table.delegate_mut().set_loaded(true);

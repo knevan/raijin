@@ -6,6 +6,7 @@ members = ["crates/core", "crates/ui"]
 base64 = "0.23"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 getrandom = "0.4"
+hotpath = "0.29.2"
 encoding_rs = "0.8"
 gpui-kit = { version = "0.8", features = ["component", "assets"] }
 gpui-tray = { version = "0.3", default-features = false, features = ["gpui-kit", "menu-state"] }

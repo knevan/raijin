@@ -8,6 +8,7 @@ Status: **Active durable store**.
 
 - **SQLite via SQLx**: SQLite is the sole durable source of truth for downloads, parts, settings, and queue states. No ad-hoc JSON sidecar files for download state.
 - **WAL Mode**: WAL (Write-Ahead Logging) mode is enabled unconditionally during database initialization.
+- **Durability policy**: `synchronous = NORMAL` is an accepted performance trade-off: the database remains consistent in WAL mode, but recent committed transactions across downloads, settings, and queues may be lost after power loss or an OS crash. See [Memory Optimization Investigation](memory-optimization.md) for pool/cache tuning and measurement limits.
 - **Atomic Transactions**: Multi-table state updates (e.g. updating download item status alongside part allocation) must execute within a `sqlx::Transaction`.
 - **Batched Commits**: Avoid per-chunk database writes. Progress is persisted on time intervals and lifecycle transitions (pause, complete, error).
 

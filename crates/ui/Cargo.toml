@@ -22,3 +22,6 @@ async-channel = "2"
 log = "0.4"
 thiserror = { workspace = true }
 
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+

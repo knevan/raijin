@@ -117,12 +117,13 @@ Three code changes, everything else was the dependency bump:
 
 Decisions taken, recorded so a future upgrade does not relitigate them:
 
-- **`gpui_kit::open_window` was not adopted.** It wraps the build view in
-  `base::Root` itself, while the application already passes a `Root`-free view
-  straight to `cx.open_window`. Adopting it would only add an import.
-- **The Add Download window now hosts dialog/sheet layers too**, because the
-  plugin is registered per application, not per window. Accepted: it was the
-  only window that previously mounted notifications alone.
+- **Correction: removing the root wrapper was not safe.** Component plugins
+  are registered per application but instantiated per `base::Root`, not for
+  every bare view passed to `cx.open_window`. `WindowExt` requires that root
+  and otherwise panics when opening a dialog or notification. Settings now
+  uses `gpui_kit::open_window` and accesses its content through `Root::view()`
+  when reusing the window. Other window entry points still need a separate
+  audit; global plugin registration alone does not prove overlay support.
 - **`menu-state` is enabled.** Without it `gpui-tray` hardcodes
   `enabled: true` in `compile_menu`, so every `MenuItem::disabled(...)` in
   `main.rs` was silently discarded. The `has_window` row also needed a

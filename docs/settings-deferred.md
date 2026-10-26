@@ -115,11 +115,14 @@ here so it is not mistaken for a one-line section.
 **Deferred verification.** These are implemented, compile clean, and pass unit
 tests, but have not been exercised in a running app:
 
-- `AlertDialog` (Regenerate confirmation) rendered from a Settings window whose
-  root is a plain `Root::new`. `settings.rs` mounts `render_dialog_layer`,
-  `render_sheet_layer`, and `render_notification_layer`, matching `main_view.rs`,
-  but the Add Download window also uses `Root::new` and does not mount those
-  layers — so the pattern is proven only for the main window.
+- Settings now opens through `gpui_kit::open_window`, which wraps its content
+  in `gpui_base::Root` and mounts component overlays through the registered
+  plugin. A bare `SettingsView` root cannot open the Regenerate confirmation:
+  `WindowExt` panics when component window state is missing. Window reuse reads
+  `SettingsView` from `Root::view()` rather than downcasting the window itself.
+  Headless UI regression tests cover confirmation, Cancel/Escape, rotation and
+  persistence, disabled integration, reuse, and reopening. Native Windows smoke
+  verification is still required; headless tests do not exercise OS fail-fast.
 - `Sidebar` inside `h_flex` with `flex_1().min_h_0()` on the parent: the nav is
   a `list()`-backed sidebar, which sizes from the viewport. Resizing the
   Settings window narrower than the nav must not collapse it.

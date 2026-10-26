@@ -521,13 +521,20 @@ fn open_settings_at(cx: &mut App, handles: &SettingsHandles, section: Option<Sec
         .window
         .lock()
         .expect("settings window lock poisoned");
-    if let Some(existing) = existing.and_then(|handle| handle.downcast::<SettingsView>()) {
+    if let Some(existing) = existing.and_then(|handle| handle.downcast::<base::Root>()) {
         // A closed window makes `update` fail; fall through and reopen.
         if existing
-            .update(cx, |view, window, cx| {
+            .update(cx, |root, window, cx| {
                 if let Some(section) = section {
-                    view.section = section;
-                    cx.notify();
+                    let view = root
+                        .view()
+                        .clone()
+                        .downcast::<SettingsView>()
+                        .expect("Settings root must contain SettingsView");
+                    view.update(cx, |view, cx| {
+                        view.section = section;
+                        cx.notify();
+                    });
                 }
                 window.activate_window();
             })
@@ -546,11 +553,10 @@ fn open_settings_at(cx: &mut App, handles: &SettingsHandles, section: Option<Sec
     options.is_resizable = true;
     options.focus = true;
     let handles = handles.clone();
-    match cx.open_window(options, |window, cx| {
+    match gpui_kit::open_window(options, cx, |window, cx| {
         cx.new(|cx| SettingsView::new(window, cx, handles.clone()))
     }) {
-        Ok(handle) => {
-            let any = AnyWindowHandle::from(handle);
+        Ok((any, _)) => {
             *handles
                 .window
                 .lock()
@@ -569,6 +575,8 @@ mod tests {
 
     use super::Section;
     use crate::tray::TraySession;
+
+    mod window;
 
     #[test]
     fn every_section_should_have_a_distinct_label_and_icon() {

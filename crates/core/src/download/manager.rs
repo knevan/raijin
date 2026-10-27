@@ -67,6 +67,9 @@ pub struct NewDownload {
     pub file_name: String,
     /// Destination folder.
     pub folder: PathBuf,
+    /// User-selected category; absent means General.
+    #[serde(default)]
+    pub category: Option<String>,
     /// Preferred worker count for future ranged downloads.
     pub preferred_connections: Option<std::num::NonZeroU16>,
     /// Optional per-download throughput limit.
@@ -83,6 +86,7 @@ impl NewDownload {
             headers: BTreeMap::new(),
             file_name: file_name.into(),
             folder,
+            category: None,
             preferred_connections: None,
             speed_limit: None,
         }
@@ -626,6 +630,7 @@ impl DownloadManager {
             headers: request.headers,
             file_name,
             folder,
+            category: request.category,
             status: DownloadStatus::Added,
             total_bytes: None,
             downloaded_bytes: Bytes::ZERO,
@@ -1136,13 +1141,15 @@ mod tests {
                 event_buffer: 8,
             },
         );
-        let request = NewDownload::http(
+        let mut request = NewDownload::http(
             "https://example.com/file.bin",
             "file.bin",
             PathBuf::from("C:/Downloads"),
         );
+        request.category = Some("Compressed".to_owned());
 
         let added = handle.add(request).await?;
+        assert_eq!(added.category.as_deref(), Some("Compressed"));
         let downloads = handle.list().await?;
 
         assert_eq!(downloads, vec![added]);
@@ -1551,6 +1558,7 @@ mod tests {
             headers: BTreeMap::new(),
             file_name: "file.bin".to_owned(),
             folder: PathBuf::from("C:/Downloads"),
+            category: None,
             status,
             total_bytes: None,
             downloaded_bytes: Bytes::ZERO,

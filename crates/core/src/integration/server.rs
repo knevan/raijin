@@ -196,6 +196,7 @@ pub fn prepare_item(item: &DownloadRequestItem, folder: &Path) -> Result<Prepare
         headers,
         file_name: file_name_for(item),
         folder: folder.to_path_buf(),
+        category: None,
         preferred_connections: None,
         speed_limit: None,
     };
@@ -1048,6 +1049,7 @@ mod tests {
             headers: BTreeMap::new(),
             file_name: "a.zip".to_owned(),
             folder: folder(),
+            category: None,
             status: crate::download::DownloadStatus::Downloading,
             total_bytes: Some(Bytes::new(2048)),
             downloaded_bytes: Bytes::new(512),

@@ -439,6 +439,7 @@ impl AddDownloadView {
         let folder = self.resolved_folder(cx);
         match build_new_download(url.trim(), &file_name, folder) {
             Ok(mut request) => {
+                request.category = download_category(self.use_category, self.selected_category(cx));
                 preserve_integration_credentials(&mut request, self.integration.as_ref());
                 let command = if autostart {
                     EngineCommand::Add(request)
@@ -658,20 +659,30 @@ impl Render for AddDownloadView {
                                     .secondary()
                                     .w(px(ICON_BUTTON))
                                     .h(px(ICON_BUTTON))
-                                    .icon(IconName::Settings)
-                                    .tooltip("Reveal folder in file manager")
+                                    .icon(IconName::Folder)
+                                    .tooltip("Open download folder")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         let folder = this.resolved_folder(cx);
                                         if let Err(error) =
                                             raijin_core::platform::open_folder(&folder)
                                         {
-                                            tracing::warn!(?error, "reveal folder failed");
+                                            tracing::warn!(?error, "open download folder failed");
                                             window.push_notification(
                                                 format!("Could not open folder: {error}"),
                                                 cx,
                                             );
                                         }
                                     })),
+                            )
+                            .child(
+                                Button::new("add-download-options")
+                                    .outline()
+                                    .secondary()
+                                    .w(px(ICON_BUTTON))
+                                    .h(px(ICON_BUTTON))
+                                    .icon(IconName::Settings)
+                                    .disabled(true)
+                                    .tooltip("Download options are not available yet"),
                             ),
                     )
                     .child(Input::new(&self.file))
@@ -697,10 +708,10 @@ impl Render for AddDownloadView {
                                         Button::new("add-submit-idle")
                                             .outline()
                                             .secondary()
-                                            .w(px(110.))
-                                            .label("Add")
+                                            .w(px(130.))
+                                            .label("Add paused")
                                             .disabled(!valid)
-                                            .tooltip("Add to the list without starting")
+                                            .tooltip("Add without starting; resume manually")
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.submit(false, window, cx);
                                             })),
@@ -900,6 +911,10 @@ fn initial_category(url: &str) -> FileCategory {
     }
 }
 
+fn download_category(use_category: bool, category: FileCategory) -> Option<String> {
+    use_category.then(|| category.label().to_owned())
+}
+
 /// Resolves the destination folder for the form.
 ///
 /// A checked "Use Category" stores into `<root>/<Label>` (sketch example:
@@ -1049,6 +1064,22 @@ mod tests {
                 &default
             ),
             default
+        );
+    }
+
+    #[test]
+    fn download_category_should_follow_checkbox_and_selection() {
+        assert_eq!(
+            super::download_category(true, FileCategory::Compressed),
+            Some("Compressed".to_owned())
+        );
+        assert_eq!(
+            super::download_category(true, FileCategory::Other),
+            Some("Other".to_owned())
+        );
+        assert_eq!(
+            super::download_category(false, FileCategory::Programs),
+            None
         );
     }
 

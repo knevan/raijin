@@ -357,6 +357,9 @@ pub struct DownloadItem {
     pub file_name: String,
     /// Destination folder.
     pub folder: PathBuf,
+    /// User-selected category; absent means General.
+    #[serde(default)]
+    pub category: Option<String>,
     /// Durable lifecycle state.
     pub status: DownloadStatus,
     /// Known total size, if available.

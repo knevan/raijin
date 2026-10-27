@@ -262,6 +262,7 @@ mod tests {
             headers: BTreeMap::new(),
             file_name: format!("file-{id}.bin"),
             folder: PathBuf::from("C:/Downloads"),
+            category: None,
             status,
             total_bytes: Some(Bytes::new(1_000)),
             downloaded_bytes,

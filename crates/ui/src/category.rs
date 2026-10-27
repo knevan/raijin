@@ -1,6 +1,6 @@
 use raijin_core::download::DownloadStatus;
 
-/// File category inferred from a file name extension.
+/// Built-in download groups and file-type classifications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileCategory {
     Compressed,
@@ -10,10 +10,11 @@ pub enum FileCategory {
     Pictures,
     Documents,
     Other,
+    General,
 }
 
 impl FileCategory {
-    /// Short label shown under the file name in the downloads table.
+    /// Label used for file categories and their destination folders.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -24,10 +25,11 @@ impl FileCategory {
             Self::Pictures => "Pictures",
             Self::Documents => "Documents",
             Self::Other => "Other",
+            Self::General => "General",
         }
     }
 
-    /// All selectable file categories in sidebar order.
+    /// Selectable categories, excluding the unchecked General group.
     #[must_use]
     pub const fn all() -> [Self; 7] {
         [
@@ -64,10 +66,10 @@ impl CategoryFilter {
 
     /// Returns true when a download of `category` passes this filter.
     #[must_use]
-    pub const fn matches(self, category: FileCategory) -> bool {
+    pub fn matches(self, category: &str) -> bool {
         match self {
             Self::All => true,
-            Self::Category(expected) => expected as u8 == category as u8,
+            Self::Category(expected) => expected.label() == category,
         }
     }
 }
@@ -179,9 +181,13 @@ mod tests {
 
     #[test]
     fn category_filter_should_match_selected_category_only() {
-        assert!(CategoryFilter::All.matches(FileCategory::Videos));
-        assert!(CategoryFilter::Category(FileCategory::Videos).matches(FileCategory::Videos));
-        assert!(!CategoryFilter::Category(FileCategory::Videos).matches(FileCategory::Music));
+        assert!(CategoryFilter::All.matches(FileCategory::Videos.label()));
+        assert!(
+            CategoryFilter::Category(FileCategory::Videos).matches(FileCategory::Videos.label())
+        );
+        assert!(
+            !CategoryFilter::Category(FileCategory::Videos).matches(FileCategory::Music.label())
+        );
     }
 
     #[test]

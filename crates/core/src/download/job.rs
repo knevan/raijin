@@ -2156,6 +2156,7 @@ mod tests {
             headers: BTreeMap::new(),
             file_name: "file.bin".to_owned(),
             folder,
+            category: None,
             status: DownloadStatus::Added,
             total_bytes: (downloaded > 0).then_some(Bytes::new(1024)),
             downloaded_bytes: Bytes::new(downloaded),

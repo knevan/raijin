@@ -18,6 +18,8 @@ pub struct DownloadView {
     pub file_name: String,
     /// Destination folder.
     pub folder: PathBuf,
+    /// User-selected category; absent means General.
+    pub category: Option<String>,
     /// Durable status.
     pub status: DownloadStatus,
     /// Downloaded bytes.
@@ -45,6 +47,7 @@ impl DownloadView {
             url: item.url.clone(),
             file_name: item.file_name.clone(),
             folder: item.folder.clone(),
+            category: item.category.clone(),
             status: item.status,
             downloaded_bytes: item.downloaded_bytes,
             total_bytes: item.total_bytes,
@@ -74,6 +77,7 @@ impl DownloadView {
             url: String::new(),
             file_name: String::new(),
             folder: PathBuf::new(),
+            category: None,
             status: DownloadStatus::Error,
             downloaded_bytes: Bytes::ZERO,
             total_bytes: None,
@@ -230,6 +234,14 @@ mod tests {
 
         assert!(projection.state().active.contains_key(&active.id));
         assert!(projection.state().completed.contains_key(&completed.id));
+        assert_eq!(
+            projection.state().active[&active.id].category,
+            active.category
+        );
+        assert_eq!(
+            projection.state().completed[&completed.id].category,
+            completed.category
+        );
     }
 
     #[test]
@@ -463,6 +475,7 @@ mod tests {
             headers: BTreeMap::new(),
             file_name: format!("file-{id}.bin"),
             folder: PathBuf::from("C:/Downloads"),
+            category: Some("Compressed".to_owned()),
             status,
             total_bytes: Some(Bytes::new(200)),
             downloaded_bytes,

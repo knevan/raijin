@@ -84,6 +84,7 @@ fn sample_item(id: i64) -> DownloadItem {
         headers: BTreeMap::new(),
         file_name: format!("file-{id}.bin"),
         folder: PathBuf::from("downloads"),
+        category: None,
         status: if completed {
             DownloadStatus::Completed
         } else {

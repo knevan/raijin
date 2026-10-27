@@ -89,7 +89,7 @@ pub struct DownloadRow {
     pub file_name: String,
     /// Lowercase sort key for case-insensitive name sorting.
     pub name_key: String,
-    /// Inferred file category for filtering and the name-cell subtitle.
+    /// Inferred file type used only for the file icon.
     pub category: FileCategory,
     /// Destination folder for open/reveal actions.
     pub folder: PathBuf,
@@ -115,8 +115,8 @@ pub struct DownloadRow {
     pub eta_seconds: Option<u64>,
     /// ETA cell text (empty when unknown).
     pub eta_label: String,
-    /// Queue holding this download, when it is a queue member.
-    pub queue_name: Option<String>,
+    /// User-selected category shown below the file name and used for filtering.
+    pub category_label: String,
     /// Creation timestamp in Unix milliseconds.
     pub created_at: i64,
     /// Date-added cell text.
@@ -163,8 +163,10 @@ impl DownloadRow {
             speed_label: format_speed(view.speed.get()),
             eta_seconds: view.eta_seconds,
             eta_label: format_eta(view.eta_seconds),
-            // Filled by the view, which owns the queue snapshot.
-            queue_name: None,
+            category_label: view
+                .category
+                .clone()
+                .unwrap_or_else(|| "General".to_owned()),
             created_at: view.created_at,
             added_label: format_relative_time(now_ms, view.created_at),
         }
@@ -354,7 +356,7 @@ pub fn filter_rows(
 ) -> Vec<DownloadRow> {
     let query = query.trim().to_lowercase();
     rows.iter()
-        .filter(|row| category.matches(row.category))
+        .filter(|row| category.matches(&row.category_label))
         .filter(|row| status.matches(row.status))
         .filter(|row| query.is_empty() || row.name_key.contains(&query))
         .cloned()
@@ -386,17 +388,6 @@ fn directed(ordering: std::cmp::Ordering, descending: bool) -> std::cmp::Orderin
         ordering.reverse()
     } else {
         ordering
-    }
-}
-
-/// Subtitle for the name cell: the owning queue when the row is a member.
-///
-/// A queued row that belongs to an inactive queue looks stuck otherwise, so the
-/// queue name takes precedence over the file category.
-fn queue_subtitle(row: &DownloadRow) -> String {
-    match &row.queue_name {
-        Some(queue) => queue.clone(),
-        None => row.category.label().to_owned(),
     }
 }
 
@@ -443,7 +434,7 @@ pub fn category_icon(category: FileCategory) -> IconName {
         FileCategory::Music => IconName::Star,
         FileCategory::Pictures => IconName::GalleryVerticalEnd,
         FileCategory::Documents => IconName::FileText,
-        FileCategory::Other => IconName::File,
+        FileCategory::Other | FileCategory::General => IconName::File,
     }
 }
 /// Checkbox multi-select set keyed by stable [`DownloadId`].
@@ -1032,7 +1023,7 @@ impl TableDelegate for DownloadsDelegate {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(queue_subtitle(row)),
+                                    .child(row.category_label.clone()),
                             ),
                     )
                     .into_any_element()
@@ -1239,8 +1230,7 @@ mod tests {
 
     use super::{
         ColumnDef, DownloadRow, QueueDrag, RowChecklist, SortColumn, SortDir, build_rows,
-        can_pause, can_resume, filter_rows, is_transferring, next_sort, queue_subtitle, sort_rows,
-        toolbar_actions,
+        can_pause, can_resume, filter_rows, is_transferring, next_sort, sort_rows, toolbar_actions,
     };
     use crate::category::{CategoryFilter, FileCategory, StatusFilter};
     use crate::format::format_bytes;
@@ -1300,20 +1290,63 @@ mod tests {
     }
 
     #[test]
-    fn queue_member_row_should_show_its_queue_instead_of_the_category() {
+    fn rows_should_use_selected_category_for_subtitle_and_filter() {
         let now = 1_700_000_000_000;
-        let mut row = DownloadRow::from_view(&view(1, DownloadStatus::Queued, 0, None, now), now);
-        assert_eq!(
-            queue_subtitle(&row),
-            row.category.label(),
-            "a non-member keeps the file category"
-        );
+        for status in [DownloadStatus::Queued, DownloadStatus::Completed] {
+            let mut view = view_named(1, "app.exe", status, now);
+            view.folder = PathBuf::from("Custom/Files");
+            view.category = Some("Compressed".to_owned());
+            let rows = build_rows([&view], now);
+            assert_eq!(rows[0].category_label, "Compressed");
+            assert_eq!(rows[0].category, FileCategory::Programs);
+            assert_eq!(
+                filter_rows(
+                    &rows,
+                    CategoryFilter::Category(FileCategory::Compressed),
+                    StatusFilter::All,
+                    ""
+                )
+                .len(),
+                1
+            );
+            assert!(
+                filter_rows(
+                    &rows,
+                    CategoryFilter::Category(FileCategory::Programs),
+                    StatusFilter::All,
+                    ""
+                )
+                .is_empty()
+            );
+        }
+    }
 
-        row.queue_name = Some("Night".to_owned());
+    #[test]
+    fn rows_without_category_should_be_general_even_in_category_folders() {
+        let now = 1_700_000_000_000;
+        let mut view = view_named(1, "app.exe", DownloadStatus::Added, now);
+        view.folder = PathBuf::from("Downloads/raijin/Programs");
+        view.category = None;
+        let rows = build_rows([&view], now);
+        assert_eq!(rows[0].category_label, "General");
         assert_eq!(
-            queue_subtitle(&row),
-            "Night",
-            "the queue explains why a queued row is waiting"
+            filter_rows(
+                &rows,
+                CategoryFilter::Category(FileCategory::General),
+                StatusFilter::All,
+                ""
+            )
+            .len(),
+            1
+        );
+        assert!(
+            filter_rows(
+                &rows,
+                CategoryFilter::Category(FileCategory::Programs),
+                StatusFilter::All,
+                ""
+            )
+            .is_empty()
         );
     }
 
@@ -1546,6 +1579,7 @@ mod tests {
             url: format!("https://example.com/{name}"),
             file_name: name.to_owned(),
             folder: PathBuf::from("C:/Downloads"),
+            category: Some(crate::category::infer_category(name).label().to_owned()),
             status,
             downloaded_bytes: Bytes::new(0),
             total_bytes: None,

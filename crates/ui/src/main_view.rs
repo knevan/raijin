@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -14,7 +13,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use raijin_core::download::{DownloadId, DownloadStatus, QueueId};
+use raijin_core::download::{DownloadStatus, QueueId};
 use raijin_core::monitor::MonitorState;
 use raijin_core::platform::DiskUsage;
 use raijin_core::platform::tray::CloseDecision;
@@ -50,7 +49,7 @@ pub struct MainView {
     table: Entity<TableState<DownloadsDelegate>>,
     /// Last-seen monitor snapshot; compared to skip no-op refreshes.
     last_snapshot: std::sync::Arc<MonitorState>,
-    /// Last-seen queue snapshot; supplies row labels and drop targets.
+    /// Last-seen queue snapshot; supplies filters and drop targets.
     queue_state: Vec<QueueSnapshot>,
     /// Unfiltered presentation rows rebuilt on every snapshot change.
     cache: Vec<DownloadRow>,
@@ -105,8 +104,6 @@ impl MainView {
         ];
 
         let monitor = handles.monitor.clone();
-        // Seed once so the first paint already labels queue members; the poll
-        // loop refreshes it on every snapshot change.
         let initial_queues = handles.queues.state();
         let queue_handle = handles.queues.clone();
         let poll_tray = tray.clone();
@@ -182,37 +179,18 @@ impl MainView {
             .chain(snapshot.completed.values())
             .collect();
         views.sort_by_key(|view| view.created_at);
-        let labels = self.queue_labels();
         self.cache = build_rows(views, now);
-        for row in &mut self.cache {
-            row.queue_name = labels.get(&row.id).cloned();
-        }
         self.last_snapshot = snapshot;
         self.loaded = true;
         self.recompute(cx);
     }
 
-    /// Stores the latest queue snapshot and relabels rows when it changed.
+    /// Stores the latest queue snapshot.
     fn apply_queue_state(&mut self, queues: Vec<QueueSnapshot>) {
         if queues == self.queue_state {
             return;
         }
         self.queue_state = queues;
-        let labels = self.queue_labels();
-        for row in &mut self.cache {
-            row.queue_name = labels.get(&row.id).cloned();
-        }
-    }
-
-    /// Maps download id to owning queue name for the current snapshot.
-    fn queue_labels(&self) -> HashMap<DownloadId, String> {
-        let mut labels = std::collections::HashMap::new();
-        for snapshot in &self.queue_state {
-            for id in &snapshot.items {
-                labels.insert(*id, snapshot.queue.name.clone());
-            }
-        }
-        labels
     }
 
     /// Refreshes detected disk usage at most every [`STORAGE_REFRESH_INTERVAL`].
@@ -868,29 +846,34 @@ fn filter_parent(
         .on_click(cx.listener(move |this, _, _, cx| {
             this.set_filter(status, CategoryFilter::All, cx);
         }))
-        .children(FileCategory::all().map(|item| {
-            let is_child_active = filter.status == status
-                && filter.queue.is_none()
-                && matches!(
-                    filter.category,
-                    CategoryFilter::Category(current) if current == item
-                );
+        .children(
+            FileCategory::all()
+                .into_iter()
+                .chain([FileCategory::General])
+                .map(|item| {
+                    let is_child_active = filter.status == status
+                        && filter.queue.is_none()
+                        && matches!(
+                            filter.category,
+                            CategoryFilter::Category(current) if current == item
+                        );
 
-            let child_text_color = if is_child_active {
-                cx.theme().sidebar_accent_foreground
-            } else {
-                cx.theme().sidebar_foreground
-            };
+                    let child_text_color = if is_child_active {
+                        cx.theme().sidebar_accent_foreground
+                    } else {
+                        cx.theme().sidebar_foreground
+                    };
 
-            SidebarMenuItem::new(item.label())
-                .icon(Icon::new(category_icon(item)).text_color(child_text_color))
-                .label_style(StyleRefinement::default().text_color(child_text_color))
-                .active(is_child_active)
-                .text_color(child_text_color)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_filter(status, CategoryFilter::Category(item), cx);
-                }))
-        }))
+                    SidebarMenuItem::new(item.label())
+                        .icon(Icon::new(category_icon(item)).text_color(child_text_color))
+                        .label_style(StyleRefinement::default().text_color(child_text_color))
+                        .active(is_child_active)
+                        .text_color(child_text_color)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_filter(status, CategoryFilter::Category(item), cx);
+                        }))
+                }),
+        )
 }
 
 /// Top-level section items rendered in the main navigation sidebar.

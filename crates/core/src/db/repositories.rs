@@ -106,7 +106,7 @@ impl DownloadRepository {
             sqlx::query(
                 r#"
             UPDATE downloads
-            SET kind = ?, url = ?, download_page = ?, headers_json = ?, file_name = ?, folder = ?,
+            SET kind = ?, url = ?, download_page = ?, headers_json = ?, file_name = ?, folder = ?, category = ?,
                 status = ?, total_bytes = ?, downloaded_bytes = ?, etag = ?, last_modified = ?,
                 preferred_connections = ?, speed_limit_bps = ?, error_kind = ?, error_message = ?,
                 created_at = ?, started_at = ?, completed_at = ?, updated_at = ?
@@ -627,6 +627,7 @@ fn bind_download_fields<'q>(
         .bind(headers_json)
         .bind(item.file_name.as_str())
         .bind(folder)
+        .bind(item.category.as_deref())
         .bind(item.status.as_str())
         .bind(option_bytes_to_i64("total_bytes", item.total_bytes)?)
         .bind(bytes_to_i64("downloaded_bytes", item.downloaded_bytes)?)
@@ -653,11 +654,11 @@ where
         sqlx::query(
             r#"
         INSERT INTO downloads (
-            kind, url, download_page, headers_json, file_name, folder, status, total_bytes,
+            kind, url, download_page, headers_json, file_name, folder, category, status, total_bytes,
             downloaded_bytes, etag, last_modified, preferred_connections, speed_limit_bps,
             error_kind, error_message, created_at, started_at, completed_at, updated_at, id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         ),
         item,
@@ -757,6 +758,7 @@ fn download_from_row(row: SqliteRow) -> DbResult<DownloadItem> {
         headers,
         file_name: row.try_get("file_name")?,
         folder: PathBuf::from(folder),
+        category: row.try_get("category")?,
         status: DownloadStatus::from_str(&status)?,
         total_bytes: option_i64_to_bytes("total_bytes", row.try_get("total_bytes")?)?,
         downloaded_bytes: i64_to_bytes("downloaded_bytes", row.try_get("downloaded_bytes")?)?,
@@ -1028,6 +1030,7 @@ mod tests {
             headers,
             file_name: "file.bin".to_owned(),
             folder: PathBuf::from("C:/Downloads"),
+            category: Some("Compressed".to_owned()),
             status: DownloadStatus::Added,
             total_bytes: Some(Bytes::new(1024)),
             downloaded_bytes: Bytes::new(0),
@@ -1098,6 +1101,8 @@ mod tests {
         let mut item = sample_download(1);
 
         repository.add(&item).await?;
+        assert_eq!(repository.get(item.id).await?.as_ref(), Some(&item));
+        item.category = None;
         item.status = DownloadStatus::Paused;
         item.downloaded_bytes = Bytes::new(128);
         item.failure = Some(DownloadFailure {
@@ -1112,6 +1117,18 @@ mod tests {
         assert_eq!(repository.list().await?, vec![item.clone()]);
         assert!(repository.remove(item.id).await?);
         assert_eq!(repository.get(item.id).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn downloads_should_reject_empty_or_untrimmed_categories() -> DbResult<()> {
+        let db = test_db().await?;
+        let repository = DownloadRepository::new(db.pool.clone());
+        for category in ["", " ", " Compressed", "Compressed "] {
+            let mut item = sample_download(1);
+            item.category = Some(category.to_owned());
+            assert!(repository.add(&item).await.is_err());
+        }
         Ok(())
     }
 

@@ -12,6 +12,12 @@
       "sourceType": "github",
       "skillPath": "skills/gpui-kit-design-guides/SKILL.md",
       "computedHash": "fecbcb47582334b91db63fd7b76c9a05b562dddfc9228fe052c5210efe78fc98"
+    },
+    "hotpath-rs": {
+      "source": "hotpath-rs/hotpath",
+      "sourceType": "github",
+      "skillPath": "skills/hotpath-rs/SKILL.md",
+      "computedHash": "afeca5d3054967b15fc5658ced4498501667c25ee416c4b5f90dec382baf84bf"
     }
   }
 }

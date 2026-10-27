@@ -10,6 +10,7 @@ path = "src/main.rs"
 [features]
 hotpath = ["hotpath/hotpath", "raijin-core/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "raijin-core/hotpath-alloc"]
+hotpath-prometheus = ["hotpath", "hotpath/hotpath-prometheus", "raijin-core/hotpath-prometheus"]
 
 [dependencies]
 hotpath = { workspace = true }
@@ -17,11 +18,10 @@ gpui-kit = { workspace = true }
 gpui-tray = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-raijin-core = { path = "../core" }
-async-channel = "2"
-log = "0.4"
+raijin-core = { workspace = true }
+async-channel = { workspace = true }
+log = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
-

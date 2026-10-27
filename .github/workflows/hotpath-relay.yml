@@ -1,0 +1,21 @@
+name: Hotpath monitor relay
+
+on:
+  workflow_run:
+    workflows: ["Hotpath monitor benchmark"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  relay:
+    # yamllint disable-line rule:line-length
+    uses: hotpath-rs/hotpath/.github/workflows/hotpath-relay.yml@f98dee237c49087e20b94b62bcd9becfceeee357 # v0.29.2
+    permissions:
+      actions: read
+      id-token: write
+      pull-requests: read
+    with:
+      benchmark: profile_monitor
+      artifact_name: hotpath-report
+      report_file: report.json

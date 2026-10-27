@@ -3,16 +3,21 @@ resolver = "3"
 members = ["crates/core", "crates/ui"]
 
 [workspace.dependencies]
+raijin-core = { path = "crates/core" }
+async-channel = "2"
 base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 getrandom = "0.4"
-hotpath = "0.29.2"
+hotpath = { version = "0.29.2", features = ["tokio"] }
+log = "0.4"
 encoding_rs = "0.8"
 gpui-kit = { version = "0.8", features = ["component", "assets"] }
 gpui-tray = { version = "0.3", default-features = false, features = ["gpui-kit", "menu-state"] }
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 sqlx = { version = "0.9", default-features = false, features = ["macros", "migrate", "runtime-tokio", "sqlite"] }
+sysinfo = "0.31"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -20,6 +25,7 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tempfile = "3.23"
+winreg = "0.52"
 
 [profile.deploy]
 inherits = "release"

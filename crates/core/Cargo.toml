@@ -6,6 +6,9 @@ edition = "2024"
 [features]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cloud = ["hotpath", "hotpath/hotpath-cloud"]
+hotpath-callgrind = ["hotpath", "hotpath/hotpath-callgrind"]
+hotpath-prometheus = ["hotpath", "hotpath/hotpath-prometheus"]
 
 [[example]]
 name = "profile_monitor"
@@ -15,7 +18,7 @@ required-features = ["hotpath"]
 hotpath = {workspace = true}
 axum = {workspace = true}
 base64 = {workspace = true}
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+chrono = { workspace = true }
 getrandom = {workspace = true}
 encoding_rs = {workspace = true}
 tokio = {workspace = true}
@@ -24,7 +27,7 @@ sqlx = {workspace = true}
 reqwest = {workspace = true}
 serde = {workspace = true}
 serde_json = {workspace = true}
-sysinfo = "0.31"
+sysinfo = { workspace = true }
 thiserror = {workspace = true}
 tracing = {workspace = true}
 tracing-subscriber = {workspace = true}
@@ -34,4 +37,4 @@ tempfile = {workspace = true}
 tokio = {workspace = true}
 
 [target.'cfg(windows)'.dependencies]
-winreg = "0.52"
+winreg = { workspace = true }

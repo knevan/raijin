@@ -121,14 +121,28 @@ Static reports require no CLI installation. For an optional live dashboard, inst
 ```powershell
 $env:HOTPATH_METRICS_SERVER_OFF = "true"
 $env:HOTPATH_OUTPUT_PATH = Join-Path $PWD "hotpath-monitor.json"
-cargo run --locked --release -p raijin-core --example profile_monitor --features hotpath-alloc
+cargo run --locked --profile deploy -p raijin-core --example profile_monitor --features hotpath-alloc
 ```
 
 The workload seeds 1,000 completed items and 16 active items, applies 500 progress events with subscriber synchronization, and reads shared snapshots 20,000 times. Assertions check projection results, snapshot sharing, and older-snapshot immutability. It uses no database, network, or desktop resources. A 30s timeout bounds the workload. Use `--features hotpath` for timing without allocation tracking.
 
-`.github/workflows/profiling.yml` provides a manually triggered Windows/Linux run of this workload and stores JSON reports as GitHub Actions artifacts. It does not upload to Hotpath Cloud or enforce regression thresholds. Establish comparable baselines before adding PR automation or budgets. This checks core projection/publication costs, not GUI lifecycle, real download throughput, or absence of leaks. Do not compare timing/RSS across operating systems as equivalent measurements.
+`.github/workflows/profiling.yml` provides a manually triggered Windows/Linux run of this workload and stores JSON reports as GitHub Actions artifacts. It does not upload to Hotpath Cloud or enforce regression thresholds. It remains separate from the automated Cloud benchmark. This checks core projection/publication costs, not GUI lifecycle, real download throughput, or absence of leaks. Do not compare timing/RSS across operating systems as equivalent measurements.
 
 For normal tests, leave profiling off. To check instrumentation builds, use `cargo check -p raijin-ui --features hotpath-alloc`; ordinary `cargo test` does not initialize a profiling session. Run the dedicated example to obtain a report without global-guard conflicts between parallel tests.
+
+### Hotpath Cloud regression CI
+
+`.github/workflows/hotpath-benchmark.yml` runs `profile_monitor` on pushes to `main` and pull requests, including forks. It builds once with `--profile deploy` and opt-in `hotpath-alloc,hotpath-cloud,hotpath-callgrind`, then merges native timing/allocation metrics with Callgrind instruction counts. Ubuntu 26.04, Valgrind 3.26.0, and Rust 1.99.0 are pinned for comparability. Bump the toolchain in a separate PR; its merge establishes a new baseline. The deploy profile matches the application build settings (Thin LTO, one codegen unit, abort-on-panic, symbols retained). Re-establish the default-branch baseline after switching from release to deploy; differences across profiles are not application regressions.
+
+The Cloud workflow shares job environment through a YAML anchor while keeping push/PR permissions separate. All its actions are SHA-pinned, and checkout does not persist credentials. PR concurrency cancels superseded runs; push concurrency does not cancel a running baseline upload. The existing manual artifact-only workflow also uses deploy, SHA-pinned actions, Rust 1.99.0, and checkout without persisted credentials. No matrix, extra command runner, or new manual Cloud trigger is needed for this single benchmark.
+
+`hotpath/policy.toml` uses the official default policy with the recommended initial 3% instruction threshold and `fail_check = false`. Timing is shown but not judged. No absolute memory budgets or required merge checks are configured. Re-run the first default-branch jobs to confirm instruction-count variation stays below the threshold; the Windows local environment cannot validate Callgrind. This benchmark measures monitor allocation traffic and CPU work, not overall GUI/tray resident memory or leak freedom.
+
+Push jobs upload using GitHub OIDC. PR jobs have only `contents: read` and store `hotpath-report/report.json`; `.github/workflows/hotpath-relay.yml` uploads it through the official reusable workflow pinned to the Hotpath 0.29.2 commit, without checking out PR code. The relay runs only from the default branch and matches the benchmark workflow name exactly; renaming that workflow requires updating the relay. The relay itself is not a PR check. Review PR changes to `hotpath/*.toml` as CI configuration, since each PR supplies its own policy.
+
+Local verification: the policy validation API returned `valid: true`; core feature-off/on checks and all-target Clippy with the Cloud/Callgrind features passed. Two native release runs on Windows with Rust 1.101.0-nightly embedded the expected benchmark/policy and matched every function allocation total (`publish`: 218,457,000 B across 500 calls; snapshot reads: 0 B). Rust 1.99.0 feature-off check passed, but its Windows release run failed in `aws-lc-sys` with MSVC C1056 before executing the workload. The pinned Linux build, merged reports, uploads, and PR comments remain unverified until CI runs. The initial mutable action references have since been replaced by SHA pins. Security analyzers may still flag the intentional `workflow_run` trigger; the privileged relay is SHA-pinned and never executes PR code. The release results above are historical validation, not verification of the deploy profile. After switching profiles, YAML/anchor parsing, command and shell-syntax assertions, SHA pins, concurrency, PR permissions, and relay mapping checks passed. The local deploy workload attempt failed before execution in `aws-lc-sys` with MSVC C1056 (object timestamp update), so no deploy report or repeatability result is claimed. The local linter's unknown `ubuntu-26.04` label is a false positive: that x64 image is listed in the official GitHub runner-images README.
+
+To activate, install the Hotpath GitHub App for `knevan/raijin` through <https://hotpath.rs/app>, then merge these files to `main`. Its first push supplies the baseline; older PR branches must incorporate the policy. Reports for this public repository are public by default. No upload is triggered during local verification.
 
 ## Acceptance and next action
 

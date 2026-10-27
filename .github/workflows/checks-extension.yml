@@ -1,0 +1,114 @@
+name: Checks/Browser Extension
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    types: [ opened, synchronize, reopened ]
+
+concurrency:
+  group: checks-extension-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  filter-changes:
+    name: Filter Changes
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      extension: ${{ steps.changes.outputs.extension }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Detect extension changes
+      uses: dorny/paths-filter@v3
+      id: changes
+      with:
+        filters: |
+          extension:
+            - 'browser-extension/**'
+            - '.github/workflows/checks-extension.yml'
+
+  typecheck:
+    name: Typecheck
+    needs: filter-changes
+    if: needs.filter-changes.outputs.extension == 'true'
+    runs-on: ubuntu-26.04
+    defaults:
+      run:
+        working-directory: browser-extension
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup pnpm and Node
+      uses: pnpm/setup@v2
+      with:
+        runtime: node@26
+        cache: true
+        install: false
+
+    - name: Install dependencies
+      run: pnpm install --frozen-lockfile
+
+    - name: Run type check
+      run: pnpm run compile
+
+  test:
+    name: Test
+    needs: filter-changes
+    if: needs.filter-changes.outputs.extension == 'true'
+    runs-on: ubuntu-26.04
+    defaults:
+      run:
+        working-directory: browser-extension
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup pnpm and Node
+      uses: pnpm/setup@v2
+      with:
+        runtime: node@26
+        cache: true
+        install: false
+
+    - name: Install dependencies
+      run: pnpm install --frozen-lockfile
+
+    - name: Run unit tests
+      run: pnpm test
+
+  build:
+    name: Build & Lint
+    needs: filter-changes
+    if: needs.filter-changes.outputs.extension == 'true'
+    runs-on: ubuntu-26.04
+    defaults:
+      run:
+        working-directory: browser-extension
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup pnpm and Node
+      uses: pnpm/setup@v2
+      with:
+        runtime: node@26
+        cache: true
+        install: false
+
+    - name: Install dependencies
+      run: pnpm install --frozen-lockfile
+
+    - name: Build Chromium extension (MV3)
+      run: pnpm run build
+
+    - name: Build Firefox extension (MV2)
+      run: pnpm run build:firefox
+
+    - name: Lint Firefox extension bundle
+      run: pnpm run lint:firefox

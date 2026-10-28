@@ -638,7 +638,9 @@ impl Render for AddDownloadView {
                             )
                             .child(
                                 div().w(px(CATEGORY_DROP_WIDTH)).child(
-                                    Select::new(&self.categories).disabled(!self.use_category),
+                                    Select::new(&self.categories)
+                                        .menu_max_h(px(130.))
+                                        .disabled(!self.use_category),
                                 ),
                             )
                             .child(
@@ -791,7 +793,7 @@ fn open_download_window(
 ) {
     // Icon-button rows sit at the 32px field height (down from 44px), so the
     // frame shrinks by the same 2 x 12px to stay snug.
-    let dialog_size = size(px(500.), px(276.));
+    let dialog_size = size(px(500.), px(284.));
     let mut options = TitleBar::window_options();
     options.window_bounds = Some(WindowBounds::centered(dialog_size, cx));
     options.window_min_size = Some(dialog_size);

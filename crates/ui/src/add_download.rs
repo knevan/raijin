@@ -409,6 +409,45 @@ impl AddDownloadView {
         });
     }
 
+    fn choose_folder(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Select download folder".into()),
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = selection
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = cx.update(|window, cx| {
+                view.update(cx, |view, cx| match result {
+                    Ok(Some(paths)) => {
+                        let Some(path) = paths.first() else {
+                            return;
+                        };
+                        let Some(path) = path.to_str() else {
+                            window.push_notification("Folder path is not valid UTF-8", cx);
+                            return;
+                        };
+                        view.folder_manual = true;
+                        view.folder.update(cx, |state, cx| {
+                            state.set_value(path, window, cx);
+                        });
+                        cx.notify();
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "folder picker failed");
+                        window.push_notification(format!("Could not select folder: {error}"), cx);
+                    }
+                })
+            });
+        })
+        .detach();
+    }
+
     /// Pastes a clipboard URL into the URL field, when one exists.
     fn paste_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = clipboard_text(cx) else {
@@ -660,18 +699,9 @@ impl Render for AddDownloadView {
                                     .w(px(ICON_BUTTON))
                                     .h(px(ICON_BUTTON))
                                     .icon(IconName::Folder)
-                                    .tooltip("Open download folder")
+                                    .tooltip("Choose download folder…")
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        let folder = this.resolved_folder(cx);
-                                        if let Err(error) =
-                                            raijin_core::platform::open_folder(&folder)
-                                        {
-                                            tracing::warn!(?error, "open download folder failed");
-                                            window.push_notification(
-                                                format!("Could not open folder: {error}"),
-                                                cx,
-                                            );
-                                        }
+                                        this.choose_folder(window, cx);
                                     })),
                             )
                             .child(
@@ -770,7 +800,7 @@ fn open_download_window(
     options.focus = focus;
     let handles = handles.clone();
     let initial_url = initial_url.to_owned();
-    match cx.open_window(options, |window, cx| {
+    match gpui_kit::open_window(options, cx, |window, cx| {
         cx.new(|cx| {
             AddDownloadView::new(
                 window,
@@ -782,7 +812,7 @@ fn open_download_window(
             )
         })
     }) {
-        Ok(handle) => {
+        Ok((handle, _)) => {
             if focus {
                 let _ = handle.update(cx, |_, window, _| window.activate_window());
             }
@@ -995,6 +1025,8 @@ mod tests {
         sanitize_filename, select_probe_filename,
     };
     use crate::category::FileCategory;
+
+    mod window;
 
     #[test]
     fn integration_credentials_should_only_follow_the_approved_original_url() {

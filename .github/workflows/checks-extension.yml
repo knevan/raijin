@@ -50,6 +50,7 @@ jobs:
         runtime: node@26
         cache: true
         install: false
+        working-directory: browser-extension
 
     - name: Install dependencies
       run: pnpm install --frozen-lockfile
@@ -75,6 +76,7 @@ jobs:
         runtime: node@26
         cache: true
         install: false
+        working-directory: browser-extension
 
     - name: Install dependencies
       run: pnpm install --frozen-lockfile
@@ -100,6 +102,7 @@ jobs:
         runtime: node@26
         cache: true
         install: false
+        working-directory: browser-extension
 
     - name: Install dependencies
       run: pnpm install --frozen-lockfile

@@ -47,8 +47,8 @@ impl Render for QueueDragPreview {
             .px_3()
             .py_1()
             .rounded(px(8.))
-            .bg(cx.theme().accent)
-            .text_color(cx.theme().accent_foreground)
+            .bg(cx.theme().primary)
+            .text_color(cx.theme().primary_foreground)
             .text_sm()
             .child(self.label.clone())
     }
@@ -790,10 +790,10 @@ impl TableDelegate for DownloadsDelegate {
         let sort_icon = match (sorted, self.sort_dir) {
             (true, SortDir::Ascending) => Icon::new(IconName::ChevronUp)
                 .xsmall()
-                .text_color(cx.theme().accent),
+                .text_color(cx.theme().primary),
             (true, SortDir::Descending) => Icon::new(IconName::ChevronDown)
                 .xsmall()
-                .text_color(cx.theme().accent),
+                .text_color(cx.theme().primary),
             (false, _) => Icon::new(IconName::ChevronsUpDown)
                 .xsmall()
                 .text_color(cx.theme().muted_foreground),
@@ -902,9 +902,9 @@ impl TableDelegate for DownloadsDelegate {
         };
 
         let border_color = if is_selected {
-            cx.theme().accent
+            cx.theme().primary
         } else if is_checked {
-            cx.theme().accent.opacity(0.8)
+            cx.theme().primary.opacity(0.8)
         } else {
             cx.theme().border.opacity(0.6)
         };

@@ -54,8 +54,8 @@ pub fn apply_product_theme(cx: &mut App) {
     colors.primary_foreground = hx(CTA_INK);
     colors.primary_hover = hx(ACCENT).lighten(0.08);
     colors.primary_active = hx(ACCENT).darken(0.08);
-    colors.accent = hx(ACCENT);
-    colors.accent_foreground = hx(CTA_INK);
+    colors.accent = hx(ROW_CARD_SELECTED_BG);
+    colors.accent_foreground = hx(TEXT_PRIMARY);
     colors.muted = hx(PANEL2);
     colors.muted_foreground = hx(TEXT_MUTED);
     colors.secondary = hx(TEXT_SECONDARY);
@@ -68,6 +68,11 @@ pub fn apply_product_theme(cx: &mut App) {
     colors.success = hx(GREEN);
     colors.info = hx(BLUE);
     colors.warning = hx(ACCENT2);
+    colors.popover = hx(PANEL);
+    colors.popover_foreground = hx(TEXT_PRIMARY);
+    colors.list = hx(PANEL);
+    colors.list_active = hx(ROW_CARD_SELECTED_BG);
+    colors.list_hover = hx(ROW_CARD_HOVER_BG);
     colors.table = gpui::transparent_black();
     colors.table_head = hx(PANEL);
     colors.table_head_foreground = hx(TEXT_SECONDARY);

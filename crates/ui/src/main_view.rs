@@ -1038,7 +1038,7 @@ impl SidebarItem for QueueSection {
                                 .child(div().truncate().text_sm().child(name))
                                 .when(running, |this| {
                                     this.child(
-                                        div().size_1p5().rounded_full().bg(cx.theme().accent),
+                                        div().size_1p5().rounded_full().bg(cx.theme().primary),
                                     )
                                 }),
                         )

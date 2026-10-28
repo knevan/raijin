@@ -16,7 +16,8 @@ Rejected: deriving the category from the destination folder or file extension. B
 
 ## New Download actions
 
-- The folder icon opens the resolved destination directory using the existing platform action, with a visible error notification on failure.
+- The folder icon opens GPUI's native single-directory picker regardless of `Use Category` or whether the current destination exists. Selecting a directory replaces the path and marks it as manual without changing the selected category or checkbox. Cancel leaves the path unchanged. Picker failures show a notification; missing folders are not created implicitly.
+- Open both manual and integration confirmation windows through `gpui_kit::open_window`, which installs the Base `Root` and component notification state. A bare `App::open_window` leaves that state missing; reporting an inaccessible folder then panics in `push_notification`, causing Windows fail-fast. Headless UI regression coverage exercises the picker from a missing destination, selection and cancellation in both checkbox states, custom-path preservation, reset, and notification support.
 - The refresh-circle button resets the folder to the category/default destination.
 - The gear is disabled and reserved for future per-download options. No speed/dynamic-part controls are shown until they are wired to the engine.
 - `Add paused` adds without starting; the user resumes manually. `Download` adds and starts. The label `Queue` is deferred until the UI offers explicit automatic scheduling behavior rather than implying it through a label change.

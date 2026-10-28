@@ -1211,7 +1211,7 @@ impl TableDelegate for DownloadsDelegate {
         );
         menu.separator().item(
             PopupMenuItem::new("Remove")
-                .icon(Icon::new(IconName::Delete))
+                .icon(Icon::new(gpui_kit::assets::IconName::Trash))
                 .on_click(dispatch(EngineCommand::Remove(id))),
         )
     }

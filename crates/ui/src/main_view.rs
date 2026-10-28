@@ -638,20 +638,6 @@ impl MainView {
             .gap_2()
             .items_center()
             .child(
-                div()
-                    .text_base()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().foreground)
-                    .child(self.header_title()),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!("{} items", self.visible_count)),
-            )
-            .child(div().w_2())
-            .child(
                 Button::new("toolbar-resume")
                     .secondary()
                     .outline()
@@ -682,7 +668,7 @@ impl MainView {
                     .w(px(36.))
                     .h(px(36.))
                     .rounded(px(10.))
-                    .icon(IconName::Close)
+                    .icon(gpui_kit::assets::IconName::CirclePause)
                     .tooltip("Pause all active downloads")
                     .disabled(!actions.can_pause_all)
                     .on_click(cx.listener(|this, _, _, cx| this.pause_all(cx))),
@@ -695,7 +681,7 @@ impl MainView {
                     .w(px(36.))
                     .h(px(36.))
                     .rounded(px(10.))
-                    .icon(IconName::Delete)
+                    .icon(gpui_kit::assets::IconName::Trash)
                     .tooltip("Remove selected download")
                     .disabled(!actions.can_remove)
                     .on_click(cx.listener(|this, _, _, cx| this.remove_selected(cx))),

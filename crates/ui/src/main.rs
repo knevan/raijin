@@ -152,7 +152,7 @@ fn main() {
     // survive `remove_window` (Windows/Linux hide path) and run windowless
     // under `--minimized`. Quit flows through the tray menu / OS requests.
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(gpui_kit::assets::AllAssets)
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             gpui_kit::init(cx);

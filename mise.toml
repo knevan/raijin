@@ -3,6 +3,10 @@ auto_install = false
 
 [env]
 RAIJIN_INTEGRATION = 1
+DATABASE_URL = "{% if env.APPDATA %}sqlite:///{{env.APPDATA | replace(from='\\\\', to='/')}}/raijin/raijin.sqlite{% else %}sqlite://{{env.HOME}}/.local/share/raijin/raijin.sqlite{% endif %}"
+
+[tasks."db:res"]
+run = "sqlx database reset -y"
 
 [tasks."dev:test"]
 alias = ["test", "t"]

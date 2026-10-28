@@ -10,7 +10,7 @@ jobs:
   monitor:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-26.04, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:

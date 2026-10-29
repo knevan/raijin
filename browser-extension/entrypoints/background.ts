@@ -3,12 +3,13 @@ import { defineBackground } from 'wxt/utils/define-background';
 import { ApiError, BackendApi, NetworkError, UnauthorizedError } from '@/utils/backend';
 import { getAll } from '@/utils/config';
 import {
+  ADD_TIMEOUT_MS,
   DOWNLOAD_CREATED_MAX_AGE_MS,
   DOWNLOAD_METADATA_WAIT_MS,
   MAX_PENDING_DOWNLOADS,
   PENDING_REQUEST_TTL_MS,
 } from '@/utils/constants';
-import { captureDecision, isBlacklisted } from '@/utils/capture';
+import { captureDecision, getFileExtension, isBlacklisted, responseMetadata } from '@/utils/capture';
 import { handleInBackground, sendCheckSelectedToTab } from '@/utils/messaging';
 import type {
   AddMediaFailure,
@@ -21,6 +22,10 @@ const MENU_SELECTION_ID = 'raijin-download-selected';
 
 interface PendingEntry {
   url: string;
+  urls: Set<string>;
+  downloadId?: number;
+  handoff?: Promise<boolean | null>;
+  browserFallback?: boolean;
   method: string;
   headers: Record<string, string>;
   tabId: number;
@@ -32,10 +37,9 @@ const tabUrls = new Map<number, string>();
 const newTabs = new Map<number, string>();
 let bypassPressed = false;
 
-function t(key: string, fallback: string): string {
+function t(key: Parameters<typeof browser.i18n.getMessage>[0], fallback: string): string {
   try {
-    const getMessage = browser.i18n.getMessage as unknown as (name: string) => string;
-    const value = getMessage(key);
+    const value = browser.i18n.getMessage(key);
     return value || fallback;
   } catch {
     return fallback;
@@ -48,32 +52,23 @@ function setPending(id: string, entry: Omit<PendingEntry, 'timer'>): void {
   const timer = setTimeout(() => {
     pending.delete(id);
   }, PENDING_REQUEST_TTL_MS);
-  // Avoid leaking timers in service workers that may be suspended.
-  const maybeUnref = (timer as unknown as { unref?: () => void }).unref;
-  if (typeof maybeUnref === 'function') {
-    try {
-      maybeUnref.call(timer);
-    } catch {
-      // Ignore; unref is optional.
-    }
-  }
   pending.set(id, { ...entry, timer });
 }
 
 function dropPending(id: string): void {
-  const prev = pending.get(id);
-  if (prev?.timer) clearTimeout(prev.timer);
-  // Keep the entry briefly so downloads.onCreated can still match it.
-  setTimeout(() => {
-    pending.delete(id);
-  }, PENDING_REQUEST_TTL_MS).unref?.();
+  const entry = pending.get(id);
+  if (!entry) return;
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = setTimeout(() => pending.delete(id), PENDING_REQUEST_TTL_MS);
 }
 
-function findPendingByUrl(url: string): PendingEntry | undefined {
-  for (const entry of pending.values()) {
-    if (entry.url === url) return entry;
-  }
-  return undefined;
+function findPendingByUrl(url: string, downloadId: number): PendingEntry | undefined {
+  const entries = [...pending.values()].reverse();
+  const bound = entries.find((entry) => entry.downloadId === downloadId);
+  if (bound) return bound;
+  const entry = entries.find((entry) => entry.urls.has(url) && entry.downloadId === undefined);
+  if (entry) entry.downloadId = downloadId;
+  return entry;
 }
 
 // Build request headers for a third-party URL. Values are only ever sent to
@@ -131,9 +126,11 @@ async function addItems(items: DownloadRequestItem[]): Promise<boolean> {
 
 async function submitItems(
   items: DownloadRequestItem[],
+  isActive?: () => boolean,
 ): Promise<{ ok: true } | { ok: false; reason: AddMediaFailure }> {
   if (items.length === 0) return { ok: false, reason: 'error' };
   const config = await getAll();
+  if (isActive && !isActive()) return { ok: false, reason: 'error' };
   const api = new BackendApi(config.port, config.token);
   const options = {
     silentAdd: Boolean(config.token) && config.silentAddDownload,
@@ -190,24 +187,28 @@ async function testPort(port?: number, token?: string): Promise<TestPortResult> 
   }
 }
 
-async function cancelDownload(id: number): Promise<void> {
+async function cancelDownload(id: number): Promise<boolean> {
   try {
     await browser.downloads.cancel(id);
-  } catch {
-    // Best effort.
+  } catch (error) {
+    console.warn('Raijin browser cancellation failed', {
+      downloadId: id,
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    });
+    return false;
   }
+  trackedDownloads.get(id)?.releaseFilename?.();
   try {
     await browser.downloads.erase({ id });
   } catch {
     // Best effort.
   }
   try {
-    const removeFile = (browser.downloads as unknown as { removeFile?: (id: number) => Promise<void> })
-      .removeFile;
-    if (typeof removeFile === 'function') await removeFile.call(browser.downloads, id);
+    await browser.downloads.removeFile?.(id);
   } catch {
     // Best effort; partial files may remain.
   }
+  return true;
 }
 
 async function closeNewTabIfCaptured(tabId: number): Promise<void> {
@@ -267,56 +268,107 @@ function trackTabs(): void {
   }
 }
 
-// Best-effort non-blocking observers. No blocking/webRequestBlocking is used;
-// when the permission is absent the map simply stays empty and the
-// downloads.onCreated fallback still works via getHeadersForUrl.
 function observeWebRequests(): void {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const webRequest = (browser as any).webRequest as
-      | {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          onSendHeaders?: { addListener: (...args: any[]) => void };
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          onCompleted?: { addListener: (...args: any[]) => void };
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          onErrorOccurred?: { addListener: (...args: any[]) => void };
-        }
-      | undefined;
+    const webRequest = browser.webRequest;
     if (!webRequest?.onSendHeaders) return;
     const filter = { urls: ['*://*/*'] };
     webRequest.onSendHeaders.addListener(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (details: any) => {
-        const requestId = details?.requestId as string | undefined;
-        const url = details?.url as string | undefined;
-        if (!requestId || !url) return;
+      (details) => {
+        const { requestId, url } = details;
         const headers: Record<string, string> = {};
-        const rawHeaders = details?.requestHeaders as
-          | Array<{ name?: string; value?: string }>
-          | undefined;
-        for (const h of rawHeaders ?? []) {
+        for (const h of details.requestHeaders ?? []) {
           if (h.name && h.value) headers[h.name] = h.value;
+        }
+        const previous = pending.get(requestId);
+        if (!previous && pending.size >= MAX_PENDING_DOWNLOADS) {
+          const disposable = [...pending].find(([, entry]) => !entry.handoff && entry.downloadId === undefined);
+          if (!disposable) return;
+          if (disposable[1].timer) clearTimeout(disposable[1].timer);
+          pending.delete(disposable[0]);
+        }
+        if (previous) {
+          previous.urls.add(url);
+          return;
         }
         setPending(requestId, {
           url,
-          method: (details?.method as string | undefined) ?? 'GET',
+          urls: new Set([url]),
+          method: details.method,
           headers,
-          tabId: (details?.tabId as number | undefined) ?? -1,
+          tabId: details.tabId,
         });
       },
       filter,
       ['requestHeaders'],
     );
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const cleanup = (details: any): void => {
-      const requestId = details?.requestId as string | undefined;
-      if (requestId) dropPending(requestId);
-    };
-    webRequest.onCompleted?.addListener(cleanup, filter);
-    webRequest.onErrorOccurred?.addListener(cleanup, filter);
-  } catch {
-    // WebRequest observers are optional.
+    webRequest.onHeadersReceived.addListener(
+      (details): undefined => {
+        if (details.type !== 'main_frame' && details.type !== 'sub_frame') return;
+        const entry = pending.get(details.requestId);
+        if (!entry || entry.handoff || details.statusCode < 200 || details.statusCode >= 300) return;
+        entry.urls.add(details.url);
+        entry.handoff = captureResponse(entry, details);
+        for (const [id, tracked] of trackedDownloads) {
+          if (entry.urls.has(tracked.snapshot.url)) void processDownload(id, tracked);
+        }
+      },
+      filter,
+      ['responseHeaders'],
+    );
+    const cleanup = (details: { requestId: string }): void => dropPending(details.requestId);
+    webRequest.onCompleted.addListener(cleanup, filter);
+    webRequest.onErrorOccurred.addListener(cleanup, filter);
+  } catch (error) {
+    console.warn('Raijin response capture unavailable', {
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    });
+  }
+}
+
+async function captureResponse(
+  entry: PendingEntry,
+  response: { url: string; type: string; statusCode: number; responseHeaders?: Array<{ name: string; value?: string }> },
+): Promise<boolean | null> {
+  try {
+    const config = await getAll();
+    const metadata = responseMetadata(response.url, response.statusCode, response.responseHeaders ?? []);
+    const page = tabUrls.get(entry.tabId) ?? null;
+    const extension = getFileExtension(metadata.suggestedName ?? '');
+    const nameIsSupported = config.registeredFileTypes.some((type) => type.toLowerCase() === extension);
+    const decision = captureDecision({
+      url: entry.url,
+      downloadPage: page,
+      suggestedName: metadata.fromHeader || nameIsSupported ? metadata.suggestedName : null,
+      fileSizeBytes: metadata.totalBytes,
+      contentType: metadata.contentType,
+      method: entry.method,
+      frameType: response.type,
+      statusCode: response.statusCode,
+    }, config, bypassPressed);
+    console.debug('Raijin response capture decision', { decision, hasName: Boolean(metadata.suggestedName), hasSize: metadata.totalBytes !== null });
+    if (isBlacklisted(response.url, config.blacklistedUrls) || decision === 'ignore') return false;
+    if (decision === 'pending') return null;
+    const headers = config.sendHeaders
+      ? { ...await getHeadersForUrl(entry.url), ...entry.headers }
+      : null;
+    if (bypassPressed || entry.browserFallback) return false;
+    const result = await submitItems([{
+      link: entry.url,
+      downloadPage: page,
+      headers,
+      description: null,
+      suggestedName: metadata.suggestedName,
+      totalBytes: metadata.totalBytes,
+      type: 'http',
+    }], () => !entry.browserFallback);
+    if (!result.ok) console.warn('Raijin response handoff failed', { reason: result.reason });
+    return result.ok;
+  } catch (error) {
+    console.error('Raijin response handoff failed', {
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    });
+    return false;
   }
 }
 
@@ -328,13 +380,19 @@ interface TrackedDownload {
   dirty: boolean;
   done: boolean;
   timer: ReturnType<typeof setTimeout>;
+  releaseFilename?: () => void;
+  browserFallback?: boolean;
 }
 
 const trackedDownloads = new Map<number, TrackedDownload>();
 
 function forgetDownload(id: number): void {
   const entry = trackedDownloads.get(id);
-  if (entry) clearTimeout(entry.timer);
+  if (entry) {
+    clearTimeout(entry.timer);
+    entry.done = true;
+    entry.releaseFilename?.();
+  }
   trackedDownloads.delete(id);
 }
 
@@ -346,14 +404,21 @@ function downloadAgeMs(startTime: string): number | null {
 async function evaluateDownload(d: DownloadSnapshot): Promise<'pending' | 'done'> {
   const config = await getAll();
   const tracked = trackedDownloads.get(d.id);
-  if (!tracked) return 'done';
+  if (!tracked || tracked.browserFallback) return 'done';
   if (tracked.snapshot !== d) return 'pending';
-  if (!config.autoCaptureLinks || bypassPressed) return 'done';
   const url = d.url;
   if (!url.startsWith('http://') && !url.startsWith('https://')) return 'done';
   if (d.byExtensionId || d.state !== 'in_progress' || d.endTime) return 'done';
 
-  const intercepted = findPendingByUrl(url);
+  const intercepted = findPendingByUrl(url, d.id);
+  if (intercepted?.handoff) {
+    const accepted = await intercepted.handoff;
+    if (accepted !== null) {
+      if (accepted) await completeHandoff(d.id, intercepted);
+      return 'done';
+    }
+  }
+  if (!config.autoCaptureLinks || bypassPressed) return 'done';
   if (intercepted && intercepted.method.toUpperCase() !== 'GET') return 'done';
 
   const downloadPage = d.referrer || null;
@@ -381,23 +446,41 @@ async function evaluateDownload(d: DownloadSnapshot): Promise<'pending' | 'done'
       : await getHeadersForUrl(url)
     : null;
   const entry = trackedDownloads.get(d.id);
-  if (!entry || bypassPressed) return 'done';
+  if (!entry || entry.browserFallback) return 'done';
   if (entry.snapshot !== d) return 'pending';
-  const result = await submitItems([{
+  if (intercepted?.handoff) {
+    const accepted = await intercepted.handoff;
+    if (accepted !== null) {
+      if (accepted) await completeHandoff(d.id, intercepted);
+      return 'done';
+    }
+  }
+  if (bypassPressed) return 'done';
+  const submission = submitItems([{
     link: url,
     downloadPage,
     headers,
     description: null,
     suggestedName,
+    totalBytes: fileSizeBytes,
     type: 'http',
-  }]);
+  }], () => !entry.browserFallback && trackedDownloads.get(d.id) === entry);
+  if (intercepted) intercepted.handoff = submission.then((result) => result.ok);
+  const result = await submission;
   if (!result.ok) {
     console.warn('Raijin auto-capture submission failed', { downloadId: d.id, reason: result.reason });
     return 'done';
   }
-  await cancelDownload(d.id);
-  if (intercepted && intercepted.tabId >= 0) await closeNewTabIfCaptured(intercepted.tabId);
+  await completeHandoff(d.id, intercepted);
   return 'done';
+}
+
+async function completeHandoff(id: number, intercepted?: PendingEntry): Promise<void> {
+  const entry = trackedDownloads.get(id);
+  if (!entry || entry.browserFallback) return;
+  if (await cancelDownload(id)) {
+    if (intercepted && intercepted.tabId >= 0) await closeNewTabIfCaptured(intercepted.tabId);
+  }
 }
 
 async function processDownload(id: number, entry: TrackedDownload): Promise<void> {
@@ -408,7 +491,8 @@ async function processDownload(id: number, entry: TrackedDownload): Promise<void
     while (entry.dirty && !entry.done && trackedDownloads.get(id) === entry) {
       entry.dirty = false;
       const snapshot = entry.snapshot;
-      entry.done = (await evaluateDownload(snapshot)) === 'done';
+      const result = await evaluateDownload(snapshot);
+      entry.done = entry.done || result === 'done';
     }
   } catch (error) {
     entry.done = true;
@@ -418,6 +502,7 @@ async function processDownload(id: number, entry: TrackedDownload): Promise<void
     });
   } finally {
     entry.running = false;
+    entry.releaseFilename?.();
   }
 }
 
@@ -472,7 +557,59 @@ function handleContextMenu(): void {
   }
 }
 
+function handleFilenameGate(): void {
+  browser.downloads.onDeterminingFilename?.addListener((snapshot, suggest) => {
+    const age = downloadAgeMs(snapshot.startTime);
+    if (snapshot.byExtensionId || snapshot.state !== 'in_progress' || snapshot.endTime
+      || !/^https?:\/\//.test(snapshot.url)
+      || (age !== null && age > DOWNLOAD_CREATED_MAX_AGE_MS)) {
+      suggest();
+      return false;
+    }
+    if (!trackedDownloads.has(snapshot.id)) trackDownload(snapshot);
+    const entry = trackedDownloads.get(snapshot.id);
+    if (!entry || entry.done || entry.releaseFilename) {
+      suggest();
+      return false;
+    }
+    const release = () => {
+      if (entry.releaseFilename !== release) return;
+      entry.releaseFilename = undefined;
+      entry.done = true;
+      entry.browserFallback = true;
+      const intercepted = findPendingByUrl(snapshot.url, snapshot.id);
+      if (intercepted) intercepted.browserFallback = true;
+      clearTimeout(timer);
+      console.debug('Raijin filename gate released', { downloadId: snapshot.id });
+      try {
+        suggest();
+      } catch (error) {
+        console.warn('Raijin filename gate release failed', {
+          downloadId: snapshot.id,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+        });
+      }
+    };
+    const timer = setTimeout(() => {
+      console.warn('Raijin filename gate timed out', { downloadId: snapshot.id });
+      release();
+    }, ADD_TIMEOUT_MS + 1000);
+    entry.releaseFilename = release;
+    console.debug('Raijin filename gate held', { downloadId: snapshot.id });
+    entry.snapshot = snapshot;
+    void processDownload(snapshot.id, entry);
+    return true;
+  });
+}
+
 function handleDownloads(): void {
+  try {
+    handleFilenameGate();
+  } catch (error) {
+    console.warn('Raijin filename gate unavailable', {
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    });
+  }
   browser.downloads.onCreated.addListener(trackDownload);
   browser.downloads.onChanged.addListener((delta) => {
     const entry = trackedDownloads.get(delta.id);

@@ -4,17 +4,8 @@ use gpui_kit::{AppContext as _, TestAppContext, base};
 
 use crate::bridge::EngineHandles;
 
-#[gpui_kit::test]
-fn folder_picker_should_preserve_category_and_handle_selection_and_cancel(cx: &mut TestAppContext) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("test runtime must start");
-    let missing = std::env::temp_dir()
-        .join(format!("raijin-folder-error-{}", std::process::id()))
-        .join("missing");
-    assert!(!missing.exists());
-    let handles = runtime.block_on(async {
+fn test_handles(runtime: &tokio::runtime::Runtime, folder: std::path::PathBuf) -> EngineHandles {
+    runtime.block_on(async {
         let pool = raijin_core::db::bootstrap("sqlite::memory:")
             .await
             .expect("test database must bootstrap");
@@ -40,11 +31,24 @@ fn folder_picker_should_preserve_category_and_handle_selection_and_cancel(cx: &m
             queues,
             monitor,
             runtime: runtime.handle().clone(),
-            default_folder: missing.clone(),
-            category_root: missing,
+            default_folder: folder.clone(),
+            category_root: folder,
             use_category_default: false,
         }
-    });
+    })
+}
+
+#[gpui_kit::test]
+fn folder_picker_should_preserve_category_and_handle_selection_and_cancel(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime must start");
+    let missing = std::env::temp_dir()
+        .join(format!("raijin-folder-error-{}", std::process::id()))
+        .join("missing");
+    assert!(!missing.exists());
+    let handles = test_handles(&runtime, missing);
     cx.update(gpui_kit::init);
     let handle = cx.update(|cx| {
         super::super::open_add_download_window(cx, &handles, "");
@@ -114,4 +118,102 @@ fn folder_picker_should_preserve_category_and_handle_selection_and_cancel(cx: &m
         window.remove_window();
     })
     .expect("Add Download must support notifications");
+}
+
+#[gpui_kit::test]
+fn integration_metadata_should_seed_size_probe_missing_fields_and_preserve_user_edits(
+    cx: &mut TestAppContext,
+) {
+    use raijin_core::integration::{DownloadRequestItem, prepare_item};
+
+    use super::super::{AddDownloadView, ProbeInfo, ProbeState, open_integration_download_window};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let handles = test_handles(&runtime, std::env::temp_dir());
+    cx.update(gpui_kit::init);
+    for complete in [true, false] {
+        let source = DownloadRequestItem {
+            link: "https://example.com/download".into(),
+            download_page: None,
+            headers: None,
+            description: None,
+            suggested_name: complete.then(|| "setup.exe".into()),
+            total_bytes: complete.then_some(123456),
+            r#type: raijin_core::integration::DownloadType::Http,
+        };
+        let prepared = prepare_item(&source, &handles.default_folder).expect("prepared");
+        let handle = cx.update(|cx| {
+            open_integration_download_window(cx, &handles, prepared, None).expect("window")
+        });
+        cx.update_window(handle, |_, window, cx| {
+            let view = base::Root::read(window, cx)
+                .view()
+                .clone()
+                .downcast::<AddDownloadView>()
+                .expect("form");
+            view.update(cx, |view, cx| {
+                assert!(!view.file_manual);
+                if complete {
+                    assert_eq!(
+                        view.probe,
+                        ProbeState::Ready {
+                            total_bytes: Some(123456)
+                        }
+                    );
+                    assert!(view.probe_abort.is_none());
+                    assert_eq!(view.file.read(cx).value().as_str(), "setup.exe");
+                } else {
+                    assert_eq!(view.probe, ProbeState::Checking);
+                    assert!(view.probe_abort.is_some());
+                    view.apply_probe_name(
+                        ProbeInfo {
+                            total_bytes: Some(987),
+                            file_name: None,
+                            final_url: "https://cdn.example.com/resolved.exe".into(),
+                            typed_url: source.link.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                    assert_eq!(view.file.read(cx).value().as_str(), "resolved.exe");
+                }
+                let generation = view.probe_gen;
+                view.refresh_derived(window, cx);
+                assert_eq!(view.probe_gen, generation);
+                assert_eq!(
+                    view.file.read(cx).value().as_str(),
+                    if complete {
+                        "setup.exe"
+                    } else {
+                        "resolved.exe"
+                    }
+                );
+                view.file
+                    .update(cx, |state, cx| state.set_value("chosen.zip", window, cx));
+                view.file_manual = true;
+                view.apply_probe_name(
+                    ProbeInfo {
+                        total_bytes: None,
+                        file_name: Some("server.exe".into()),
+                        final_url: source.link.clone(),
+                        typed_url: source.link.clone(),
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(view.file.read(cx).value().as_str(), "chosen.zip");
+                view.url.update(cx, |state, cx| {
+                    state.set_value("https://other.example.com/file", window, cx)
+                });
+                view.refresh_derived(window, cx);
+                assert_eq!(view.probe, ProbeState::Checking);
+                assert!(view.probe_name.is_none());
+            });
+            window.remove_window();
+        })
+        .expect("window update");
+    }
 }

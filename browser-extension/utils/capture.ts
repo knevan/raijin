@@ -32,6 +32,32 @@ export function getFileFromUrl(url: string): string | null {
   }
 }
 
+export function responseMetadata(
+  url: string,
+  status: number,
+  headers: Array<{ name: string; value?: string }>,
+): { suggestedName: string | null; fromHeader: boolean; totalBytes: number | null; contentType: string | null } {
+  const get = (name: string) => headers.find((header) => header.name.toLowerCase() === name)?.value;
+  const disposition = get('content-disposition') ?? '';
+  const encoded = /(?:^|;)\s*filename\*\s*=\s*UTF-8'[^']*'([^;]+)/i.exec(disposition)?.[1];
+  const plain = /(?:^|;)\s*filename\s*=\s*(?:"((?:\\.|[^"\\])*)"|([^;]+))/i.exec(disposition);
+  const name = encoded ? safeDecode(encoded.trim()) : plain?.[1]?.replace(/\\(.)/g, '$1') ?? plain?.[2]?.trim();
+  const range = /^bytes\s+(\d+)-(\d+)\/(\d+)$/i.exec((get('content-range') ?? '').trim());
+  const validRange = range !== null
+    && Number.isSafeInteger(Number(range[1])) && Number.isSafeInteger(Number(range[2]))
+    && Number(range[1]) <= Number(range[2]) && Number(range[2]) < Number(range[3]);
+  const rawSize = status === 206
+    ? validRange ? range?.[3] : undefined
+    : get('content-length');
+  const size = rawSize && /^\d+$/.test(rawSize.trim()) ? Number(rawSize) : NaN;
+  return {
+    suggestedName: name?.split(/[\\/]/).pop()?.trim() || getFileFromUrl(url),
+    fromHeader: Boolean(name?.trim()),
+    totalBytes: Number.isSafeInteger(size) && size >= 0 ? size : null,
+    contentType: get('content-type') ?? null,
+  };
+}
+
 function safeDecode(value: string): string {
   try {
     return decodeURIComponent(value);

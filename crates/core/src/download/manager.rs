@@ -1432,7 +1432,7 @@ mod tests {
             ))
             .await?;
 
-        assert_eq!(added.file_name, "file (1).bin");
+        assert_eq!(added.file_name, "file(1).bin");
         stop_manager(&handle, task).await
     }
 

@@ -156,6 +156,13 @@ pub async fn list_queues(engine: &IntegrationEngine) -> Result<IntegrationReply,
     Ok(IntegrationReply::Queues(summaries))
 }
 
+fn confirmation_reply(result: Result<(), String>, accepted: IntegrationReply) -> IntegrationReply {
+    match result {
+        Ok(()) => accepted,
+        Err(error) => IntegrationReply::Failed(error),
+    }
+}
+
 /// Sends a reply, logging when the requester already gave up.
 pub fn reply(responder: IntegrationResponder, value: IntegrationReply) {
     if responder.send(value).is_err() {
@@ -206,14 +213,14 @@ pub struct Started {
 
 /// Opens the confirmation dialog for validated integration items.
 ///
-/// The dialog owns the download from here; the HTTP request is already answered
-/// with `202 Accepted` because the user still has to confirm.
+/// Successful window creation transfers ownership before `202 Accepted` is sent.
+/// The user still has to approve the download.
 pub type DialogOpener = Box<
     dyn FnMut(
         &mut gpui_kit::App,
         Vec<PreparedItem>,
         Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
-    ),
+    ) -> Result<(), String>,
 >;
 
 /// Drains integration commands on the GPUI foreground thread.
@@ -242,10 +249,8 @@ pub fn spawn_dispatcher(cx: &mut gpui_kit::App, started: Started, mut open_dialo
                         validate_confirmation(request, &engine.default_folder, responder);
                     match prepared {
                         Some(prepared) => {
-                            // Answer first: the extension must not block on a
-                            // user who may take minutes to confirm.
-                            reply(responder, value);
-                            cx.update(|cx| open_dialog(cx, prepared, pending));
+                            let result = cx.update(|cx| open_dialog(cx, prepared, pending));
+                            reply(responder, confirmation_reply(result, value));
                         }
                         None => reply(responder, value),
                     }
@@ -305,6 +310,21 @@ mod tests {
 
     use super::{IntegrationBridge, bridge, reply, test_responder, validate_confirmation};
 
+    #[test]
+    fn confirmation_should_reject_failed_window_creation() {
+        assert!(matches!(
+            super::confirmation_reply(
+                Err("window creation failed".to_owned()),
+                IntegrationReply::Accepted { ids: Vec::new() },
+            ),
+            IntegrationReply::Failed(message) if message == "window creation failed"
+        ));
+        assert!(matches!(
+            super::confirmation_reply(Ok(()), IntegrationReply::Accepted { ids: Vec::new() }),
+            IntegrationReply::Accepted { .. }
+        ));
+    }
+
     fn item(link: &str) -> DownloadRequestItem {
         DownloadRequestItem {
             link: link.to_owned(),
@@ -312,6 +332,7 @@ mod tests {
             headers: None,
             description: None,
             suggested_name: None,
+            total_bytes: None,
             r#type: DownloadType::Http,
         }
     }

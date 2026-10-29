@@ -229,14 +229,25 @@ fn main() {
                     cx,
                     started,
                     Box::new(move |cx, prepared, pending| {
+                        let mut windows: Vec<AnyWindowHandle> = Vec::new();
                         for item in prepared {
-                            crate::add_download::open_integration_download_window(
+                            match crate::add_download::open_integration_download_window(
                                 cx,
                                 &dialog_handles,
                                 item,
                                 pending.clone(),
-                            );
+                            ) {
+                                Ok(window) => windows.push(window),
+                                Err(error) => {
+                                    for handle in windows {
+                                        let _ = handle
+                                            .update(cx, |_, window, _| window.remove_window());
+                                    }
+                                    return Err(error);
+                                }
+                            }
                         }
+                        Ok(())
                     }),
                 );
             }

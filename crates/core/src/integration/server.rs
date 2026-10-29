@@ -548,6 +548,7 @@ mod tests {
             headers: None,
             description: None,
             suggested_name: None,
+            total_bytes: None,
             r#type: kind,
         }
     }

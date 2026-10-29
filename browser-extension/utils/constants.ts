@@ -7,6 +7,8 @@ export const DEFAULT_BYPASS_KEY = 'Delete';
 
 // How long a downloads.onCreated item may lag behind its network request.
 export const DOWNLOAD_CREATED_MAX_AGE_MS = 10_000;
+export const DOWNLOAD_METADATA_WAIT_MS = 20_000;
+export const MAX_PENDING_DOWNLOADS = 128;
 
 // Lifetime of cached webRequest entries before they are dropped.
 export const PENDING_REQUEST_TTL_MS = 20_000;

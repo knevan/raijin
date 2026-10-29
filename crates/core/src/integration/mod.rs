@@ -46,6 +46,8 @@ pub struct DownloadRequestItem {
     pub description: Option<String>,
     /// Server- or page-suggested file name.
     pub suggested_name: Option<String>,
+    /// Browser-provided size hint; never used for transfer validation.
+    pub total_bytes: Option<u64>,
     /// Transport kind.
     pub r#type: DownloadType,
 }
@@ -168,8 +170,24 @@ mod tests {
             headers: None,
             description: None,
             suggested_name: suggested.map(str::to_owned),
+            total_bytes: None,
             r#type: DownloadType::Http,
         }
+    }
+
+    #[test]
+    fn request_item_should_accept_optional_size_hints() {
+        let original = item("https://example.com/download", Some("setup.exe"));
+        let mut value = serde_json::to_value(&original).expect("serialized item");
+        value.as_object_mut().expect("object").remove("totalBytes");
+        let legacy: DownloadRequestItem =
+            serde_json::from_value(value.clone()).expect("legacy request");
+        assert_eq!(legacy.total_bytes, None);
+        value["totalBytes"] = serde_json::json!(123456);
+        let sized: DownloadRequestItem = serde_json::from_value(value.clone()).expect("size hint");
+        assert_eq!(sized.total_bytes, Some(123456));
+        value["totalBytes"] = serde_json::json!(-1);
+        assert!(serde_json::from_value::<DownloadRequestItem>(value).is_err());
     }
 
     #[test]

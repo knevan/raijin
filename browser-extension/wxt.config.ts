@@ -17,7 +17,7 @@ export default defineConfig({
     name: 'Raijin Browser Integration',
     description: 'Capture browser downloads and send them to the Raijin download manager.',
     default_locale: 'en',
-    permissions: ['contextMenus', 'storage', 'tabs', 'downloads', 'cookies', 'notifications'],
+    permissions: ['contextMenus', 'storage', 'tabs', 'downloads', 'webRequest', 'cookies', 'notifications'],
     host_permissions: ['*://*/*'],
     icons: {
       16: 'icon/16.png',

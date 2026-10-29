@@ -1336,8 +1336,8 @@ pub(crate) async fn unique_destination_path(
     let extension = requested.extension().and_then(|value| value.to_str());
     for suffix in 1_u32..=9_999 {
         let file_name = match extension {
-            Some(extension) => format!("{stem} ({suffix}).{extension}"),
-            None => format!("{stem} ({suffix})"),
+            Some(extension) => format!("{stem}({suffix}).{extension}"),
+            None => format!("{stem}({suffix})"),
         };
         let candidate = parent.join(file_name);
         if !path_exists(&candidate).await?
@@ -1367,8 +1367,8 @@ async fn unique_final_destination_path(requested: &PathBuf) -> HttpDownloadJobRe
     let extension = requested.extension().and_then(|value| value.to_str());
     for suffix in 1_u32..=9_999 {
         let file_name = match extension {
-            Some(extension) => format!("{stem} ({suffix}).{extension}"),
-            None => format!("{stem} ({suffix})"),
+            Some(extension) => format!("{stem}({suffix}).{extension}"),
+            None => format!("{stem}({suffix})"),
         };
         let candidate = parent.join(file_name);
         if !path_exists(&candidate).await? {
@@ -2791,6 +2791,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unique_destination_paths_should_suffix_without_spaces() -> HttpDownloadJobResult<()> {
+        let folder = tempfile::tempdir()?;
+        for (name, first, second, third) in [
+            ("setup.exe", "setup(1).exe", "setup(2).exe", "setup(3).exe"),
+            ("README", "README(1)", "README(2)", "README(3)"),
+        ] {
+            let requested = folder.path().join(name);
+            assert_eq!(
+                unique_destination_path(&requested, ".raijin-part").await?,
+                requested
+            );
+            fs::write(&requested, b"original").await?;
+            fs::write(folder.path().join(first), b"existing").await?;
+            fs::write(
+                incomplete_path_for(&folder.path().join(second), ".raijin-part"),
+                b"partial",
+            )
+            .await?;
+
+            assert_eq!(
+                unique_destination_path(&requested, ".raijin-part").await?,
+                folder.path().join(third)
+            );
+            assert_eq!(
+                unique_final_destination_path(&requested).await?,
+                folder.path().join(second)
+            );
+            assert_eq!(fs::read(&requested).await?, b"original");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn job_should_choose_unique_final_name_when_destination_exists()
     -> HttpDownloadJobResult<()> {
         let body = vec![b'd'; 1024];
@@ -2801,9 +2834,9 @@ mod tests {
         let item = sample_item(server.url(), folder.path().to_path_buf(), 0);
 
         let completed = run_job(&db, item, CancellationToken::new()).await?;
-        let final_bytes = fs::read(folder.path().join("file (1).bin")).await?;
+        let final_bytes = fs::read(folder.path().join("file(1).bin")).await?;
 
-        assert_eq!(completed.file_name, "file (1).bin");
+        assert_eq!(completed.file_name, "file(1).bin");
         assert_eq!(final_bytes, body);
         Ok(())
     }

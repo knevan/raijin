@@ -32,6 +32,32 @@ export function getFileFromUrl(url: string): string | null {
   }
 }
 
+export function responseMetadata(
+  url: string,
+  status: number,
+  headers: Array<{ name: string; value?: string }>,
+): { suggestedName: string | null; fromHeader: boolean; totalBytes: number | null; contentType: string | null } {
+  const get = (name: string) => headers.find((header) => header.name.toLowerCase() === name)?.value;
+  const disposition = get('content-disposition') ?? '';
+  const encoded = /(?:^|;)\s*filename\*\s*=\s*UTF-8'[^']*'([^;]+)/i.exec(disposition)?.[1];
+  const plain = /(?:^|;)\s*filename\s*=\s*(?:"((?:\\.|[^"\\])*)"|([^;]+))/i.exec(disposition);
+  const name = encoded ? safeDecode(encoded.trim()) : plain?.[1]?.replace(/\\(.)/g, '$1') ?? plain?.[2]?.trim();
+  const range = /^bytes\s+(\d+)-(\d+)\/(\d+)$/i.exec((get('content-range') ?? '').trim());
+  const validRange = range !== null
+    && Number.isSafeInteger(Number(range[1])) && Number.isSafeInteger(Number(range[2]))
+    && Number(range[1]) <= Number(range[2]) && Number(range[2]) < Number(range[3]);
+  const rawSize = status === 206
+    ? validRange ? range?.[3] : undefined
+    : get('content-length');
+  const size = rawSize && /^\d+$/.test(rawSize.trim()) ? Number(rawSize) : NaN;
+  return {
+    suggestedName: name?.split(/[\\/]/).pop()?.trim() || getFileFromUrl(url),
+    fromHeader: Boolean(name?.trim()),
+    totalBytes: Number.isSafeInteger(size) && size >= 0 ? size : null,
+    contentType: get('content-type') ?? null,
+  };
+}
+
 function safeDecode(value: string): string {
   try {
     return decodeURIComponent(value);
@@ -67,37 +93,37 @@ function isSuccessStatus(statusCode: number): boolean {
 }
 
 // Pure auto-capture decision shared by the background interceptor.
-export function shouldCapture(
+export function captureDecision(
   candidate: CaptureCandidate,
   config: RaijinConfig,
   bypassPressed: boolean,
-): boolean {
-  if (!config.autoCaptureLinks) return false;
-  if (bypassPressed) return false;
-  if (candidate.method.toUpperCase() !== 'GET') return false;
+): 'capture' | 'pending' | 'ignore' {
+  if (!config.autoCaptureLinks) return 'ignore';
+  if (bypassPressed) return 'ignore';
+  if (candidate.method.toUpperCase() !== 'GET') return 'ignore';
   if (
     candidate.frameType !== undefined &&
     candidate.frameType !== 'main_frame' &&
     candidate.frameType !== 'sub_frame'
   ) {
-    return false;
+    return 'ignore';
   }
-  if (candidate.statusCode !== undefined && !isSuccessStatus(candidate.statusCode)) return false;
+  if (candidate.statusCode !== undefined && !isSuccessStatus(candidate.statusCode)) return 'ignore';
 
   let url: URL;
   try {
     url = new URL(candidate.url);
   } catch {
-    return false;
+    return 'ignore';
   }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return 'ignore';
 
   const contentType = candidate.contentType?.toLowerCase() ?? null;
-  if (contentType?.startsWith('text/')) return false;
+  if (contentType?.startsWith('text/')) return 'ignore';
 
-  if (isBlacklisted(candidate.url, config.blacklistedUrls)) return false;
+  if (isBlacklisted(candidate.url, config.blacklistedUrls)) return 'ignore';
   if (candidate.downloadPage && isBlacklisted(candidate.downloadPage, config.blacklistedUrls)) {
-    return false;
+    return 'ignore';
   }
 
   if (
@@ -105,16 +131,16 @@ export function shouldCapture(
     config.captureFileSizeMinimumKb > 0 &&
     candidate.fileSizeBytes < config.captureFileSizeMinimumKb * 1024
   ) {
-    return false;
+    return 'ignore';
   }
 
-  const fileName = candidate.suggestedName?.trim()
-    ? candidate.suggestedName.trim()
-    : getFileFromUrl(candidate.url);
-  if (!fileName) return false;
+  const fileName = candidate.suggestedName?.trim();
+  if (!fileName) return 'pending';
   const ext = getFileExtension(fileName);
-  if (!ext) return false;
-  return config.registeredFileTypes.map((t) => t.toLowerCase()).includes(ext);
+  if (!ext) return 'pending';
+  if (!config.registeredFileTypes.some((type) => type.toLowerCase() === ext)) return 'ignore';
+  if (candidate.fileSizeBytes === null && config.captureFileSizeMinimumKb > 0) return 'pending';
+  return 'capture';
 }
 
 // Resolve raw hrefs against a base URL, keep http(s) only, dedupe.

@@ -4,6 +4,7 @@ export interface DownloadRequestItem {
   headers: Record<string, string> | null;
   description: string | null;
   suggestedName: string | null;
+  totalBytes?: number | null;
   type: 'http' | 'hls';
 }
 

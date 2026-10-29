@@ -67,6 +67,8 @@ pub struct AddDownloadView {
     probe_gen: u64,
     integration: Option<raijin_core::integration::PreparedItem>,
     _pending: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    probe_url: Option<String>,
+    probe_abort: Option<tokio::task::AbortHandle>,
     _subscriptions: [Subscription; 4],
 }
 
@@ -124,6 +126,8 @@ impl AddDownloadView {
             probe_gen: 0,
             integration,
             _pending: pending,
+            probe_url: None,
+            probe_abort: None,
             _subscriptions: subscriptions,
         };
         // Seed category root + checkbox default from engine handles, then run
@@ -134,7 +138,11 @@ impl AddDownloadView {
             view.file.update(cx, |state, cx| {
                 state.set_value(item.request.file_name.as_str(), window, cx);
             });
-            view.file_manual = true;
+            view.probe_name = item
+                .source
+                .suggested_name
+                .as_ref()
+                .map(|_| item.request.file_name.clone());
         }
         view.refresh_derived(window, cx);
         view
@@ -182,11 +190,20 @@ impl AddDownloadView {
     /// the single place that writes derived values without feedback loops.
     fn refresh_derived(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let url = self.url_text(cx);
+        if self
+            .probe_url
+            .as_deref()
+            .is_some_and(|previous| previous != url)
+        {
+            self.probe_name = None;
+        }
         let url_valid = is_http_url_str(&url);
         // File name follows the URL until the user takes over.
         if !self.file_manual {
             let suggestion = if url_valid {
-                crate::bridge::suggest_filename(&url)
+                self.probe_name
+                    .clone()
+                    .unwrap_or_else(|| crate::bridge::suggest_filename(&url))
             } else {
                 String::new()
             };
@@ -214,7 +231,7 @@ impl AddDownloadView {
                 state.set_value(folder.to_string_lossy().as_ref(), window, cx);
             });
         }
-        if self.integration.is_none() {
+        if self.probe_url.as_deref() != Some(url.as_str()) {
             self.schedule_probe(url, window, cx);
         }
         cx.notify();
@@ -233,26 +250,52 @@ impl AddDownloadView {
         });
     }
 
-    /// Starts a debounced size probe for `url`; stale results are dropped.
+    /// Starts a bounded metadata probe for `url`; stale results are dropped.
     ///
     /// A successful probe also upgrades the file suggestion (header over final
     /// URL) unless the user already typed a name by hand. Field writes need a
     /// live window, so they run through its handle; the badge works windowless.
     fn schedule_probe(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(abort) = self.probe_abort.take() {
+            abort.abort();
+        }
+        self.probe_url = Some(url.clone());
         self.probe_gen += 1;
         let generation = self.probe_gen;
+        let hinted_size = self
+            .integration
+            .as_ref()
+            .filter(|item| item.source.link.trim() == url)
+            .and_then(|item| item.source.total_bytes);
+        if hinted_size.is_some() && self.probe_name.is_some() {
+            self.probe = ProbeState::Ready {
+                total_bytes: hinted_size,
+            };
+            return;
+        }
         if !is_http_url_str(&url) {
             self.probe = ProbeState::Idle;
             return;
         }
-        self.probe = ProbeState::Checking;
-        let runtime = self.handles.runtime.clone();
+        self.probe = hinted_size.map_or(ProbeState::Checking, |size| ProbeState::Ready {
+            total_bytes: Some(size),
+        });
+        let task = self
+            .handles
+            .runtime
+            .spawn(async move { probe_download_info(&url).await });
+        self.probe_abort = Some(task.abort_handle());
         let window_handle = window.window_handle();
         cx.spawn(async move |weak, cx| {
-            let probed = runtime
-                .spawn(async move { probe_download_info(&url).await })
-                .await
-                .unwrap_or(None);
+            let probed = match task.await {
+                Ok(info) => info,
+                Err(error) => {
+                    if !error.is_cancelled() {
+                        tracing::warn!(%error, "metadata probe task failed");
+                    }
+                    None
+                }
+            };
             let info = weak
                 .update(cx, |view, cx| {
                     if view.probe_gen != generation {
@@ -261,13 +304,16 @@ impl AddDownloadView {
                     match probed {
                         Some(info) => {
                             view.probe = ProbeState::Ready {
-                                total_bytes: info.total_bytes,
+                                total_bytes: info.total_bytes.or(hinted_size),
                             };
                             cx.notify();
                             Some(info)
                         }
                         None => {
-                            view.probe = ProbeState::Failed;
+                            view.probe =
+                                hinted_size.map_or(ProbeState::Failed, |size| ProbeState::Ready {
+                                    total_bytes: Some(size),
+                                });
                             cx.notify();
                             None
                         }
@@ -314,6 +360,7 @@ impl AddDownloadView {
         ) else {
             return;
         };
+        self.probe_name = Some(upgrade.clone());
         self.file.update(cx, |state, cx| {
             state.set_value(upgrade.as_str(), window, cx);
         });
@@ -771,7 +818,9 @@ impl Render for AddDownloadView {
 /// so tray-only runs and `--add <url>` launches never construct the downloads table.
 /// Failures only mean the window could not open and are logged.
 pub fn open_add_download_window(cx: &mut App, handles: &EngineHandles, initial_url: &str) {
-    open_download_window(cx, handles, initial_url, None, None);
+    if let Err(error) = open_download_window(cx, handles, initial_url, None, None) {
+        tracing::error!(%error, "failed to open Add Download window");
+    }
 }
 
 pub fn open_integration_download_window(
@@ -779,9 +828,9 @@ pub fn open_integration_download_window(
     handles: &EngineHandles,
     item: raijin_core::integration::PreparedItem,
     pending: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
-) {
+) -> Result<AnyWindowHandle, String> {
     let url = item.request.url.clone();
-    open_download_window(cx, handles, &url, Some(item), pending);
+    open_download_window(cx, handles, &url, Some(item), pending)
 }
 
 fn open_download_window(
@@ -790,7 +839,7 @@ fn open_download_window(
     initial_url: &str,
     integration: Option<raijin_core::integration::PreparedItem>,
     pending: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
-) {
+) -> Result<AnyWindowHandle, String> {
     // Icon-button rows sit at the 32px field height (down from 44px), so the
     // frame shrinks by the same 2 x 12px to stay snug.
     let dialog_size = size(px(500.), px(284.));
@@ -818,8 +867,9 @@ fn open_download_window(
             if focus {
                 let _ = handle.update(cx, |_, window, _| window.activate_window());
             }
+            Ok(handle)
         }
-        Err(error) => tracing::error!(?error, "failed to open Add Download window"),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -882,21 +932,44 @@ fn select_probe_filename(
 /// A short timeout keeps the badge from hanging the submit path: the form
 /// stays submittable either way because blind servers are still downloadable.
 async fn probe_download_info(url: &str) -> Option<ProbeInfo> {
-    let client = raijin_core::download::ReqwestHttpClient::new().ok()?;
+    let client = match raijin_core::download::ReqwestHttpClient::new() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "metadata probe client initialization failed");
+            return None;
+        }
+    };
     let request = raijin_core::download::ProbeRequest::new(url.to_owned());
-    let metadata = tokio::time::timeout(
+    let metadata = match tokio::time::timeout(
         PROBE_TIMEOUT,
         raijin_core::download::probe_http(&client, request),
     )
     .await
-    .ok()?
-    .ok()?;
+    {
+        Ok(Ok(metadata)) => metadata,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "metadata probe failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!("metadata probe timed out");
+            return None;
+        }
+    };
     Some(ProbeInfo {
         total_bytes: metadata.total_bytes.map(|bytes| bytes.get()),
         file_name: metadata.file_name,
         final_url: metadata.url,
         typed_url: url.to_owned(),
     })
+}
+
+impl Drop for AddDownloadView {
+    fn drop(&mut self) {
+        if let Some(abort) = self.probe_abort.take() {
+            abort.abort();
+        }
+    }
 }
 
 /// Reads clipboard text, if any, on the GPUI thread.
@@ -1030,6 +1103,38 @@ mod tests {
 
     mod window;
 
+    #[tokio::test]
+    async fn metadata_probe_should_resolve_redirect_filename_and_size_without_saving_a_file() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let url = format!("{origin}/download");
+        let server = tokio::spawn(async move {
+            for response in [
+                "HTTP/1.1 302 Found\r\nLocation: /installer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 206 Partial Content\r\nContent-Disposition: attachment; filename=setup.exe\r\nContent-Range: bytes 0-0/123456\r\nContent-Length: 1\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\nx",
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("connection");
+                let mut request = [0; 4096];
+                let count = stream.read(&mut request).await.expect("request");
+                assert!(count > 0);
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response");
+            }
+        });
+        let info = super::probe_download_info(&url).await.expect("metadata");
+        assert_eq!(info.file_name.as_deref(), Some("setup.exe"));
+        assert_eq!(info.total_bytes, Some(123456));
+        assert_eq!(info.final_url, format!("{origin}/installer"));
+        assert_eq!(info.typed_url, url);
+        server.await.expect("server");
+    }
+
     #[test]
     fn integration_credentials_should_only_follow_the_approved_original_url() {
         use raijin_core::integration::{DownloadRequestItem, DownloadType, prepare_item};
@@ -1040,6 +1145,7 @@ mod tests {
             headers: Some([("Cookie".to_owned(), "session=secret".to_owned())].into()),
             description: None,
             suggested_name: None,
+            total_bytes: None,
             r#type: DownloadType::Http,
         };
         let folder = PathBuf::from("C:/Downloads");

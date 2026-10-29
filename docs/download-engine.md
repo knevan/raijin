@@ -13,6 +13,7 @@ This document records the architectural invariants and design decisions for Raij
 - **Incomplete Destination & Atomic Rename**:
   - In-flight downloads write to an incomplete destination file (e.g. `.incomplete` or part files).
   - On full verification and completion, the file is atomically renamed to the target filename.
+  - Destination collisions use `name(1).exe`, `name(2).exe`, and so on, without a space and before the extension. Extensionless names use `name(1)`. Both initial and final destination selection follow this convention; existing files are not renamed. Initial selection also avoids occupied incomplete destinations.
 - **Batched Persistence**:
   - Do NOT persist progress on every incoming chunk.
   - Persist progress on a periodic timer interval (e.g. 500ms - 1s) and immediately upon pause, error, or completion.

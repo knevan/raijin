@@ -46,6 +46,18 @@ The `wxt` extension lives in `browser-extension/` and targets Chromium and Firef
 - Store the port and optional token in extension-local storage, never browser sync.
 - While the popup is open, check connectivity immediately and schedule the next check 250 ms after the previous check completes. Read the latest port/token each time, preserve the last status while checking, and do not clear download action messages. Closing/unmounting the popup stops scheduling; an already-dispatched background request may finish, but cannot restart polling. No persistent background polling, WebSocket, or new endpoint is introduced. The short interval is chosen for responsive app-start detection; request latency and timeouts still affect detection time.
 
+### Automatic download capture
+
+Download listeners register synchronously during background startup, before asynchronous context-menu initialization. Capture follows browser download events, not arbitrary page clicks or URL-extension guesses.
+
+A new download is tracked by download ID. When the browser filename is absent or has no extension, or a configured minimum size cannot yet be checked, `downloads.onChanged` updates the candidate instead of permanently rejecting it. The browser-resolved filename is reduced to its basename and sent as `suggestedName`; desktop sanitization and validation still apply. This uses metadata already obtained by the browser and adds no pre-approval remote probe.
+
+Tracking is limited to 128 downloads and 20 seconds per item. Historical, terminal, erased, and expired items are not revived by change events. Unsupported file types, text responses, blacklist matches (including the final redirect URL), bypass, and disabled capture remain exclusions. Unknown size is only a reason to wait when a minimum size is configured.
+
+Each tracked ID has at most one submission attempt, including while metadata events arrive during API I/O. Only accepted submissions cancel the browser download. Failure or incomplete metadata leaves it with the browser; automatic retry after an ambiguous API timeout is deliberately avoided to prevent duplicate confirmation windows. Diagnostics contain decision/error categories and download IDs, not URLs, paths, headers, or credentials.
+
+The submission keeps the original download URL and only gathers headers for that URL, never by transferring original credentials to the final redirect host. Cold-start, Native Messaging, and remote metadata probing in the confirmation form remain outside this change. Browser smoke testing is still required, particularly for redirect URLs without a filename such as the VS Code installer endpoint.
+
 ## 4. Rationale and deferred work
 
 Rejected: a global authentication-OFF toggle that exposes silent downloads and private lists to every local client. It simplifies setup by removing the security boundary rather than narrowing the unauthenticated capability.

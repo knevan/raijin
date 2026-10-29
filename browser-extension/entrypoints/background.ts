@@ -2,8 +2,13 @@ import { browser } from 'wxt/browser';
 import { defineBackground } from 'wxt/utils/define-background';
 import { ApiError, BackendApi, NetworkError, UnauthorizedError } from '@/utils/backend';
 import { getAll } from '@/utils/config';
-import { DOWNLOAD_CREATED_MAX_AGE_MS, PENDING_REQUEST_TTL_MS } from '@/utils/constants';
-import { getFileFromUrl, shouldCapture } from '@/utils/capture';
+import {
+  DOWNLOAD_CREATED_MAX_AGE_MS,
+  DOWNLOAD_METADATA_WAIT_MS,
+  MAX_PENDING_DOWNLOADS,
+  PENDING_REQUEST_TTL_MS,
+} from '@/utils/constants';
+import { captureDecision, isBlacklisted } from '@/utils/capture';
 import { handleInBackground, sendCheckSelectedToTab } from '@/utils/messaging';
 import type {
   AddMediaFailure,
@@ -19,7 +24,6 @@ interface PendingEntry {
   method: string;
   headers: Record<string, string>;
   tabId: number;
-  handled: boolean;
   timer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -299,7 +303,6 @@ function observeWebRequests(): void {
           method: (details?.method as string | undefined) ?? 'GET',
           headers,
           tabId: (details?.tabId as number | undefined) ?? -1,
-          handled: false,
         });
       },
       filter,
@@ -317,90 +320,121 @@ function observeWebRequests(): void {
   }
 }
 
-function downloadAgeMs(startTime: unknown): number | null {
-  if (typeof startTime !== 'string' || !startTime) return null;
-  const parsed = Date.parse(startTime);
-  if (Number.isNaN(parsed)) return null;
-  return Date.now() - parsed;
+type DownloadSnapshot = Parameters<Parameters<typeof browser.downloads.onCreated.addListener>[0]>[0];
+
+interface TrackedDownload {
+  snapshot: DownloadSnapshot;
+  running: boolean;
+  dirty: boolean;
+  done: boolean;
+  timer: ReturnType<typeof setTimeout>;
 }
 
-async function handleDownloadCreated(details: unknown): Promise<void> {
-  const d = details as {
-    id?: number;
-    url?: string;
-    referrer?: string;
-    filename?: string;
-    mime?: string;
-    fileSize?: number;
-    totalBytes?: number;
-    startTime?: string;
-    endTime?: string;
-    state?: string;
-    byExtensionId?: string;
-  };
+const trackedDownloads = new Map<number, TrackedDownload>();
+
+function forgetDownload(id: number): void {
+  const entry = trackedDownloads.get(id);
+  if (entry) clearTimeout(entry.timer);
+  trackedDownloads.delete(id);
+}
+
+function downloadAgeMs(startTime: string): number | null {
+  const parsed = Date.parse(startTime);
+  return Number.isNaN(parsed) ? null : Date.now() - parsed;
+}
+
+async function evaluateDownload(d: DownloadSnapshot): Promise<'pending' | 'done'> {
   const config = await getAll();
-  if (!config.autoCaptureLinks) return;
-  const id = d.id;
-  const url = d.url ?? '';
-  if (id === undefined || !url) return;
-  if (!url.startsWith('http://') && !url.startsWith('https://')) return;
-  if (d.byExtensionId) return;
-  if (typeof d.state === 'string' && d.state === 'complete') return;
-  if (typeof d.endTime === 'string' && d.endTime) return;
-  const age = downloadAgeMs(d.startTime);
-  if (age !== null && age > DOWNLOAD_CREATED_MAX_AGE_MS) return;
+  const tracked = trackedDownloads.get(d.id);
+  if (!tracked) return 'done';
+  if (tracked.snapshot !== d) return 'pending';
+  if (!config.autoCaptureLinks || bypassPressed) return 'done';
+  const url = d.url;
+  if (!url.startsWith('http://') && !url.startsWith('https://')) return 'done';
+  if (d.byExtensionId || d.state !== 'in_progress' || d.endTime) return 'done';
 
   const intercepted = findPendingByUrl(url);
-  if (intercepted?.handled) {
-    await cancelDownload(id);
-    return;
-  }
-  if (intercepted && intercepted.method.toUpperCase() !== 'GET') return;
+  if (intercepted && intercepted.method.toUpperCase() !== 'GET') return 'done';
 
   const downloadPage = d.referrer || null;
-  let fileSizeBytes: number | null = null;
-  if (typeof d.fileSize === 'number') {
-    fileSizeBytes = d.fileSize;
-  } else if (typeof d.totalBytes === 'number' && d.totalBytes >= 0) {
-    fileSizeBytes = d.totalBytes;
-  }
-  const ok = shouldCapture(
+  const fileSizeBytes = d.fileSize >= 0 ? d.fileSize : d.totalBytes >= 0 ? d.totalBytes : null;
+  if (d.finalUrl && isBlacklisted(d.finalUrl, config.blacklistedUrls)) return 'done';
+  const suggestedName = d.filename.split(/[\\/]/).pop()?.trim() || null;
+  const decision = captureDecision(
     {
       url,
       downloadPage,
       fileSizeBytes,
-      contentType: typeof d.mime === 'string' ? d.mime : null,
-      suggestedName: typeof d.filename === 'string' ? d.filename : getFileFromUrl(url),
+      contentType: d.mime || null,
+      suggestedName,
       method: intercepted?.method ?? 'GET',
     },
     config,
     bypassPressed,
   );
-  if (!ok) return;
-
-  let headers: Record<string, string> | null = null;
-  if (intercepted && Object.keys(intercepted.headers).length > 0) {
-    headers = { ...intercepted.headers };
-  } else {
-    headers = await getHeadersForUrl(url);
-  }
-  const item: DownloadRequestItem = {
+  console.debug('Raijin auto-capture decision', { downloadId: d.id, decision });
+  if (decision === 'pending') return 'pending';
+  if (decision === 'ignore') return 'done';
+  const headers = config.sendHeaders
+    ? intercepted && Object.keys(intercepted.headers).length > 0
+      ? { ...intercepted.headers }
+      : await getHeadersForUrl(url)
+    : null;
+  const entry = trackedDownloads.get(d.id);
+  if (!entry || bypassPressed) return 'done';
+  if (entry.snapshot !== d) return 'pending';
+  const result = await submitItems([{
     link: url,
     downloadPage,
     headers,
     description: null,
-    suggestedName: typeof d.filename === 'string' ? d.filename : null,
+    suggestedName,
     type: 'http',
-  };
-  const accepted = await addItems([item]);
-  if (!accepted) {
-    // Server down and pass-through allowed: leave the browser download alone.
-    if (config.allowPassDownloadIfAppNotRespond) return;
-    return;
+  }]);
+  if (!result.ok) {
+    console.warn('Raijin auto-capture submission failed', { downloadId: d.id, reason: result.reason });
+    return 'done';
   }
-  if (intercepted) intercepted.handled = true;
-  await cancelDownload(id);
+  await cancelDownload(d.id);
   if (intercepted && intercepted.tabId >= 0) await closeNewTabIfCaptured(intercepted.tabId);
+  return 'done';
+}
+
+async function processDownload(id: number, entry: TrackedDownload): Promise<void> {
+  entry.dirty = true;
+  if (entry.running || entry.done) return;
+  entry.running = true;
+  try {
+    while (entry.dirty && !entry.done && trackedDownloads.get(id) === entry) {
+      entry.dirty = false;
+      const snapshot = entry.snapshot;
+      entry.done = (await evaluateDownload(snapshot)) === 'done';
+    }
+  } catch (error) {
+    entry.done = true;
+    console.error('Raijin auto-capture processing failed', {
+      downloadId: id,
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    });
+  } finally {
+    entry.running = false;
+  }
+}
+
+function trackDownload(snapshot: DownloadSnapshot): void {
+  if (trackedDownloads.has(snapshot.id)) return;
+  const age = downloadAgeMs(snapshot.startTime);
+  if (age !== null && age > DOWNLOAD_CREATED_MAX_AGE_MS) return;
+  if (trackedDownloads.size >= MAX_PENDING_DOWNLOADS) return;
+  const entry: TrackedDownload = {
+    snapshot,
+    running: false,
+    dirty: false,
+    done: false,
+    timer: setTimeout(() => forgetDownload(snapshot.id), DOWNLOAD_METADATA_WAIT_MS),
+  };
+  trackedDownloads.set(snapshot.id, entry);
+  void processDownload(snapshot.id, entry);
 }
 
 function handleContextMenu(): void {
@@ -411,7 +445,7 @@ function handleContextMenu(): void {
           const link = (info.linkUrl || info.srcUrl || '').trim();
           if (!link) return;
           const headers = await getHeadersForUrl(link);
-          const linkText = (info as unknown as { linkText?: unknown }).linkText;
+          const linkText = 'linkText' in info ? info.linkText : undefined;
           await addItems([
             {
               link,
@@ -439,24 +473,32 @@ function handleContextMenu(): void {
 }
 
 function handleDownloads(): void {
-  try {
-    const onCreated = browser.downloads?.onCreated;
-    if (!onCreated) return;
-    onCreated.addListener((details) => {
-      void handleDownloadCreated(details as unknown);
-    });
-  } catch {
-    // downloads.onCreated is optional (e.g. some Firefox builds);
-    // menu + selection flows keep working.
-  }
+  browser.downloads.onCreated.addListener(trackDownload);
+  browser.downloads.onChanged.addListener((delta) => {
+    const entry = trackedDownloads.get(delta.id);
+    if (!entry) return;
+    if (delta.state?.current === 'complete' || delta.state?.current === 'interrupted') {
+      forgetDownload(delta.id);
+      return;
+    }
+    if (entry.done) return;
+    const snapshot = entry.snapshot;
+    entry.snapshot = {
+      ...snapshot,
+      filename: delta.filename?.current ?? snapshot.filename,
+      mime: delta.mime?.current ?? snapshot.mime,
+      fileSize: delta.fileSize?.current ?? snapshot.fileSize,
+      totalBytes: delta.totalBytes?.current ?? snapshot.totalBytes,
+      url: delta.url?.current ?? snapshot.url,
+      finalUrl: delta.finalUrl?.current ?? snapshot.finalUrl,
+    };
+    void processDownload(delta.id, entry);
+  });
+  browser.downloads.onErased.addListener(forgetDownload);
 }
 
-async function boot(): Promise<void> {
-  try {
-    await ensureContextMenus();
-  } catch {
-    // Continue without menus.
-  }
+function boot(): void {
+  void ensureContextMenus();
   trackTabs();
   observeWebRequests();
   handleContextMenu();
@@ -478,6 +520,6 @@ async function boot(): Promise<void> {
 
 export default defineBackground({
   main() {
-    void boot();
+    boot();
   },
 });

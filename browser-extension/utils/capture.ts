@@ -67,37 +67,37 @@ function isSuccessStatus(statusCode: number): boolean {
 }
 
 // Pure auto-capture decision shared by the background interceptor.
-export function shouldCapture(
+export function captureDecision(
   candidate: CaptureCandidate,
   config: RaijinConfig,
   bypassPressed: boolean,
-): boolean {
-  if (!config.autoCaptureLinks) return false;
-  if (bypassPressed) return false;
-  if (candidate.method.toUpperCase() !== 'GET') return false;
+): 'capture' | 'pending' | 'ignore' {
+  if (!config.autoCaptureLinks) return 'ignore';
+  if (bypassPressed) return 'ignore';
+  if (candidate.method.toUpperCase() !== 'GET') return 'ignore';
   if (
     candidate.frameType !== undefined &&
     candidate.frameType !== 'main_frame' &&
     candidate.frameType !== 'sub_frame'
   ) {
-    return false;
+    return 'ignore';
   }
-  if (candidate.statusCode !== undefined && !isSuccessStatus(candidate.statusCode)) return false;
+  if (candidate.statusCode !== undefined && !isSuccessStatus(candidate.statusCode)) return 'ignore';
 
   let url: URL;
   try {
     url = new URL(candidate.url);
   } catch {
-    return false;
+    return 'ignore';
   }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return 'ignore';
 
   const contentType = candidate.contentType?.toLowerCase() ?? null;
-  if (contentType?.startsWith('text/')) return false;
+  if (contentType?.startsWith('text/')) return 'ignore';
 
-  if (isBlacklisted(candidate.url, config.blacklistedUrls)) return false;
+  if (isBlacklisted(candidate.url, config.blacklistedUrls)) return 'ignore';
   if (candidate.downloadPage && isBlacklisted(candidate.downloadPage, config.blacklistedUrls)) {
-    return false;
+    return 'ignore';
   }
 
   if (
@@ -105,16 +105,16 @@ export function shouldCapture(
     config.captureFileSizeMinimumKb > 0 &&
     candidate.fileSizeBytes < config.captureFileSizeMinimumKb * 1024
   ) {
-    return false;
+    return 'ignore';
   }
 
-  const fileName = candidate.suggestedName?.trim()
-    ? candidate.suggestedName.trim()
-    : getFileFromUrl(candidate.url);
-  if (!fileName) return false;
+  const fileName = candidate.suggestedName?.trim();
+  if (!fileName) return 'pending';
   const ext = getFileExtension(fileName);
-  if (!ext) return false;
-  return config.registeredFileTypes.map((t) => t.toLowerCase()).includes(ext);
+  if (!ext) return 'pending';
+  if (!config.registeredFileTypes.some((type) => type.toLowerCase() === ext)) return 'ignore';
+  if (candidate.fileSizeBytes === null && config.captureFileSizeMinimumKb > 0) return 'pending';
+  return 'capture';
 }
 
 // Resolve raw hrefs against a base URL, keep http(s) only, dedupe.

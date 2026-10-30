@@ -1,5 +1,9 @@
+#[cfg(test)]
+pub(crate) mod queue_tests;
+
 use std::path::PathBuf;
 
+use gpui_kit::{App, Window};
 use raijin_core::download::{DownloadId, DownloadManagerHandle, NewDownload, QueueId};
 use raijin_core::monitor::DownloadMonitorHandle;
 use raijin_core::queue::QueueManagerHandle;
@@ -77,10 +81,12 @@ pub enum EngineCommand {
     PauseAll,
     /// Resume every paused download (tray "Resume all", one actor command).
     ResumeAll,
-    /// Add a download and immediately resume it.
-    Add(NewDownload),
-    /// Add a download without resuming it (stays `Added` until resumed).
-    AddPaused(NewDownload),
+    AddToQueue {
+        request: NewDownload,
+        queue_id: QueueId,
+        autostart: bool,
+    },
+    Queue(QueueAction),
     /// Move downloads into a queue (drag onto a queue).
     MoveToQueue {
         /// Destination queue.
@@ -90,33 +96,90 @@ pub enum EngineCommand {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueAction {
+    Create(String),
+    Save {
+        id: QueueId,
+        name: String,
+        limit: std::num::NonZeroU16,
+        stop_on_empty: bool,
+    },
+    Delete(QueueId),
+    Start(QueueId),
+    Stop(QueueId),
+    Reorder {
+        id: QueueId,
+        order: Vec<DownloadId>,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CommandFailure {
+    #[error(transparent)]
+    Queue(#[from] raijin_core::queue::QueueManagerError),
+    #[error("command interrupted: {0}")]
+    Task(#[from] tokio::task::JoinError),
+}
+
+impl CommandFailure {
+    pub fn created_download(&self) -> Option<DownloadId> {
+        match self {
+            Self::Queue(raijin_core::queue::QueueManagerError::AdmissionAfterAdd {
+                id, ..
+            }) => Some(*id),
+            _ => None,
+        }
+    }
+}
+
 impl EngineHandles {
-    /// Dispatches a command without blocking the GPUI thread.
-    ///
-    /// Failures are logged; visible state (including error kinds) arrives
-    /// through the monitor projection on the next poll tick.
+    /// Dispatches a command for windowless callers; failures are logged.
     pub fn dispatch(&self, command: EngineCommand) {
+        self.execute(command);
+    }
+
+    fn execute(
+        &self,
+        command: EngineCommand,
+    ) -> tokio::task::JoinHandle<raijin_core::queue::QueueManagerResult<()>> {
         let manager = self.manager.clone();
         let queues = self.queues.clone();
         self.runtime.spawn(async move {
-            // Each arm keeps its own error type: queue and engine failures are
-            // different domain errors and must not be flattened into one.
-            match command {
-                EngineCommand::MoveToQueue {
-                    queue_id,
-                    downloads,
-                } => {
-                    if let Err(error) = queues.enqueue(queue_id, downloads).await {
-                        tracing::warn!(?error, "queue move failed");
-                    }
-                }
-                other => {
-                    if let Err(error) = other.dispatch_to(&manager, &queues).await {
-                        tracing::warn!(?error, "engine command failed");
-                    }
-                }
+            let result = command.dispatch_to(&manager, &queues).await;
+            if let Err(error) = &result {
+                tracing::warn!(?error, "download command failed");
+            }
+            result
+        })
+    }
+
+    pub fn dispatch_in(&self, command: EngineCommand, window: &mut Window, cx: &mut App) {
+        use gpui_kit::component::WindowExt as _;
+        self.run_in(command, window, cx, |result, window, cx| {
+            if let Err(error) = result {
+                window.push_notification(error.to_string(), cx);
             }
         });
+    }
+
+    pub fn run_in(
+        &self,
+        command: EngineCommand,
+        window: &mut Window,
+        cx: &mut App,
+        complete: impl FnOnce(Result<(), CommandFailure>, &mut Window, &mut App) + 'static,
+    ) {
+        let task = self.execute(command);
+        let handle = window.window_handle();
+        cx.spawn(async move |cx| {
+            let result = match task.await {
+                Ok(result) => result.map_err(CommandFailure::from),
+                Err(error) => Err(CommandFailure::from(error)),
+            };
+            let _ = handle.update(cx, |_, window, cx| complete(result, window, cx));
+        })
+        .detach();
     }
 }
 
@@ -130,8 +193,23 @@ impl EngineCommand {
         self,
         manager: &DownloadManagerHandle,
         queues: &QueueManagerHandle,
-    ) -> raijin_core::download::DownloadManagerResult<()> {
-        match self {
+    ) -> raijin_core::queue::QueueManagerResult<()> {
+        if let Self::Queue(action) = self {
+            return match action {
+                QueueAction::Create(name) => queues.create(name).await.map(|_| ()),
+                QueueAction::Delete(id) => queues.delete(id).await.map(|_| ()),
+                QueueAction::Start(id) => queues.start(id).await,
+                QueueAction::Stop(id) => queues.stop(id).await,
+                QueueAction::Reorder { id, order } => queues.reorder(id, order).await,
+                QueueAction::Save {
+                    id,
+                    name,
+                    limit,
+                    stop_on_empty,
+                } => queues.configure(id, name, limit, stop_on_empty).await,
+            };
+        }
+        let result = match self {
             Self::Pause(id) => manager.pause(id).await.map(|_| ()),
             Self::Resume(id) => manager.resume(id).await.map(|_| ()),
             Self::Remove(id) => manager.remove(id).await.map(|_| ()),
@@ -140,13 +218,21 @@ impl EngineCommand {
             Self::ResumeAll => manager.resume_all().await.map(|_| ()),
             // Adds must go through the queue: admission is the only path that
             // starts a job, so an add without membership would never run.
-            Self::Add(request) => Self::add_queued(manager, queues, request, true).await,
-            Self::AddPaused(request) => Self::add_queued(manager, queues, request, false).await,
-            Self::MoveToQueue { .. } => Ok(()),
-        }
+            Self::AddToQueue {
+                request,
+                queue_id,
+                autostart,
+            } => return Self::add_queued(manager, queues, request, queue_id, autostart).await,
+            Self::MoveToQueue {
+                queue_id,
+                downloads,
+            } => return queues.move_downloads(queue_id, downloads).await,
+            Self::Queue(_) => unreachable!(),
+        };
+        result.map_err(Into::into)
     }
 
-    /// Adds a download, attaches it to Main, and optionally starts it.
+    /// Adds a download and hands execution to queue admission.
     ///
     /// # Errors
     ///
@@ -156,21 +242,33 @@ impl EngineCommand {
         manager: &DownloadManagerHandle,
         queues: &QueueManagerHandle,
         request: NewDownload,
+        queue_id: QueueId,
         start: bool,
-    ) -> raijin_core::download::DownloadManagerResult<()> {
+    ) -> raijin_core::queue::QueueManagerResult<()> {
+        if !queues
+            .list()
+            .await?
+            .iter()
+            .any(|snapshot| snapshot.queue.id == queue_id)
+        {
+            return Err(raijin_core::queue::QueueManagerError::QueueNotFound(
+                queue_id,
+            ));
+        }
         let added = manager.add(request).await?;
-        if !start {
-            manager.pause(added.id).await?;
+        let admission = async {
+            if !start {
+                manager.pause(added.id).await?;
+            }
+            queues.enqueue(queue_id, [added.id]).await
         }
-        queues
-            .enqueue(QueueId::MAIN, [added.id])
-            .await
-            .map_err(|_| raijin_core::download::DownloadManagerError::Stopped)?;
-        if start {
-            manager.start(added.id).await.map(|_| ())
-        } else {
-            Ok(())
-        }
+        .await;
+        admission.map_err(
+            |source| raijin_core::queue::QueueManagerError::AdmissionAfterAdd {
+                id: added.id,
+                source: Box::new(source),
+            },
+        )
     }
 }
 

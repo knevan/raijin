@@ -19,6 +19,7 @@ mod downloads;
 mod format;
 mod integration_bridge;
 mod main_view;
+mod queue_picker;
 mod settings;
 mod theme;
 mod tray;

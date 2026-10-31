@@ -796,66 +796,77 @@ impl MainView {
 
         h_flex()
             .items_center()
-            .gap_1()
-            .p(px(2.))
-            .rounded_lg()
-            .bg(cx.theme().muted)
-            .children(items.into_iter().map(|(filter, label, count)| {
-                let is_active = self.status == filter;
-                let bg_color = if is_active {
-                    cx.theme().background
-                } else {
-                    gpui::transparent_black()
-                };
-                let text_color = if is_active {
-                    cx.theme().foreground
-                } else {
-                    cx.theme().muted_foreground
-                };
-                let count_bg = if is_active {
-                    cx.theme().muted
-                } else {
-                    cx.theme().background
-                };
-
+            .child(
                 h_flex()
-                    .id(SharedString::from(format!("status-tab-{}", label)))
                     .items_center()
-                    .gap_1p5()
-                    .px_2p5()
-                    .py_1()
-                    .rounded(px(4.))
-                    .bg(bg_color)
-                    .text_color(text_color)
-                    .text_xs()
-                    .font_weight(if is_active {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .cursor_pointer()
-                    .when(!is_active, |this| {
-                        this.hover(|style| style.text_color(cx.theme().foreground))
-                    })
-                    .child(label)
-                    .child(
-                        div()
-                            .px_1p5()
-                            .py(px(0.5))
-                            .rounded_full()
-                            .bg(count_bg)
+                    .gap(px(2.))
+                    .p(px(2.5))
+                    .rounded(px(999.))
+                    .bg(cx.theme().muted.opacity(0.4))
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.5))
+                    .children(items.into_iter().map(|(filter, label, count)| {
+                        let is_active = self.status == filter;
+                        let bg_color = if is_active {
+                            cx.theme().primary
+                        } else {
+                            gpui::transparent_black()
+                        };
+                        let text_color = if is_active {
+                            cx.theme().primary_foreground
+                        } else {
+                            cx.theme().muted_foreground
+                        };
+                        let count_bg = if is_active {
+                            cx.theme().primary_foreground.opacity(0.18)
+                        } else {
+                            cx.theme().background.opacity(0.6)
+                        };
+                        let count_text = if is_active {
+                            cx.theme().primary_foreground
+                        } else {
+                            cx.theme().muted_foreground
+                        };
+
+                        h_flex()
+                            .id(SharedString::from(format!("status-tab-{}", label)))
+                            .items_center()
+                            .gap_1p5()
+                            .px_3()
+                            .py(px(3.5))
+                            .rounded(px(999.))
+                            .bg(bg_color)
+                            .text_color(text_color)
                             .text_xs()
-                            .text_color(if is_active {
-                                cx.theme().foreground
+                            .font_weight(if is_active {
+                                FontWeight::SEMIBOLD
                             } else {
-                                cx.theme().muted_foreground
+                                FontWeight::NORMAL
                             })
-                            .child(count.to_string()),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_status_filter(filter, cx);
-                    }))
-            }))
+                            .cursor_pointer()
+                            .when(!is_active, |this| {
+                                this.hover(|style| {
+                                    style
+                                        .bg(cx.theme().muted.opacity(0.4))
+                                        .text_color(cx.theme().foreground)
+                                })
+                            })
+                            .child(label)
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py(px(0.5))
+                                    .rounded_full()
+                                    .bg(count_bg)
+                                    .text_xs()
+                                    .text_color(count_text)
+                                    .child(count.to_string()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_status_filter(filter, cx);
+                            }))
+                    })),
+            )
     }
 
     fn render_statusbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -382,6 +382,75 @@ mod tests {
         });
     }
 
+    #[gpui_kit::test]
+    fn edit_dialog_should_populate_and_save(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (manager, queues) = runtime.block_on(crate::bridge::queue_tests::managers(2));
+        let (monitor, _task) = {
+            let _guard = runtime.enter();
+            raijin_core::monitor::DownloadMonitorHandle::spawn(manager.subscribe(), None)
+        };
+        let handles = crate::bridge::EngineHandles {
+            manager,
+            queues: queues.clone(),
+            monitor,
+            runtime: runtime.handle().clone(),
+            default_folder: std::env::temp_dir(),
+            category_root: std::env::temp_dir(),
+            use_category_default: false,
+        };
+        cx.update(gpui_kit::init);
+        let window = cx.update(|cx| {
+            crate::add_download::open_add_download_window(cx, &handles, "");
+            *cx.windows().last().expect("window")
+        });
+        let initial_snapshot = handles.queues.state().first().cloned().expect("main queue");
+        let _form = cx
+            .update_window(window, |_, window, cx| {
+                let form = QueueForm::open(
+                    QueueFormKind::Edit(initial_snapshot),
+                    handles.clone(),
+                    window,
+                    cx,
+                );
+                window.render_frame(cx);
+                assert_eq!(form.read(cx).limit.read(cx).value().as_ref(), "2");
+                let limit = form.read(cx).limit.clone();
+                limit.update(cx, |state, cx| state.set_value("4", window, cx));
+                window.render_frame(cx);
+                window.click("queue-commit", cx);
+                assert!(form.read(cx).busy);
+                form
+            })
+            .expect("dialog");
+        runtime.block_on(async {
+            for _ in 0..100 {
+                if queues.list().await.expect("queues")[0]
+                    .queue
+                    .max_concurrent
+                    .get()
+                    == 4
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("edit did not complete");
+        });
+        cx.run_until_parked();
+        runtime.block_on(async {
+            assert_eq!(
+                queues.list().await.expect("queues")[0]
+                    .queue
+                    .max_concurrent
+                    .get(),
+                4
+            );
+            queues.shutdown().await.expect("queue shutdown");
+            handles.manager.shutdown().await.expect("engine shutdown");
+        });
+    }
+
     #[test]
     fn reorder_should_preserve_members_and_handle_boundaries() {
         let ids = [DownloadId::new(1), DownloadId::new(2), DownloadId::new(3)];

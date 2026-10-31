@@ -282,19 +282,10 @@ fn main() {
             } else if !windowless_start {
                 let handles = handles.clone();
                 let tray = tray.clone();
+                let settings = settings.clone();
                 cx.spawn(async move |cx| {
                     cx.update(|cx| {
-                        let options = main_window_options(cx);
-                        cx.open_window(options, |window, cx| {
-                            build_main_view(
-                                window,
-                                cx,
-                                handles.clone(),
-                                tray.clone(),
-                                settings.clone(),
-                            )
-                        })
-                        .expect("failed to open main window");
+                        open_main_window(cx, &handles, &tray, &settings);
                     })
                 })
                 .detach();
@@ -535,7 +526,7 @@ fn open_main_window(
     let root_handles = handles.clone();
     let root_tray = tray.clone();
     let root_settings = settings.clone();
-    match cx.open_window(main_window_options(cx), |window, cx| {
+    match gpui_kit::open_window(main_window_options(cx), cx, |window, cx| {
         build_main_view(
             window,
             cx,
@@ -544,7 +535,7 @@ fn open_main_window(
             root_settings.clone(),
         )
     }) {
-        Ok(handle) => {
+        Ok((handle, _view)) => {
             tray.mark_shown();
             // Window-level activate foregrounds the reopened window.
             // App-level `activate` is a Windows no-op, and a background

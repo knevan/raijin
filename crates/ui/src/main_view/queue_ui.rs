@@ -224,7 +224,7 @@ impl Render for QueueForm {
 }
 
 impl MainView {
-    fn new_queue(&self, window: &mut Window, cx: &mut App) {
+    pub(super) fn new_queue(&self, window: &mut Window, cx: &mut App) {
         QueueForm::open(QueueFormKind::Create, self.handles.clone(), window, cx);
     }
 
@@ -274,37 +274,98 @@ impl MainView {
         );
     }
 
-    pub(super) fn render_queue_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self
+    pub(super) fn render_queue_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let snapshot = self
             .queue_state
             .iter()
-            .find(|s| Some(s.queue.id) == self.selected_queue);
-        v_flex().gap_2()
-            .child(h_flex().gap_2()
-                .child(div().flex_1().text_lg().child(self.header_title()))
-                .child(Button::new("new-queue").small().label("New queue…")
-                    .on_click(cx.listener(|this, _, window, cx| this.new_queue(window, cx)))))
-            .when_some(selected, |this, snapshot| {
-                let id = snapshot.queue.id;
-                let active = snapshot.active;
-                let running = self.cache.iter().filter(|r| snapshot.items.contains(&r.id) && matches!(r.status,
-                    DownloadStatus::Downloading | DownloadStatus::PreparingFile | DownloadStatus::Retrying)).count();
-                let waiting = self.cache.iter().filter(|r| snapshot.items.contains(&r.id) && r.status == DownloadStatus::Queued).count();
-                this.child(div().text_sm().text_color(cx.theme().muted_foreground).child(format!(
-                    "{} · {running} running · {waiting} waiting · limit {} · execution order",
-                    if active { "Active" } else { "Stopped" }, snapshot.queue.max_concurrent,
-                )))
-                .child(h_flex().gap_2()
-                    .child(Button::new("queue-toggle").small().label(if active { "Stop queue" } else { "Start queue" })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let action = if active { QueueAction::Stop(id) } else { QueueAction::Start(id) };
-                            this.handles.dispatch_in(EngineCommand::Queue(action), window, cx);
-                        })))
-                    .child(Button::new("queue-settings").small().label("Queue settings…")
-                        .on_click(cx.listener(|this, _, window, cx| this.edit_queue(false, window, cx))))
-                    .child(Button::new("queue-delete").small().label("Delete queue…").disabled(id == QueueId::MAIN)
-                        .on_click(cx.listener(|this, _, window, cx| this.edit_queue(true, window, cx)))))
+            .find(|s| Some(s.queue.id) == self.selected_queue)?;
+        let id = snapshot.queue.id;
+        let active = snapshot.active;
+        let running = self
+            .cache
+            .iter()
+            .filter(|r| {
+                snapshot.items.contains(&r.id)
+                    && matches!(
+                        r.status,
+                        DownloadStatus::Downloading
+                            | DownloadStatus::PreparingFile
+                            | DownloadStatus::Retrying
+                    )
             })
+            .count();
+        let waiting = self
+            .cache
+            .iter()
+            .filter(|r| snapshot.items.contains(&r.id) && r.status == DownloadStatus::Queued)
+            .count();
+
+        Some(
+            v_flex()
+                .gap_2()
+                .p_3()
+                .rounded_md()
+                .bg(cx.theme().muted)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(format!("Queue: {}", snapshot.queue.name)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "{} · {running} running · {waiting} waiting · limit {} · execution order",
+                                    if active { "Active" } else { "Stopped" },
+                                    snapshot.queue.max_concurrent,
+                                )),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("queue-toggle")
+                                .small()
+                                .label(if active { "Stop queue" } else { "Start queue" })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let action = if active {
+                                        QueueAction::Stop(id)
+                                    } else {
+                                        QueueAction::Start(id)
+                                    };
+                                    this.handles.dispatch_in(
+                                        EngineCommand::Queue(action),
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new("queue-settings")
+                                .small()
+                                .label("Queue settings…")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.edit_queue(false, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("queue-delete")
+                                .small()
+                                .label("Delete queue…")
+                                .disabled(id == QueueId::MAIN)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.edit_queue(true, window, cx)
+                                })),
+                        ),
+                ),
+        )
     }
 }
 

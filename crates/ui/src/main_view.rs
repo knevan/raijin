@@ -342,19 +342,27 @@ impl MainView {
             .collect()
     }
 
-    /// Applies a combined status + category filter from the sidebar tree.
-    ///
-    /// Navigation invalidates the positional row highlight, so the current
-    /// row is cleared (checkboxes survive via the delegate's id-keyed set).
-    fn set_filter(
-        &mut self,
-        status: StatusFilter,
-        category: CategoryFilter,
-        cx: &mut Context<Self>,
-    ) {
-        self.status = status;
+    /// Applies a category filter from the sidebar, preserving the current status filter.
+    fn set_category_filter(&mut self, category: CategoryFilter, cx: &mut Context<Self>) {
+        if self.category == category && self.selected_queue.is_none() {
+            return;
+        }
         self.category = category;
         self.selected_queue = None;
+        self.selected = None;
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().clear_selection();
+            table.clear_selection(cx);
+        });
+        self.recompute(cx);
+    }
+
+    /// Applies a status filter from the status pill selector, preserving the current category/queue.
+    fn set_status_filter(&mut self, status: StatusFilter, cx: &mut Context<Self>) {
+        if self.status == status {
+            return;
+        }
+        self.status = status;
         self.selected = None;
         self.table.update(cx, |table, cx| {
             table.delegate_mut().clear_selection();
@@ -486,7 +494,7 @@ impl MainView {
             return format!("Queue: {}", snapshot.queue.name);
         }
         match (self.category, self.status) {
-            (CategoryFilter::All, StatusFilter::All) => "Recent".to_owned(),
+            (CategoryFilter::All, StatusFilter::All) => "All Downloads".to_owned(),
             (category, StatusFilter::All) => category.label().to_owned(),
             (CategoryFilter::All, status) => status.label().to_owned(),
             (category, status) => format!("{} · {}", category.label(), status.label()),
@@ -554,35 +562,16 @@ impl MainView {
     /// Queues section.
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let filter = ActiveSidebarFilter {
-            status: self.status,
             category: self.category,
             queue: self.selected_queue,
         };
-        let menu = SidebarMenu::new()
-            .child(filter_parent(
-                "All",
-                IconName::Folder,
-                StatusFilter::All,
-                true,
-                filter,
-                cx,
-            ))
-            .child(filter_parent(
-                "Finished",
-                IconName::CircleCheck,
-                StatusFilter::Finished,
-                false,
-                filter,
-                cx,
-            ))
-            .child(filter_parent(
-                "Unfinished",
-                IconName::Loader,
-                StatusFilter::Unfinished,
-                false,
-                filter,
-                cx,
-            ));
+        let menu = SidebarMenu::new().child(categories_accordion(
+            "All Downloads",
+            IconName::Folder,
+            true,
+            filter,
+            cx,
+        ));
 
         let queue_section = QueueSection {
             queues: self.queue_state.clone(),
@@ -691,6 +680,12 @@ impl MainView {
                     .disabled(!has_targets)
                     .on_click(cx.listener(|this, _, window, cx| this.move_to_queue(window, cx))),
             )
+            .child(
+                Button::new("new-queue")
+                    .small()
+                    .label("New queue…")
+                    .on_click(cx.listener(|this, _, window, cx| this.new_queue(window, cx))),
+            )
             .when(self.selected_queue.is_some(), |this| {
                 this.child(
                     Button::new("queue-move-up")
@@ -754,6 +749,115 @@ impl MainView {
             )
     }
 
+    fn status_counts(&self) -> (usize, usize, usize) {
+        let mut all = 0;
+        let mut unfinished = 0;
+        let mut finished = 0;
+
+        let queue_member_ids: Option<std::collections::HashSet<_>> = self
+            .selected_queue
+            .and_then(|qid| {
+                self.queue_state
+                    .iter()
+                    .find(|s| s.queue.id == qid)
+                    .map(|s| s.items.iter().copied().collect())
+            });
+
+        for row in &self.cache {
+            if !self.category.matches(&row.category_label) {
+                continue;
+            }
+            if let Some(ref members) = queue_member_ids
+                && !members.contains(&row.id)
+            {
+                continue;
+            }
+            if StatusFilter::All.matches(row.status) {
+                all += 1;
+            }
+            if StatusFilter::Unfinished.matches(row.status) {
+                unfinished += 1;
+            }
+            if StatusFilter::Finished.matches(row.status) {
+                finished += 1;
+            }
+        }
+        (all, unfinished, finished)
+    }
+
+    fn render_status_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (all_count, unfinished_count, finished_count) = self.status_counts();
+
+        let items = [
+            (StatusFilter::All, "All", all_count),
+            (StatusFilter::Unfinished, "Downloading", unfinished_count),
+            (StatusFilter::Finished, "Finished", finished_count),
+        ];
+
+        h_flex()
+            .items_center()
+            .gap_1()
+            .p(px(2.))
+            .rounded_lg()
+            .bg(cx.theme().muted)
+            .children(items.into_iter().map(|(filter, label, count)| {
+                let is_active = self.status == filter;
+                let bg_color = if is_active {
+                    cx.theme().background
+                } else {
+                    gpui::transparent_black()
+                };
+                let text_color = if is_active {
+                    cx.theme().foreground
+                } else {
+                    cx.theme().muted_foreground
+                };
+                let count_bg = if is_active {
+                    cx.theme().muted
+                } else {
+                    cx.theme().background
+                };
+
+                h_flex()
+                    .id(SharedString::from(format!("status-tab-{}", label)))
+                    .items_center()
+                    .gap_1p5()
+                    .px_2p5()
+                    .py_1()
+                    .rounded(px(4.))
+                    .bg(bg_color)
+                    .text_color(text_color)
+                    .text_xs()
+                    .font_weight(if is_active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .cursor_pointer()
+                    .when(!is_active, |this| {
+                        this.hover(|style| style.text_color(cx.theme().foreground))
+                    })
+                    .child(label)
+                    .child(
+                        div()
+                            .px_1p5()
+                            .py(px(0.5))
+                            .rounded_full()
+                            .bg(count_bg)
+                            .text_xs()
+                            .text_color(if is_active {
+                                cx.theme().foreground
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(count.to_string()),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_status_filter(filter, cx);
+                    }))
+            }))
+    }
+
     fn render_statusbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let speed = if self.total_speed_bps == 0 {
             "Idle".to_owned()
@@ -798,13 +902,11 @@ impl Render for MainView {
                                     .min_w_0()
                                     .gap_3()
                                     .p_4()
-                                    .child(self.render_queue_header(cx))
+                                    .when_some(self.render_queue_banner(cx), |this, banner| {
+                                        this.child(banner)
+                                    })
                                     .child(self.render_toolbar(cx))
-                                    // Hybrid Card-Table: the header renders as a floating rounded island
-                                    // with an 8px vertical gap to the body rows, and each row renders as
-                                    // an independent card with smooth borders and a 6px gap.
-                                    // with a compact gap to the body rows, and each row renders as
-                                    // an independent card with smooth borders and a 4px vertical gap.
+                                    .child(self.render_status_selector(cx))
                                     .child({
                                         let view = cx.entity();
                                         div()
@@ -846,28 +948,22 @@ impl Render for MainView {
 /// Active sidebar filter state passed to menu builders.
 #[derive(Clone, Copy)]
 struct ActiveSidebarFilter {
-    status: StatusFilter,
     category: CategoryFilter,
     queue: Option<QueueId>,
 }
 
-/// Builds one sidebar filter dropdown: a status parent with the file
-/// categories scoped to that status as children.
+/// Builds the sidebar category filter dropdown.
 ///
-/// Parent clicks select the whole status and toggle dropdown expansion;
-/// child clicks select one category within it. Chevron also toggles
-/// collapse without changing the filter.
-fn filter_parent(
+/// Parent clicks select all categories and toggle dropdown expansion;
+/// child clicks select one category within it.
+fn categories_accordion(
     label: &'static str,
     icon: IconName,
-    status: StatusFilter,
     open: bool,
     filter: ActiveSidebarFilter,
     cx: &mut Context<MainView>,
 ) -> SidebarMenuItem {
-    let is_parent_active = filter.status == status
-        && matches!(filter.category, CategoryFilter::All)
-        && filter.queue.is_none();
+    let is_parent_active = matches!(filter.category, CategoryFilter::All) && filter.queue.is_none();
 
     let parent_text_color = if is_parent_active {
         cx.theme().sidebar_accent_foreground
@@ -883,15 +979,14 @@ fn filter_parent(
         .default_open(open)
         .click_to_toggle(true)
         .on_click(cx.listener(move |this, _, _, cx| {
-            this.set_filter(status, CategoryFilter::All, cx);
+            this.set_category_filter(CategoryFilter::All, cx);
         }))
         .children(
             FileCategory::all()
                 .into_iter()
                 .chain([FileCategory::General])
                 .map(|item| {
-                    let is_child_active = filter.status == status
-                        && filter.queue.is_none()
+                    let is_child_active = filter.queue.is_none()
                         && matches!(
                             filter.category,
                             CategoryFilter::Category(current) if current == item
@@ -909,7 +1004,7 @@ fn filter_parent(
                         .active(is_child_active)
                         .text_color(child_text_color)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_filter(status, CategoryFilter::Category(item), cx);
+                            this.set_category_filter(CategoryFilter::Category(item), cx);
                         }))
                 }),
         )

@@ -424,6 +424,77 @@ impl QueueRepository {
         Ok(rows > 0)
     }
 
+    /// Moves memberships atomically without changing download state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a parent is missing or SQLite cannot commit.
+    pub async fn move_items(&self, queue_id: QueueId, ids: &[DownloadId]) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        for id in ids {
+            let current: Option<i64> = sqlx::query_scalar(
+                "SELECT queue_id FROM queue_items WHERE queue_id = ? AND download_id = ?",
+            )
+            .bind(queue_id.get())
+            .bind(id.get())
+            .fetch_optional(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM queue_items WHERE download_id = ? AND queue_id != ?")
+                .bind(id.get())
+                .bind(queue_id.get())
+                .execute(&mut *tx)
+                .await?;
+            if current.is_none() {
+                sqlx::query(
+                    "INSERT INTO queue_items (queue_id, download_id, position) SELECT ?, ?, COALESCE(MAX(position), -1) + 1 FROM queue_items WHERE queue_id = ?",
+                )
+                .bind(queue_id.get())
+                .bind(id.get())
+                .bind(queue_id.get())
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Deletes a custom queue and transfers its members to Main atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SQLite cannot commit the transfer.
+    pub async fn delete_queue_into_main(&self, id: QueueId) -> DbResult<bool> {
+        if id == QueueId::MAIN {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT qi.download_id FROM queue_items qi JOIN downloads d ON d.id = qi.download_id WHERE qi.queue_id = ? AND d.status NOT IN ('completed', 'removed') ORDER BY qi.position, qi.download_id",
+        )
+        .bind(id.get())
+        .fetch_all(&mut *tx)
+        .await?;
+        for download_id in ids {
+            sqlx::query(
+                "INSERT INTO queue_items (queue_id, download_id, position) SELECT ?, ?, COALESCE(MAX(position), -1) + 1 FROM queue_items WHERE queue_id = ? ON CONFLICT(queue_id, download_id) DO NOTHING",
+            )
+            .bind(QueueId::MAIN.get())
+            .bind(download_id)
+            .bind(QueueId::MAIN.get())
+            .execute(&mut *tx)
+            .await?;
+        }
+        let removed = sqlx::query("DELETE FROM queues WHERE id = ?")
+            .bind(id.get())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            > 0;
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     /// Adds or updates one queue item.
     ///
     /// # Errors

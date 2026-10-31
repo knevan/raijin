@@ -35,7 +35,7 @@ Load the following skills on demand when relevant to the task:
 ## Module Boundaries
 
 - `download/`: Engine traits, manager actor, jobs, parts, file allocation, retry, validation, speed limiting (see `docs/download-engine.md`).
-- `queue/`: Queue manager, scheduler, queue models, and commands (ON HOLD — see `docs/queue-rules.md`).
+- `queue/`: Queue manager, scheduler, queue models, and commands (basic queue is MVP scope; see `docs/queue-rules.md`).
 - `monitor/`: UI-safe projected state, speed meters, event aggregation. UI views consume monitor state, never direct engine internals.
 - `db/`: SQLite models, repositories, migrations, transaction helpers (see `docs/database.md`).
 - `integration/`: Local API (`axum`) request/response models and server glue, completely UI-free (see `docs/api-and-integration.md`).

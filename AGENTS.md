@@ -6,7 +6,7 @@ Key architectural invariants:
 
 - Native HTTP download engine first (dynamic multi-connection range splitting).
 - Aria2-next only as optional future adapter behind engine trait.
-- Queue system separate from download engine (ON HOLD — see `docs/queue-rules.md`).
+- Queue system separate from download engine (basic queue is MVP scope; see `docs/queue-rules.md`).
 - Monitor/projection layer separate from engine and UI.
 - `gpui-kit` views render projected monitor state and send commands, never mutate engine internals.
 - SQLite is the sole durable source of truth (WAL mode). No ad-hoc JSON sidecar files.
@@ -109,11 +109,9 @@ cargo clippy --all-targets -p raijin-ui -- -D warnings
 - Do not bind GPUI views directly to download engine jobs.
 - Do not update `Entity` state from Tokio background workers.
 - Do not put queue scheduling logic inside download workers.
-- Do not implement queue UI while M3 is on hold.
 - Do not write migration files manually; use `sqlx migrate add <name>`.
 - Do not persist download state as JSON sidecars.
 - Do not make window-system crates required for core tests.
-- Do not introduce aria2 as default engine.
-- Do not use `Yamrc/gpui-tray`.
+- Do not introduce aria2-next as default engine.
 - Do not silently discard validation errors or restart changed remote files.
 - Do not hold locks across `.await`.

@@ -70,6 +70,19 @@ pub enum QueueManagerError {
     /// The reserved main queue cannot be deleted.
     #[error("the main queue cannot be deleted")]
     MainQueueNotDeletable,
+    /// A download record exists, but its admission setup did not finish.
+    #[error("download `{id}` was added but queue setup failed: {source}")]
+    AdmissionAfterAdd {
+        id: DownloadId,
+        #[source]
+        source: Box<QueueManagerError>,
+    },
+    /// Queue names must contain visible text.
+    #[error("enter a queue name")]
+    InvalidName,
+    /// Membership moves cannot transfer live workers or finished downloads.
+    #[error("pause download `{0}` before moving it; finished downloads cannot be queued")]
+    NotMovable(DownloadId),
     /// Schedule rejected by the typed boundary.
     #[error(transparent)]
     Schedule(#[from] QueueScheduleError),
@@ -125,6 +138,12 @@ pub enum QueueCommand {
         downloads: Vec<DownloadId>,
         reply: oneshot::Sender<QueueManagerResult<()>>,
     },
+    /// Move membership without resuming downloads.
+    Move {
+        queue_id: QueueId,
+        downloads: Vec<DownloadId>,
+        reply: oneshot::Sender<QueueManagerResult<()>>,
+    },
     /// Drop one download from whichever queue holds it.
     RemoveItem {
         download_id: DownloadId,
@@ -141,6 +160,14 @@ pub enum QueueCommand {
         queue: Queue,
         schedule: Option<QueueSchedule>,
         reply: oneshot::Sender<QueueManagerResult<Queue>>,
+    },
+    /// Update user-facing properties without rewriting schedules.
+    Configure {
+        id: QueueId,
+        name: String,
+        limit: NonZeroU16,
+        stop_on_empty: bool,
+        reply: oneshot::Sender<QueueManagerResult<()>>,
     },
     /// Activate a queue so admission may fill its slots.
     Start {
@@ -235,6 +262,7 @@ impl QueueManagerHandle {
             active_queues: HashSet::new(),
             active: HashMap::new(),
             blocked: HashSet::new(),
+            suspended: HashSet::new(),
             empty_notified: HashSet::new(),
             next_start: HashMap::new(),
             next_stop: HashMap::new(),
@@ -330,11 +358,33 @@ impl QueueManagerHandle {
             .map_err(|_| QueueManagerError::ResponseDropped)?
     }
 
-    /// Removes one download from its queue.
+    /// Moves memberships without resuming downloads or transferring live workers.
     ///
     /// # Errors
     ///
     /// Returns an error when the actor stopped or persistence fails.
+    pub async fn move_downloads(
+        &self,
+        queue_id: QueueId,
+        downloads: Vec<DownloadId>,
+    ) -> QueueManagerResult<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(QueueCommand::Move {
+            queue_id,
+            downloads,
+            reply,
+        })
+        .await?;
+        receiver
+            .await
+            .map_err(|_| QueueManagerError::ResponseDropped)?
+    }
+
+    /// Removes one download's membership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor or database is unavailable.
     pub async fn remove_item(&self, download_id: DownloadId) -> QueueManagerResult<bool> {
         let (reply, receiver) = oneshot::channel();
         self.send(QueueCommand::RemoveItem { download_id, reply })
@@ -389,11 +439,37 @@ impl QueueManagerHandle {
             .map_err(|_| QueueManagerError::ResponseDropped)?
     }
 
-    /// Activates a queue.
+    /// Updates basic properties while preserving the stored schedule.
     ///
     /// # Errors
     ///
     /// Returns an error when the actor stopped or persistence fails.
+    pub async fn configure(
+        &self,
+        id: QueueId,
+        name: String,
+        limit: NonZeroU16,
+        stop_on_empty: bool,
+    ) -> QueueManagerResult<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(QueueCommand::Configure {
+            id,
+            name,
+            limit,
+            stop_on_empty,
+            reply,
+        })
+        .await?;
+        receiver
+            .await
+            .map_err(|_| QueueManagerError::ResponseDropped)?
+    }
+
+    /// Starts admission without resuming manually paused items.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor or database is unavailable.
     pub async fn start(&self, id: QueueId) -> QueueManagerResult<()> {
         let (reply, receiver) = oneshot::channel();
         self.send(QueueCommand::Start { id, reply }).await?;
@@ -489,6 +565,7 @@ struct QueueManager {
     active: HashMap<DownloadId, QueueId>,
     /// Downloads whose last run failed; re-admitted only after a retry signal.
     blocked: HashSet<DownloadId>,
+    suspended: HashSet<DownloadId>,
     /// Queues already reported empty, so `BecameEmpty` stays an edge event.
     empty_notified: HashSet<QueueId>,
     next_start: HashMap<QueueId, NaiveDateTime>,
@@ -586,6 +663,15 @@ impl QueueManager {
                 send_reply(reply, result);
                 Ok(false)
             }
+            QueueCommand::Move {
+                queue_id,
+                downloads,
+                reply,
+            } => {
+                let result = self.move_downloads(queue_id, &downloads).await;
+                send_reply(reply, result);
+                Ok(false)
+            }
             QueueCommand::RemoveItem { download_id, reply } => {
                 let result = self.remove_item(download_id).await;
                 send_reply(reply, result);
@@ -606,6 +692,17 @@ impl QueueManager {
                 reply,
             } => {
                 let result = self.set_queue(queue, schedule).await;
+                send_reply(reply, result);
+                Ok(false)
+            }
+            QueueCommand::Configure {
+                id,
+                name,
+                limit,
+                stop_on_empty,
+                reply,
+            } => {
+                let result = self.configure(id, name, limit, stop_on_empty).await;
                 send_reply(reply, result);
                 Ok(false)
             }
@@ -659,6 +756,10 @@ impl QueueManager {
     }
 
     async fn create_queue(&mut self, name: String) -> QueueManagerResult<QueueId> {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return Err(QueueManagerError::InvalidName);
+        }
         let now = now_ms()?;
         let id = self.queues.next_queue_id().await?;
         let queue = Queue {
@@ -690,7 +791,35 @@ impl QueueManager {
         // Deactivate first: deleting the row cascades membership, and a running
         // job must not keep a slot for a queue that no longer exists.
         self.set_active(id, false).await?;
-        let removed = self.queues.delete_queue(id).await?;
+        let members = self
+            .queue_state(id)
+            .ok_or(QueueManagerError::QueueNotFound(id))?
+            .items
+            .clone();
+        let mut transferred = Vec::new();
+        for download_id in members {
+            self.suspended.remove(&download_id);
+            let Some(item) = self.downloads.get(download_id).await? else {
+                continue;
+            };
+            if matches!(
+                item.status,
+                DownloadStatus::Completed | DownloadStatus::Removed
+            ) {
+                continue;
+            }
+            let item = self.engine.pause(download_id).await?;
+            self.statuses.insert(download_id, item.status);
+            transferred.push(download_id);
+        }
+        let removed = self.queues.delete_queue_into_main(id).await?;
+        if let Some(main) = self.queue_state_mut(QueueId::MAIN) {
+            for download_id in transferred {
+                if !main.items.contains(&download_id) {
+                    main.items.push(download_id);
+                }
+            }
+        }
         self.queues_state.retain(|state| state.queue.id != id);
         self.active.retain(|_, owner| *owner != id);
         self.next_start.remove(&id);
@@ -733,6 +862,55 @@ impl QueueManager {
         });
         self.admit_all().await?;
         Ok(())
+    }
+
+    async fn move_downloads(
+        &mut self,
+        queue_id: QueueId,
+        ids: &[DownloadId],
+    ) -> QueueManagerResult<()> {
+        if self.queue_state(queue_id).is_none() {
+            return Err(QueueManagerError::QueueNotFound(queue_id));
+        }
+        let running = self.engine.list_active().await?;
+        for id in ids {
+            let item = self
+                .downloads
+                .get(*id)
+                .await?
+                .ok_or(QueueManagerError::DownloadNotFound(*id))?;
+            if running.contains(id)
+                || self.active.contains_key(id)
+                || matches!(
+                    item.status,
+                    DownloadStatus::Completed
+                        | DownloadStatus::Removed
+                        | DownloadStatus::Downloading
+                        | DownloadStatus::PreparingFile
+                        | DownloadStatus::Retrying
+                )
+            {
+                return Err(QueueManagerError::NotMovable(*id));
+            }
+        }
+        self.queues.move_items(queue_id, ids).await?;
+        for state in &mut self.queues_state {
+            if state.queue.id != queue_id {
+                state.items.retain(|id| !ids.contains(id));
+            } else {
+                for id in ids {
+                    if !state.items.contains(id) {
+                        state.items.push(*id);
+                    }
+                }
+            }
+        }
+        for id in ids {
+            self.suspended.remove(id);
+        }
+        self.empty_notified.remove(&queue_id);
+        self.publish(QueueEvent::Changed { queue_id: None });
+        self.admit_all().await
     }
 
     /// Moves `download_id` into `queue_id`, dropping any previous membership.
@@ -781,6 +959,7 @@ impl QueueManager {
     }
 
     async fn remove_item(&mut self, download_id: DownloadId) -> QueueManagerResult<bool> {
+        self.suspended.remove(&download_id);
         let Some(queue_id) = self
             .queues_state
             .iter()
@@ -837,6 +1016,10 @@ impl QueueManager {
         }
         let schedule = schedule.map(QueueSchedule::canonicalized);
         let mut queue = queue;
+        queue.name = queue.name.trim().to_owned();
+        if queue.name.is_empty() {
+            return Err(QueueManagerError::InvalidName);
+        }
         queue.schedule_json = match &schedule {
             Some(schedule) => Some(schedule.to_json()?),
             None => None,
@@ -851,6 +1034,34 @@ impl QueueManager {
         self.publish(QueueEvent::Changed { queue_id: Some(id) });
         self.admit_all().await?;
         Ok(queue)
+    }
+
+    async fn configure(
+        &mut self,
+        id: QueueId,
+        name: String,
+        limit: NonZeroU16,
+        stop_on_empty: bool,
+    ) -> QueueManagerResult<()> {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return Err(QueueManagerError::InvalidName);
+        }
+        let mut queue = self
+            .queue_state(id)
+            .ok_or(QueueManagerError::QueueNotFound(id))?
+            .queue
+            .clone();
+        queue.name = name;
+        queue.max_concurrent = limit;
+        queue.stop_on_empty = stop_on_empty;
+        queue.updated_at = now_ms()?;
+        self.queues.set_queue(&queue).await?;
+        if let Some(state) = self.queue_state_mut(id) {
+            state.queue = queue;
+        }
+        self.publish(QueueEvent::Changed { queue_id: Some(id) });
+        self.admit_all().await
     }
 
     async fn set_global_limit(&mut self, limit: NonZeroU16) -> QueueManagerResult<()> {
@@ -880,6 +1091,22 @@ impl QueueManager {
         let was_active = self.active_queues.contains(&id);
         if active {
             self.active_queues.insert(id);
+            let resume: Vec<_> = self
+                .queue_state(id)
+                .into_iter()
+                .flat_map(|state| state.items.iter().copied())
+                .filter(|download_id| self.suspended.contains(download_id))
+                .collect();
+            for download_id in resume {
+                if matches!(
+                    self.statuses.get(&download_id),
+                    Some(DownloadStatus::Paused)
+                ) {
+                    let item = self.engine.resume(download_id).await?;
+                    self.statuses.insert(download_id, item.status);
+                }
+                self.suspended.remove(&download_id);
+            }
             // A queue start is an explicit retry signal: unblock its members.
             let members: HashSet<DownloadId> = self
                 .queue_state(id)
@@ -909,10 +1136,10 @@ impl QueueManager {
             .map(|(download_id, _)| *download_id)
             .collect();
         for download_id in running {
+            let item = self.engine.pause(download_id).await?;
+            self.statuses.insert(download_id, item.status);
+            self.suspended.insert(download_id);
             self.active.remove(&download_id);
-            if let Err(error) = self.engine.pause(download_id).await {
-                tracing::warn!(%download_id, %error, "failed to pause download for queue stop");
-            }
         }
         Ok(())
     }
@@ -1083,6 +1310,7 @@ impl QueueManager {
         self.statuses.insert(id, item.status);
         match item.status {
             DownloadStatus::Completed => {
+                self.suspended.remove(&id);
                 self.blocked.remove(&id);
                 let member = self
                     .queues_state
@@ -1105,6 +1333,7 @@ impl QueueManager {
                 }
             }
             DownloadStatus::Queued | DownloadStatus::Added => {
+                self.suspended.remove(&id);
                 // Leaving `Error` clears the block so the user's retry runs.
                 self.blocked.remove(&id);
                 // Keep the slot if we already owned it; a resume issued outside
@@ -1717,6 +1946,289 @@ mod tests {
         );
         let stored = harness.queues.list_items(extra).await?;
         assert!(stored.is_empty(), "membership cascades on delete");
+        stop(&handle, task).await
+    }
+
+    #[tokio::test]
+    async fn move_should_preserve_status_order_and_validate_whole_batch() -> QueueManagerResult<()>
+    {
+        let harness = harness().await?;
+        seed_download(&harness, 1, DownloadStatus::Paused).await;
+        seed_download(&harness, 2, DownloadStatus::Added).await;
+        let (handle, task) = spawn_queue(&harness, 2).await?;
+        let destination = handle.create("  Later  ").await?;
+        assert_eq!(find(&handle, destination).await?.queue.name, "Later");
+        assert!(matches!(
+            handle.create(" ").await,
+            Err(QueueManagerError::InvalidName)
+        ));
+        handle
+            .move_downloads(destination, vec![DownloadId::new(1), DownloadId::new(2)])
+            .await?;
+        assert_eq!(
+            find(&handle, destination).await?.items,
+            vec![DownloadId::new(1), DownloadId::new(2)]
+        );
+        assert_eq!(
+            harness
+                .downloads
+                .get(DownloadId::new(1))
+                .await?
+                .expect("row")
+                .status,
+            DownloadStatus::Paused
+        );
+        assert_eq!(
+            harness
+                .downloads
+                .get(DownloadId::new(2))
+                .await?
+                .expect("row")
+                .status,
+            DownloadStatus::Added
+        );
+        let result = handle
+            .move_downloads(
+                QueueId::MAIN,
+                vec![DownloadId::new(1), DownloadId::new(999)],
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(QueueManagerError::DownloadNotFound(_))
+        ));
+        assert_eq!(
+            harness
+                .queues
+                .queue_ids_for_download(DownloadId::new(1))
+                .await?,
+            vec![destination]
+        );
+        assert!(
+            harness
+                .queues
+                .move_items(QueueId::MAIN, &[DownloadId::new(1), DownloadId::new(999)])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            harness
+                .queues
+                .queue_ids_for_download(DownloadId::new(1))
+                .await?,
+            vec![destination]
+        );
+        handle
+            .move_downloads(destination, vec![DownloadId::new(1)])
+            .await?;
+        assert_eq!(
+            find(&handle, destination).await?.items,
+            vec![DownloadId::new(1), DownloadId::new(2)]
+        );
+        stop(&handle, task).await
+    }
+
+    #[tokio::test]
+    async fn configure_should_preserve_opaque_schedule_and_persist_properties()
+    -> QueueManagerResult<()> {
+        let harness = harness().await?;
+        let (handle, task) = spawn_queue(&harness, 3).await?;
+        let id = handle.create("Later").await?;
+        let mut stored = harness.queues.get_queue(id).await?.expect("queue");
+        stored.schedule_json = Some("invalid legacy schedule".to_owned());
+        harness.queues.set_queue(&stored).await?;
+        handle.reconcile().await?;
+        let limit = NonZeroU16::new(1).expect("nonzero");
+        handle
+            .configure(id, " Renamed ".to_owned(), limit, true)
+            .await?;
+        let saved = harness.queues.get_queue(id).await?.expect("queue");
+        assert_eq!(saved.name, "Renamed");
+        assert_eq!(saved.max_concurrent, limit);
+        assert!(saved.stop_on_empty);
+        assert_eq!(saved.schedule_json, stored.schedule_json);
+        assert!(matches!(
+            handle.configure(id, " ".to_owned(), limit, false).await,
+            Err(QueueManagerError::InvalidName)
+        ));
+        stop(&handle, task).await
+    }
+
+    #[tokio::test]
+    async fn delete_should_transfer_paused_members_to_main_and_keep_downloads()
+    -> QueueManagerResult<()> {
+        let harness = harness().await?;
+        seed_download(&harness, 1, DownloadStatus::Paused).await;
+        let (handle, task) = spawn_queue(&harness, 2).await?;
+        handle.stop(QueueId::MAIN).await?;
+        let id = handle.create("Later").await?;
+        handle.move_downloads(id, vec![DownloadId::new(1)]).await?;
+        harness.engine.resume(DownloadId::new(1)).await?;
+        handle.delete(id).await?;
+        assert_eq!(
+            harness
+                .queues
+                .queue_ids_for_download(DownloadId::new(1))
+                .await?,
+            vec![QueueId::MAIN]
+        );
+        assert_eq!(
+            harness
+                .downloads
+                .get(DownloadId::new(1))
+                .await?
+                .expect("download kept")
+                .status,
+            DownloadStatus::Paused
+        );
+        assert!(harness.engine.list_active().await?.is_empty());
+        stop(&handle, task).await
+    }
+
+    #[tokio::test]
+    async fn live_stop_start_should_resume_only_queue_suspended_downloads() -> QueueManagerResult<()>
+    {
+        let harness = harness().await?;
+        let addr = black_hole_server()
+            .await
+            .map_err(|error| QueueManagerError::Engine(error.into()))?;
+        let url = format!("http://{addr}/file.bin");
+        seed_download_with_url(&harness, 1, DownloadStatus::Paused, url.clone()).await;
+        seed_download_with_url(&harness, 2, DownloadStatus::Paused, url).await;
+        let (handle, task) = QueueManagerHandle::spawn(
+            harness.downloads.clone(),
+            harness.queues.clone(),
+            harness.engine.clone(),
+            harness.engine.subscribe(),
+            QueueManagerOptions::default(),
+        );
+        let id = handle.create("Later").await?;
+        handle
+            .move_downloads(id, vec![DownloadId::new(1), DownloadId::new(2)])
+            .await?;
+        harness.engine.resume(DownloadId::new(1)).await?;
+        assert!(!find(&handle, id).await?.active);
+        assert!(
+            harness.engine.list_active().await?.is_empty(),
+            "resume must not start a stopped queue"
+        );
+        handle.start(id).await?;
+        wait_for_active(&harness, DownloadId::new(1)).await?;
+        assert!(matches!(
+            handle
+                .move_downloads(QueueId::MAIN, vec![DownloadId::new(1)])
+                .await,
+            Err(QueueManagerError::NotMovable(_))
+        ));
+        handle.stop(id).await?;
+        handle.start(id).await?;
+        wait_for_active(&harness, DownloadId::new(1)).await?;
+        assert_eq!(
+            harness
+                .downloads
+                .get(DownloadId::new(2))
+                .await?
+                .expect("paused row")
+                .status,
+            DownloadStatus::Paused
+        );
+        handle.stop(id).await?;
+        stop(&handle, task).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_limit_should_span_queues_and_lower_without_pausing_workers()
+    -> QueueManagerResult<()> {
+        let harness = harness().await?;
+        let addr = black_hole_server()
+            .await
+            .map_err(|error| QueueManagerError::Engine(error.into()))?;
+        for id in 1..=3 {
+            seed_download_with_url(
+                &harness,
+                id,
+                DownloadStatus::Paused,
+                format!("http://{addr}/{id}"),
+            )
+            .await;
+        }
+        let (handle, task) = QueueManagerHandle::spawn(
+            harness.downloads.clone(),
+            harness.queues.clone(),
+            harness.engine.clone(),
+            harness.engine.subscribe(),
+            QueueManagerOptions {
+                global_limit: NonZeroU16::new(2).expect("limit"),
+                ..Default::default()
+            },
+        );
+        let custom = handle.create("Later").await?;
+        handle
+            .configure(
+                custom,
+                "Later".to_owned(),
+                NonZeroU16::new(1).expect("limit"),
+                false,
+            )
+            .await?;
+        handle
+            .move_downloads(custom, vec![DownloadId::new(1), DownloadId::new(2)])
+            .await?;
+        handle.start(custom).await?;
+        for id in 1..=3 {
+            harness.engine.resume(DownloadId::new(id)).await?;
+        }
+        wait_for_active(&harness, DownloadId::new(1)).await?;
+        wait_for_active(&harness, DownloadId::new(3)).await?;
+        assert_eq!(harness.engine.list_active().await?.len(), 2);
+        assert!(
+            !harness
+                .engine
+                .list_active()
+                .await?
+                .contains(&DownloadId::new(2))
+        );
+        handle
+            .set_global_limit(NonZeroU16::new(1).expect("limit"))
+            .await?;
+        assert_eq!(
+            harness.engine.list_active().await?.len(),
+            2,
+            "lowering the limit must not stop workers"
+        );
+        harness.engine.pause(DownloadId::new(1)).await?;
+        assert!(
+            !harness
+                .engine
+                .list_active()
+                .await?
+                .contains(&DownloadId::new(2))
+        );
+        harness.engine.pause(DownloadId::new(3)).await?;
+        wait_for_active(&harness, DownloadId::new(2)).await?;
+        handle.stop(custom).await?;
+        stop(&handle, task).await
+    }
+
+    #[tokio::test]
+    async fn restart_should_keep_membership_order_and_leave_custom_queues_stopped()
+    -> QueueManagerResult<()> {
+        let harness = harness().await?;
+        seed_download(&harness, 1, DownloadStatus::Paused).await;
+        seed_download(&harness, 2, DownloadStatus::Paused).await;
+        let (handle, task) = spawn_queue(&harness, 2).await?;
+        let id = handle.create("Later").await?;
+        handle
+            .move_downloads(id, vec![DownloadId::new(2), DownloadId::new(1)])
+            .await?;
+        handle.start(id).await?;
+        stop(&handle, task).await?;
+        let (handle, task) = spawn_queue(&harness, 2).await?;
+        let snapshot = find(&handle, id).await?;
+        assert_eq!(snapshot.items, vec![DownloadId::new(2), DownloadId::new(1)]);
+        assert!(!snapshot.active);
+        assert!(find(&handle, QueueId::MAIN).await?.active);
         stop(&handle, task).await
     }
 

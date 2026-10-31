@@ -1,3 +1,5 @@
+mod queue_ui;
+
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -121,7 +123,7 @@ impl MainView {
                 let queues = queue_handle.state();
                 let alive = weak
                     .update(cx, |view, cx| {
-                        view.apply_queue_state(queues);
+                        view.apply_queue_state(queues, cx);
                         view.apply_snapshot(snapshot, cx)
                     })
                     .is_ok();
@@ -186,11 +188,18 @@ impl MainView {
     }
 
     /// Stores the latest queue snapshot.
-    fn apply_queue_state(&mut self, queues: Vec<QueueSnapshot>) {
+    fn apply_queue_state(&mut self, queues: Vec<QueueSnapshot>, cx: &mut Context<Self>) {
         if queues == self.queue_state {
             return;
         }
         self.queue_state = queues;
+        if self
+            .selected_queue
+            .is_some_and(|id| !self.queue_state.iter().any(|s| s.queue.id == id))
+        {
+            self.selected_queue = None;
+        }
+        self.recompute(cx);
     }
 
     /// Refreshes detected disk usage at most every [`STORAGE_REFRESH_INTERVAL`].
@@ -225,6 +234,13 @@ impl MainView {
                 let member_ids: std::collections::HashSet<_> =
                     snapshot.items.iter().copied().collect();
                 filtered.retain(|row| member_ids.contains(&row.id));
+                let positions: std::collections::HashMap<_, _> = snapshot
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, id)| (*id, ix))
+                    .collect();
+                filtered.sort_by_key(|row| positions.get(&row.id).copied());
             } else {
                 filtered.clear();
             }
@@ -233,6 +249,9 @@ impl MainView {
         self.active_count = self.cache.iter().filter(|row| row.is_active).count();
         self.total_speed_bps = self.cache.iter().map(|row| row.speed_bps).sum();
         self.table.update(cx, |table, cx| {
+            table
+                .delegate_mut()
+                .set_queue_order(self.selected_queue.is_some());
             table.delegate_mut().set_rows(filtered);
             table.delegate_mut().set_loaded(true);
             table.refresh(cx);
@@ -346,11 +365,9 @@ impl MainView {
 
     /// Filters downloads by queue membership or toggles back to all downloads.
     fn select_queue(&mut self, queue_id: Option<QueueId>, cx: &mut Context<Self>) {
-        if self.selected_queue == queue_id {
-            self.selected_queue = None;
-        } else {
-            self.selected_queue = queue_id;
-        }
+        self.selected_queue = queue_id;
+        self.category = CategoryFilter::All;
+        self.status = StatusFilter::All;
         self.selected = None;
         self.table.update(cx, |table, cx| {
             table.delegate_mut().clear_selection();
@@ -373,7 +390,7 @@ impl MainView {
         cx.notify();
     }
 
-    fn pause_selected(&mut self, cx: &mut Context<Self>) {
+    fn pause_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.target_ids(cx);
         let targets: Vec<_> = {
             let table = self.table.read(cx);
@@ -387,12 +404,13 @@ impl MainView {
                 .collect()
         };
         for id in targets {
-            self.handles.dispatch(EngineCommand::Pause(id));
+            self.handles
+                .dispatch_in(EngineCommand::Pause(id), window, cx);
         }
         cx.notify();
     }
 
-    fn resume_selected(&mut self, cx: &mut Context<Self>) {
+    fn resume_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.target_ids(cx);
         let targets: Vec<_> = {
             let table = self.table.read(cx);
@@ -406,7 +424,8 @@ impl MainView {
                 .collect()
         };
         for id in targets {
-            self.handles.dispatch(EngineCommand::Resume(id));
+            self.handles
+                .dispatch_in(EngineCommand::Resume(id), window, cx);
         }
         cx.notify();
     }
@@ -632,9 +651,15 @@ impl MainView {
         // row — Resume/Pause enable only when a target actually supports the
         // action, so a Finished selection leaves only Remove enabled.
         let targets = self.target_statuses(cx);
+        let has_targets = !targets.is_empty();
+        let reorder_enabled = self.selected_queue.is_some()
+            && self.query.trim().is_empty()
+            && self.selected_id(cx).is_some()
+            && self.table.read(cx).delegate().checked_ids().len() <= 1;
         let all: Vec<DownloadStatus> = self.cache.iter().map(|row| row.status).collect();
         let actions = toolbar_actions(&targets, &all);
         h_flex()
+            .flex_wrap()
             .gap_2()
             .items_center()
             .child(
@@ -646,7 +671,7 @@ impl MainView {
                     .icon(IconName::Play)
                     .label("Resume")
                     .disabled(!actions.can_resume)
-                    .on_click(cx.listener(|this, _, _, cx| this.resume_selected(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.resume_selected(window, cx))),
             )
             .child(
                 Button::new("toolbar-pause")
@@ -657,8 +682,35 @@ impl MainView {
                     .icon(IconName::Pause)
                     .label("Pause")
                     .disabled(!actions.can_pause)
-                    .on_click(cx.listener(|this, _, _, cx| this.pause_selected(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.pause_selected(window, cx))),
             )
+            .child(
+                Button::new("move-to-queue")
+                    .small()
+                    .label("Move to queue…")
+                    .disabled(!has_targets)
+                    .on_click(cx.listener(|this, _, window, cx| this.move_to_queue(window, cx))),
+            )
+            .when(self.selected_queue.is_some(), |this| {
+                this.child(
+                    Button::new("queue-move-up")
+                        .small()
+                        .label("Move up")
+                        .disabled(!reorder_enabled)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.reorder_selected(true, window, cx)
+                        })),
+                )
+                .child(
+                    Button::new("queue-move-down")
+                        .small()
+                        .label("Move down")
+                        .disabled(!reorder_enabled)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.reorder_selected(false, window, cx)
+                        })),
+                )
+            })
             .child(div().flex_1())
             .child(
                 Button::new("toolbar-pause-all")
@@ -746,6 +798,7 @@ impl Render for MainView {
                                     .min_w_0()
                                     .gap_3()
                                     .p_4()
+                                    .child(self.render_queue_header(cx))
                                     .child(self.render_toolbar(cx))
                                     // Hybrid Card-Table: the header renders as a floating rounded island
                                     // with an 8px vertical gap to the body rows, and each row renders as
@@ -979,81 +1032,36 @@ impl SidebarItem for QueueSection {
                     cx.theme().sidebar_foreground
                 };
 
-                let count_badge_bg = if is_active {
-                    cx.theme().sidebar_accent_foreground.opacity(0.15)
-                } else {
-                    cx.theme().muted.opacity(0.8)
-                };
-
-                let item_id = ElementId::NamedInteger("queue-item".into(), queue_id.get() as u64);
-
-                h_flex()
-                    .id(item_id)
+                let item_id = SharedString::from(format!("queue-item-{}", queue_id.get()));
+                let label = format!(
+                    "{name} · {count} · {}",
+                    if running { "Active" } else { "Stopped" }
+                );
+                div()
                     .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .px_2()
-                    .py_1p5()
-                    .rounded(cx.theme().radius)
-                    .text_sm()
-                    .cursor_pointer()
-                    .when(is_active, |this| {
-                        this.font_weight(FontWeight::MEDIUM)
-                            .bg(cx.theme().tokens.sidebar_accent)
-                            .text_color(cx.theme().sidebar_accent_foreground)
-                    })
-                    .when(!is_active, |this| {
-                        this.text_color(cx.theme().sidebar_foreground)
-                            .hover(|this| {
-                                this.bg(cx.theme().sidebar_accent.opacity(0.8))
-                                    .text_color(cx.theme().sidebar_accent_foreground)
-                            })
-                    })
-                    .when(is_collapsed, |this| {
-                        this.justify_center()
-                            .child(Icon::new(IconName::Menu).size_4().text_color(text_color))
-                    })
-                    .when(!is_collapsed, |this| {
-                        this.child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .overflow_hidden()
-                                .child(Icon::new(IconName::Menu).size_4().text_color(text_color))
-                                .child(div().truncate().text_sm().child(name))
-                                .when(running, |this| {
-                                    this.child(
-                                        div().size_1p5().rounded_full().bg(cx.theme().primary),
-                                    )
-                                }),
-                        )
-                        .child(
-                            div()
-                                .px_1p5()
-                                .py_0p5()
-                                .rounded(px(4.))
-                                .bg(count_badge_bg)
-                                .text_xs()
-                                .text_color(if is_active {
-                                    cx.theme().sidebar_accent_foreground
-                                } else {
-                                    cx.theme().muted_foreground
-                                })
-                                .child(format!("{count}")),
-                        )
-                    })
-                    .on_click(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                        view.update(cx, |this, cx| {
-                            this.select_queue(Some(queue_id), cx);
-                        });
-                    })
+                    .child(
+                        Button::new(item_id)
+                            .ghost()
+                            .w_full()
+                            .icon(IconName::Menu)
+                            .when(!is_collapsed, |this| this.label(label.clone()))
+                            .tooltip(label)
+                            .text_color(text_color)
+                            .when(is_active, |this| this.bg(cx.theme().sidebar_accent))
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| this.select_queue(Some(queue_id), cx));
+                            }),
+                    )
                     .can_drop(|payload, _, _| payload.is::<crate::downloads::QueueDrag>())
-                    .on_drop(move |drag: &crate::downloads::QueueDrag, _, _| {
-                        handles.dispatch(EngineCommand::MoveToQueue {
-                            queue_id,
-                            downloads: drag.downloads.clone(),
-                        });
+                    .on_drop(move |drag: &crate::downloads::QueueDrag, window, cx| {
+                        handles.dispatch_in(
+                            EngineCommand::MoveToQueue {
+                                queue_id,
+                                downloads: drag.downloads.clone(),
+                            },
+                            window,
+                            cx,
+                        );
                     })
             }))
     }

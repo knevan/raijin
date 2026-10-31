@@ -8,6 +8,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex,
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use raijin_core::download::{DownloadId, DownloadStatus, FailureKind};
 use raijin_core::monitor::DownloadView;
@@ -555,6 +556,7 @@ pub struct DownloadsDelegate {
     columns: Vec<ColumnDef>,
     sort_column: SortColumn,
     sort_dir: SortDir,
+    queue_order: bool,
     loaded: bool,
     checklist: RowChecklist,
     commands: EngineHandles,
@@ -577,6 +579,7 @@ impl DownloadsDelegate {
             ],
             sort_column: SortColumn::DateAdded,
             sort_dir: SortDir::Descending,
+            queue_order: false,
             loaded: false,
             checklist: RowChecklist::default(),
             commands,
@@ -589,7 +592,9 @@ impl DownloadsDelegate {
     /// Checks for downloads that are no longer visible are dropped, so a
     /// removed or filtered-out row can never stay checked.
     pub fn set_rows(&mut self, mut rows: Vec<DownloadRow>) {
-        sort_rows(&mut rows, self.sort_column, self.sort_dir);
+        if !self.queue_order {
+            sort_rows(&mut rows, self.sort_column, self.sort_dir);
+        }
         self.checklist.retain_visible(rows.iter().map(|row| row.id));
         if let Some(selected) = self.selected_id
             && !rows.iter().any(|row| row.id == selected)
@@ -597,6 +602,10 @@ impl DownloadsDelegate {
             self.selected_id = None;
         }
         self.rows = rows;
+    }
+
+    pub fn set_queue_order(&mut self, enabled: bool) {
+        self.queue_order = enabled;
     }
 
     /// Marks the initial monitor snapshot as received (hides the skeleton).
@@ -635,6 +644,9 @@ impl DownloadsDelegate {
 
     /// Applies a header-click sort and re-sorts the visible rows.
     fn apply_sort(&mut self, column: SortColumn, dir: SortDir) {
+        if self.queue_order {
+            return;
+        }
         self.sort_column = column;
         self.sort_dir = dir;
         sort_rows(&mut self.rows, column, dir);
@@ -786,7 +798,7 @@ impl TableDelegate for DownloadsDelegate {
         // NOTE: per-cell card backgrounds were tried and reverted — the row
         // container owns the header paint; rounding belongs to the wrapper
         // in `MainView` (see its comment for the probe evidence).
-        let sorted = SortColumn::from_key(key) == self.sort_column;
+        let sorted = !self.queue_order && SortColumn::from_key(key) == self.sort_column;
         let sort_icon = match (sorted, self.sort_dir) {
             (true, SortDir::Ascending) => Icon::new(IconName::ChevronUp)
                 .xsmall()
@@ -825,7 +837,7 @@ impl TableDelegate for DownloadsDelegate {
                 });
                 cx.stop_propagation();
             })
-            .child(sort_icon)
+            .when(!self.queue_order, |this| this.child(sort_icon))
             .child(name)
             .into_any_element();
         // ABDM-style header select-all box. It lives outside the sort-click
@@ -1159,8 +1171,8 @@ impl TableDelegate for DownloadsDelegate {
         let commands = self.commands.clone();
         let dispatch = move |command: EngineCommand| {
             let commands = commands.clone();
-            move |_: &ClickEvent, _: &mut Window, _: &mut App| {
-                commands.dispatch(command.clone());
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                commands.dispatch_in(command.clone(), window, cx);
             }
         };
 

@@ -22,18 +22,17 @@ jobs:
     env: &benchmark-env
       HOTPATH_BENCHMARK: profile_monitor
       HOTPATH_USER_METADATA: >-
-        runner=Linux-X64,toolchain=1.99.0,profile=deploy,valgrind=3.26.0
+        runner=Linux-X64,toolchain=nightly-2026-10-25,profile=deploy,valgrind=3.26.0
       HOTPATH_OUTPUT_FORMAT: json
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       # dtolnay/rust-toolchain master, pinned at setup
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
-          toolchain: "1.99.0"
-      # Swatinem/rust-cache v2.9.3
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+          toolchain: nightly-2026-10-25
+      - uses: Swatinem/rust-cache@v2
       - name: Install valgrind
         run: |
           sudo apt-get update
@@ -76,17 +75,15 @@ jobs:
       contents: read
     env: *benchmark-env
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@v7
         with:
           # The pull request's head commit, not the default merge commit.
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      # dtolnay/rust-toolchain master, pinned at setup
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+      - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.99.0"
-      # Swatinem/rust-cache v2.9.3
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+          toolchain: nightly-2026-10-25
+      - uses: Swatinem/rust-cache@v2
       - name: Install valgrind
         run: |
           sudo apt-get update
@@ -114,8 +111,7 @@ jobs:
             and (.functions_icount.data | length > 0)
             and (.functions_timing.data | length > 0)' \
             report.json > /dev/null
-      # actions/upload-artifact v4.6.2
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@v7
         with:
           name: hotpath-report
           path: report.json

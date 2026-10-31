@@ -16,6 +16,7 @@ use crate::bridge::{EngineCommand, EngineHandles, build_new_download, is_http_ur
 use crate::category::{FileCategory, infer_category};
 use crate::downloads::category_icon;
 use crate::format::format_bytes;
+use crate::queue_picker::QueueChoice;
 
 /// Width of the category dropdown, matching the sketch (300).
 const CATEGORY_DROP_WIDTH: f32 = 300.0;
@@ -52,6 +53,10 @@ pub struct AddDownloadView {
     folder: Entity<InputState>,
     file: Entity<InputState>,
     categories: Entity<SelectState<SearchableVec<SharedString>>>,
+    queues: Entity<SelectState<SearchableVec<QueueChoice>>>,
+    submitting: bool,
+    record_created: bool,
+    submit_error: Option<String>,
     use_category: bool,
     category_root: PathBuf,
     /// True once the user edits the file name by hand (stops URL auto-fill).
@@ -104,6 +109,26 @@ impl AddDownloadView {
                 cx,
             )
         });
+        let snapshots = handles.queues.state();
+        let choices: Vec<_> = if snapshots.is_empty() {
+            vec![QueueChoice::new(
+                raijin_core::download::QueueId::MAIN,
+                "Main",
+            )]
+        } else {
+            snapshots
+                .into_iter()
+                .map(|s| QueueChoice::new(s.queue.id, s.queue.name))
+                .collect()
+        };
+        let queues = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(choices),
+                Some(IndexPath::new(0)),
+                window,
+                cx,
+            )
+        });
         let subscriptions = [
             cx.subscribe_in(&url, window, Self::on_url_event),
             cx.subscribe_in(&folder, window, Self::on_folder_event),
@@ -116,6 +141,10 @@ impl AddDownloadView {
             folder,
             file,
             categories,
+            queues,
+            submitting: false,
+            record_created: false,
+            submit_error: None,
             use_category: true,
             category_root: PathBuf::new(),
             file_manual: false,
@@ -155,7 +184,7 @@ impl AddDownloadView {
 
     /// True when the form may be submitted (URL valid; folder falls back).
     fn is_valid(&self, cx: &App) -> bool {
-        is_http_url_str(&self.url_text(cx))
+        !self.submitting && !self.record_created && is_http_url_str(&self.url_text(cx))
     }
 
     /// Currently selected file category from the dropdown value.
@@ -509,7 +538,15 @@ impl AddDownloadView {
     }
 
     /// Submits the form: `autostart` selects Download (resume) vs Add (idle).
-    fn submit(&self, autostart: bool, window: &mut Window, cx: &mut App) {
+    fn submit(&mut self, autostart: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.submitting || self.record_created {
+            return;
+        }
+        let Some(queue_id) = self.queues.read(cx).selected_value().copied() else {
+            self.submit_error = Some("Choose a queue.".to_owned());
+            cx.notify();
+            return;
+        };
         let url = self.url.read(cx).value().to_string();
         let raw_file = self.file.read(cx).value().to_string();
         let file_name = sanitize_filename(&raw_file);
@@ -527,13 +564,34 @@ impl AddDownloadView {
             Ok(mut request) => {
                 request.category = download_category(self.use_category, self.selected_category(cx));
                 preserve_integration_credentials(&mut request, self.integration.as_ref());
-                let command = if autostart {
-                    EngineCommand::Add(request)
-                } else {
-                    EngineCommand::AddPaused(request)
-                };
-                self.handles.dispatch(command);
-                window.remove_window();
+                self.submitting = true;
+                self.submit_error = None;
+                cx.notify();
+                let weak = cx.entity().downgrade();
+                self.handles.run_in(
+                    EngineCommand::AddToQueue {
+                        request,
+                        queue_id,
+                        autostart,
+                    },
+                    window,
+                    cx,
+                    move |result, window, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.submitting = false;
+                            match result {
+                                Ok(()) => window.remove_window(),
+                                Err(error) => {
+                                view.record_created = error.created_download().is_some();
+                                view.submit_error = Some(if view.record_created {
+                                    format!("{error}. Close this window and use Move to queue in the library; do not add the download again.")
+                                } else { error.to_string() });
+                            }
+                            }
+                            cx.notify();
+                        });
+                    },
+                );
             }
             Err(error) => window.push_notification(error.to_string(), cx),
         }
@@ -767,6 +825,24 @@ impl Render for AddDownloadView {
                     .child(Input::new(&self.file))
                     .child(
                         h_flex()
+                            .gap_3()
+                            .child("Queue")
+                            .child(Select::new(&self.queues).disabled(self.submitting)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                "Queued downloads wait for an active queue and an available slot.",
+                            ),
+                    )
+                    .when_some(self.submit_error.clone(), |this, error| {
+                        this.child(div().text_sm().text_color(cx.theme().danger).child(error))
+                    })
+                    .when(self.submitting, |this| this.child("Adding download…"))
+                    .child(
+                        h_flex()
                             .justify_between()
                             .items_center()
                             .child(
@@ -799,9 +875,9 @@ impl Render for AddDownloadView {
                                         Button::new("add-submit-start")
                                             .primary()
                                             .w(px(170.))
-                                            .label("Download")
+                                            .label("Add to queue")
                                             .disabled(!valid)
-                                            .tooltip("Add and start downloading")
+                                            .tooltip("Add ready to run when the queue admits it")
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.submit(true, window, cx);
                                             })),

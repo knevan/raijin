@@ -371,7 +371,7 @@ impl DiskUsage {
 #[must_use]
 pub fn disk_usage_for(path: &Path) -> Option<DiskUsage> {
     let canonical = normalize_canonical(std::fs::canonicalize(path).ok()?);
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
     let disk = disks
         .iter()
         .filter(|disk| canonical.starts_with(disk.mount_point()))

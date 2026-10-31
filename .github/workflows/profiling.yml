@@ -18,19 +18,17 @@ jobs:
       HOTPATH_OUTPUT_PATH: hotpath-monitor.json
       HOTPATH_OUTPUT_FORMAT: json
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      # dtolnay/rust-toolchain master, pinned at setup
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+      - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.99.0"
+          toolchain: nightly-2026-10-25
       - name: Profile monitor workload
         run: >-
           cargo run --locked --profile deploy -p raijin-core
           --example profile_monitor --features hotpath-alloc
-      # actions/upload-artifact v4.6.2
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@v7
         with:
           name: hotpath-monitor-${{ matrix.os }}
           path: hotpath-monitor.json

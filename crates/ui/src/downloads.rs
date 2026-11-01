@@ -65,6 +65,9 @@ pub const MONITOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 /// the two-line Name and Status layouts while rendering distinct island cards.
 pub const TABLE_ROW_HEIGHT_PX: f32 = 52.0;
 
+/// Height of the floating table header row in pixels.
+pub const TABLE_HEADER_HEIGHT_PX: f32 = 34.0;
+
 /// Table column keys. Also used as stable [`Column`] keys.
 pub mod col {
     /// File name + category cell.
@@ -791,6 +794,9 @@ impl TableDelegate for DownloadsDelegate {
     ) -> impl IntoElement {
         let key = self.column_key(col_ix);
         let name = self.columns[col_ix].name;
+
+        let is_last = col_ix + 1 == self.columns.len();
+
         // Sketch header: sort glyph left of the label in `$text-muted`, label
         // in `$text-secondary`. The table's built-in right-side glyph is
         // disabled, so this is the single sort affordance; the whole header
@@ -842,12 +848,14 @@ impl TableDelegate for DownloadsDelegate {
             .into_any_element();
         // ABDM-style header select-all box. It lives outside the sort-click
         // area so checking all rows never re-sorts the table.
-        if key == col::NAME {
+        let cell_content = if key == col::NAME {
             let header_table = cx.entity();
             let all_checked = self.all_visible_checked();
             let has_rows = !self.rows.is_empty();
             h_flex()
                 .h_full()
+                .flex_1()
+                .min_w_0()
                 .items_center()
                 .gap_2()
                 .pl_3()
@@ -885,13 +893,39 @@ impl TableDelegate for DownloadsDelegate {
         } else if key == col::ADDED {
             h_flex()
                 .h_full()
+                .flex_1()
+                .min_w_0()
                 .items_center()
                 .pr_3()
                 .child(sort_label)
                 .into_any_element()
         } else {
-            sort_label
-        }
+            h_flex()
+                .h_full()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .child(sort_label)
+                .into_any_element()
+        };
+
+        h_flex()
+            .size_full()
+            .items_center()
+            .child(cell_content)
+            .when(!is_last, |this| {
+                // Offset by +8px to align across `render_cell`'s right padding
+                // directly onto the column boundary and resize grab hitbox.
+                this.child(
+                    div()
+                        .w(px(1.))
+                        .h(px(16.))
+                        .bg(cx.theme().border.opacity(0.8))
+                        .flex_shrink_0()
+                        .relative()
+                        .left(px(8.)),
+                )
+            })
     }
 
     fn render_tr(

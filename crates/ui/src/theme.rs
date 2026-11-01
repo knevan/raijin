@@ -79,8 +79,9 @@ pub fn apply_product_theme(cx: &mut App) {
     colors.table_hover = hx(ROW_CARD_HOVER_BG);
     colors.table_active = gpui::transparent_black();
     colors.table_active_border = gpui::transparent_black();
-    // Sketch body rows have no separators. Header dividers use the separate
-    // `border` token, so zeroing only the row token keeps them intact.
+    // Keep `table_row_border` transparent so built-in full-height column
+    // hairlines do not show during idle. Custom 16px inset dividers are
+    // placed in `DownloadsDelegate::render_th`.
     colors.table_row_border = hx(BORDER).opacity(0.0);
     colors.button_primary = hx(ACCENT);
     colors.button_primary_foreground = hx(CTA_INK);

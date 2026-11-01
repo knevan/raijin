@@ -3,10 +3,11 @@ mod queue_ui;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::collapsible::Collapsible as UiCollapsible;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
-use gpui_kit::component::sidebar::{Sidebar, SidebarItem, SidebarMenu, SidebarMenuItem};
+use gpui_kit::component::sidebar::{Sidebar, SidebarItem};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::{
@@ -58,6 +59,8 @@ pub struct MainView {
     category: CategoryFilter,
     status: StatusFilter,
     selected_queue: Option<QueueId>,
+    categories_open: bool,
+    queues_open: bool,
     query: String,
     /// Visible index of the selected row, if any.
     selected: Option<usize>,
@@ -146,6 +149,8 @@ impl MainView {
             category: CategoryFilter::All,
             status: StatusFilter::All,
             selected_queue: None,
+            categories_open: true,
+            queues_open: true,
             query: String::new(),
             selected: None,
             loaded: false,
@@ -340,6 +345,18 @@ impl MainView {
             .filter_map(|id| delegate.row_by_id(*id))
             .map(|row| row.status)
             .collect()
+    }
+
+    /// Toggles the categories accordion expansion in the sidebar.
+    pub fn toggle_categories(&mut self, cx: &mut Context<Self>) {
+        self.categories_open = !self.categories_open;
+        cx.notify();
+    }
+
+    /// Toggles the queues accordion expansion in the sidebar.
+    pub fn toggle_queues(&mut self, cx: &mut Context<Self>) {
+        self.queues_open = !self.queues_open;
+        cx.notify();
     }
 
     /// Applies a category filter from the sidebar, preserving the current status filter.
@@ -561,21 +578,18 @@ impl MainView {
     /// Renders the sidebar with collapsible filter dropdowns and a dedicated
     /// Queues section.
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let filter = ActiveSidebarFilter {
+        let categories_section = CategoriesSection {
             category: self.category,
-            queue: self.selected_queue,
+            selected_queue: self.selected_queue,
+            open: self.categories_open,
+            view: cx.entity(),
+            collapsed: false,
         };
-        let menu = SidebarMenu::new().child(categories_accordion(
-            "All Downloads",
-            IconName::Folder,
-            true,
-            filter,
-            cx,
-        ));
 
         let queue_section = QueueSection {
             queues: self.queue_state.clone(),
             selected_queue: self.selected_queue,
+            open: self.queues_open,
             handles: self.handles.clone(),
             view: cx.entity(),
             collapsed: false,
@@ -595,7 +609,7 @@ impl MainView {
                         this.open_add_window(cx);
                     })),
             )
-            .child(MainSidebarSection::Menu(Box::new(menu)))
+            .child(MainSidebarSection::Categories(Box::new(categories_section)))
             .child(MainSidebarSection::Queues(Box::new(queue_section)))
             .footer(self.render_storage(cx))
     }
@@ -754,9 +768,8 @@ impl MainView {
         let mut unfinished = 0;
         let mut finished = 0;
 
-        let queue_member_ids: Option<std::collections::HashSet<_>> = self
-            .selected_queue
-            .and_then(|qid| {
+        let queue_member_ids: Option<std::collections::HashSet<_>> =
+            self.selected_queue.and_then(|qid| {
                 self.queue_state
                     .iter()
                     .find(|s| s.queue.id == qid)
@@ -794,79 +807,77 @@ impl MainView {
             (StatusFilter::Finished, "Finished", finished_count),
         ];
 
-        h_flex()
-            .items_center()
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .p(px(2.5))
-                    .rounded(px(999.))
-                    .bg(cx.theme().muted.opacity(0.4))
-                    .border_1()
-                    .border_color(cx.theme().border.opacity(0.5))
-                    .children(items.into_iter().map(|(filter, label, count)| {
-                        let is_active = self.status == filter;
-                        let bg_color = if is_active {
-                            cx.theme().primary
-                        } else {
-                            gpui::transparent_black()
-                        };
-                        let text_color = if is_active {
-                            cx.theme().primary_foreground
-                        } else {
-                            cx.theme().muted_foreground
-                        };
-                        let count_bg = if is_active {
-                            cx.theme().primary_foreground.opacity(0.18)
-                        } else {
-                            cx.theme().background.opacity(0.6)
-                        };
-                        let count_text = if is_active {
-                            cx.theme().primary_foreground
-                        } else {
-                            cx.theme().muted_foreground
-                        };
+        h_flex().items_center().child(
+            h_flex()
+                .items_center()
+                .gap(px(2.))
+                .p(px(2.5))
+                .rounded(px(999.))
+                .bg(cx.theme().muted.opacity(0.4))
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.5))
+                .children(items.into_iter().map(|(filter, label, count)| {
+                    let is_active = self.status == filter;
+                    let bg_color = if is_active {
+                        cx.theme().primary
+                    } else {
+                        gpui::transparent_black()
+                    };
+                    let text_color = if is_active {
+                        cx.theme().primary_foreground
+                    } else {
+                        cx.theme().muted_foreground
+                    };
+                    let count_bg = if is_active {
+                        cx.theme().primary_foreground.opacity(0.18)
+                    } else {
+                        cx.theme().background.opacity(0.6)
+                    };
+                    let count_text = if is_active {
+                        cx.theme().primary_foreground
+                    } else {
+                        cx.theme().muted_foreground
+                    };
 
-                        h_flex()
-                            .id(SharedString::from(format!("status-tab-{}", label)))
-                            .items_center()
-                            .gap_1p5()
-                            .px_3()
-                            .py(px(3.5))
-                            .rounded(px(999.))
-                            .bg(bg_color)
-                            .text_color(text_color)
-                            .text_xs()
-                            .font_weight(if is_active {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
+                    h_flex()
+                        .id(SharedString::from(format!("status-tab-{}", label)))
+                        .items_center()
+                        .gap_1p5()
+                        .px_3()
+                        .py(px(3.5))
+                        .rounded(px(999.))
+                        .bg(bg_color)
+                        .text_color(text_color)
+                        .text_xs()
+                        .font_weight(if is_active {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .cursor_pointer()
+                        .when(!is_active, |this| {
+                            this.hover(|style| {
+                                style
+                                    .bg(cx.theme().muted.opacity(0.4))
+                                    .text_color(cx.theme().foreground)
                             })
-                            .cursor_pointer()
-                            .when(!is_active, |this| {
-                                this.hover(|style| {
-                                    style
-                                        .bg(cx.theme().muted.opacity(0.4))
-                                        .text_color(cx.theme().foreground)
-                                })
-                            })
-                            .child(label)
-                            .child(
-                                div()
-                                    .px_1p5()
-                                    .py(px(0.5))
-                                    .rounded_full()
-                                    .bg(count_bg)
-                                    .text_xs()
-                                    .text_color(count_text)
-                                    .child(count.to_string()),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_status_filter(filter, cx);
-                            }))
-                    })),
-            )
+                        })
+                        .child(label)
+                        .child(
+                            div()
+                                .px_1p5()
+                                .py(px(0.5))
+                                .rounded_full()
+                                .bg(count_bg)
+                                .text_xs()
+                                .text_color(count_text)
+                                .child(count.to_string()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_status_filter(filter, cx);
+                        }))
+                })),
+        )
     }
 
     fn render_statusbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -959,89 +970,253 @@ impl Render for MainView {
     }
 }
 
-/// Active sidebar filter state passed to menu builders.
-#[derive(Clone, Copy)]
-struct ActiveSidebarFilter {
+/// Dedicated sidebar section for managing and filtering category downloads.
+#[derive(Clone)]
+struct CategoriesSection {
     category: CategoryFilter,
-    queue: Option<QueueId>,
+    selected_queue: Option<QueueId>,
+    open: bool,
+    view: Entity<MainView>,
+    collapsed: bool,
 }
 
-/// Builds the sidebar category filter dropdown.
-///
-/// Parent clicks select all categories and toggle dropdown expansion;
-/// child clicks select one category within it.
-fn categories_accordion(
-    label: &'static str,
-    icon: IconName,
-    open: bool,
-    filter: ActiveSidebarFilter,
-    cx: &mut Context<MainView>,
-) -> SidebarMenuItem {
-    let is_parent_active = matches!(filter.category, CategoryFilter::All) && filter.queue.is_none();
+impl Collapsible for CategoriesSection {
+    fn is_collapsed(&self) -> bool {
+        self.collapsed
+    }
 
-    let parent_text_color = if is_parent_active {
-        cx.theme().sidebar_accent_foreground
-    } else {
-        cx.theme().sidebar_foreground
-    };
+    fn collapsed(mut self, collapsed: bool) -> Self {
+        self.collapsed = collapsed;
+        self
+    }
+}
 
-    SidebarMenuItem::new(label)
-        .icon(Icon::new(icon).text_color(parent_text_color))
-        .label_style(StyleRefinement::default().text_color(parent_text_color))
-        .active(is_parent_active)
-        .text_color(parent_text_color)
-        .default_open(open)
-        .click_to_toggle(true)
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.set_category_filter(CategoryFilter::All, cx);
-        }))
-        .children(
-            FileCategory::all()
-                .into_iter()
-                .chain([FileCategory::General])
-                .map(|item| {
-                    let is_child_active = filter.queue.is_none()
-                        && matches!(
-                            filter.category,
-                            CategoryFilter::Category(current) if current == item
-                        );
+impl SidebarItem for CategoriesSection {
+    fn render(
+        self,
+        id: impl Into<ElementId>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        let id = id.into();
+        let is_collapsed = self.collapsed;
+        let is_open = !is_collapsed && self.open;
+        let is_parent_active =
+            matches!(self.category, CategoryFilter::All) && self.selected_queue.is_none();
 
-                    let child_text_color = if is_child_active {
-                        cx.theme().sidebar_accent_foreground
+        let header_text_color = if is_parent_active {
+            cx.theme().foreground
+        } else {
+            cx.theme().sidebar_foreground
+        };
+
+        let view_click = self.view.clone();
+        let view_toggle = self.view.clone();
+
+        let header = h_flex()
+            .id("categories-header")
+            .w_full()
+            .h(px(30.))
+            .items_center()
+            .rounded_md()
+            .cursor_pointer()
+            .overflow_hidden()
+            .when(!is_parent_active, |this| {
+                this.hover(|this| {
+                    this.bg(cx.theme().list_hover)
+                        .text_color(cx.theme().foreground)
+                })
+            })
+            .when(is_parent_active, |this| {
+                this.font_weight(FontWeight::MEDIUM)
+                    .bg(cx.theme().list_active)
+                    .text_color(cx.theme().foreground)
+            })
+            .when(is_collapsed, |this| {
+                this.justify_center().child(
+                    Icon::new(IconName::Folder)
+                        .size_4()
+                        .text_color(header_text_color),
+                )
+            })
+            .when(!is_collapsed, |this| {
+                this.child(
+                    div()
+                        .w(px(3.0))
+                        .h(px(15.0))
+                        .rounded_full()
+                        .when(is_parent_active, |this| this.bg(cx.theme().info))
+                        .when(!is_parent_active, |this| this.bg(gpui::transparent_black())),
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_2()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::Folder)
+                                        .size_4()
+                                        .text_color(header_text_color),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(header_text_color)
+                                        .child("All Downloads"),
+                                ),
+                        )
+                        .child(
+                            Button::new("categories-caret")
+                                .xsmall()
+                                .ghost()
+                                .icon(
+                                    Icon::new(IconName::ChevronRight)
+                                        .size_4()
+                                        .when(is_open, |this| {
+                                            this.rotate(percentage(90. / 360.))
+                                        }),
+                                )
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    view_toggle.update(cx, |this, cx| this.toggle_categories(cx));
+                                }),
+                        ),
+                )
+            })
+            .on_click(move |_, _, cx| {
+                view_click.update(cx, |this, cx| {
+                    let was_active = matches!(this.category, CategoryFilter::All)
+                        && this.selected_queue.is_none();
+                    this.set_category_filter(CategoryFilter::All, cx);
+                    if was_active {
+                        this.toggle_categories(cx);
                     } else {
-                        cx.theme().sidebar_foreground
-                    };
+                        this.categories_open = true;
+                        cx.notify();
+                    }
+                });
+            });
 
-                    SidebarMenuItem::new(item.label())
-                        .icon(Icon::new(category_icon(item)).text_color(child_text_color))
-                        .label_style(StyleRefinement::default().text_color(child_text_color))
-                        .active(is_child_active)
-                        .text_color(child_text_color)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_category_filter(CategoryFilter::Category(item), cx);
-                        }))
-                }),
+        let view_items = self.view.clone();
+        let current_category = self.category;
+        let selected_queue = self.selected_queue;
+
+        let submenu = v_flex()
+            .id("categories-submenu")
+            .w_full()
+            .gap(px(2.))
+            .pt(px(2.))
+            .children(
+                FileCategory::all()
+                    .into_iter()
+                    .chain([FileCategory::General])
+                    .map(move |item| {
+                        let is_child_active = selected_queue.is_none()
+                            && matches!(
+                                current_category,
+                                CategoryFilter::Category(current) if current == item
+                            );
+
+                        let child_text_color = if is_child_active {
+                            cx.theme().foreground
+                        } else {
+                            cx.theme().sidebar_foreground
+                        };
+
+                        let view = view_items.clone();
+
+                        h_flex()
+                            .id(SharedString::from(format!("cat-{}", item.label())))
+                            .w_full()
+                            .h(px(28.))
+                            .items_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .overflow_hidden()
+                            .when(!is_child_active, |this| {
+                                this.hover(|this| {
+                                    this.bg(cx.theme().list_hover)
+                                        .text_color(cx.theme().foreground)
+                                })
+                            })
+                            .when(is_child_active, |this| {
+                                this.font_weight(FontWeight::MEDIUM)
+                                    .bg(cx.theme().list_active)
+                                    .text_color(cx.theme().foreground)
+                            })
+                            .child(
+                                div()
+                                    .w(px(3.0))
+                                    .h(px(14.0))
+                                    .rounded_full()
+                                    .when(is_child_active, |this| this.bg(cx.theme().info))
+                                    .when(!is_child_active, |this| {
+                                        this.bg(gpui::transparent_black())
+                                    }),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .items_center()
+                                    .gap_2()
+                                    .pl_4()
+                                    .pr_2()
+                                    .child(
+                                        Icon::new(category_icon(item))
+                                            .size_4()
+                                            .text_color(child_text_color),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(child_text_color)
+                                            .child(item.label()),
+                                    ),
+                            )
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.set_category_filter(CategoryFilter::Category(item), cx);
+                                });
+                            })
+                    }),
+            );
+
+        v_flex().id(id).w_full().child(
+            UiCollapsible::new()
+                .motion_id("categories-motion")
+                .open(is_open)
+                .child(header)
+                .content(submenu),
         )
+    }
 }
 
 /// Top-level section items rendered in the main navigation sidebar.
 #[derive(Clone)]
 enum MainSidebarSection {
-    Menu(Box<SidebarMenu>),
+    Categories(Box<CategoriesSection>),
     Queues(Box<QueueSection>),
 }
 
 impl Collapsible for MainSidebarSection {
     fn is_collapsed(&self) -> bool {
         match self {
-            Self::Menu(menu) => menu.is_collapsed(),
+            Self::Categories(categories) => categories.is_collapsed(),
             Self::Queues(queues) => queues.is_collapsed(),
         }
     }
 
     fn collapsed(self, collapsed: bool) -> Self {
         match self {
-            Self::Menu(menu) => Self::Menu(Box::new(menu.collapsed(collapsed))),
+            Self::Categories(categories) => {
+                Self::Categories(Box::new(categories.collapsed(collapsed)))
+            }
             Self::Queues(queues) => Self::Queues(Box::new(queues.collapsed(collapsed))),
         }
     }
@@ -1056,7 +1231,7 @@ impl SidebarItem for MainSidebarSection {
     ) -> impl IntoElement {
         let id = id.into();
         match self {
-            Self::Menu(menu) => menu.render(id, window, cx).into_any_element(),
+            Self::Categories(categories) => categories.render(id, window, cx).into_any_element(),
             Self::Queues(queues) => queues.render(id, window, cx).into_any_element(),
         }
     }
@@ -1067,6 +1242,7 @@ impl SidebarItem for MainSidebarSection {
 struct QueueSection {
     queues: Vec<QueueSnapshot>,
     selected_queue: Option<QueueId>,
+    open: bool,
     handles: EngineHandles,
     view: Entity<MainView>,
     collapsed: bool,
@@ -1092,51 +1268,133 @@ impl SidebarItem for QueueSection {
     ) -> impl IntoElement {
         let id = id.into();
         let is_collapsed = self.collapsed;
+        let is_open = !is_collapsed && self.open;
 
-        v_flex()
-            .id(id)
+        let view_toggle = self.view.clone();
+        let view_click = self.view.clone();
+        let view_add = self.view.clone();
+
+        let header = h_flex()
+            .id("queues-header")
             .w_full()
-            .gap_1()
-            .pt_2()
+            .h(px(30.))
+            .items_center()
+            .rounded_md()
+            .cursor_pointer()
+            .overflow_hidden()
+            .hover(|this| {
+                this.bg(cx.theme().list_hover)
+                    .text_color(cx.theme().foreground)
+            })
+            .when(is_collapsed, |this| {
+                this.justify_center().child(
+                    Icon::new(IconName::Menu)
+                        .size_4()
+                        .text_color(cx.theme().sidebar_foreground),
+                )
+            })
             .when(!is_collapsed, |this| {
                 this.child(
+                    div()
+                        .w(px(3.0))
+                        .h(px(15.0))
+                        .rounded_full()
+                        .bg(gpui::transparent_black()),
+                )
+                .child(
                     h_flex()
-                        .px_2()
-                        .h_6()
+                        .flex_1()
                         .items_center()
                         .justify_between()
+                        .gap_2()
+                        .px_2()
                         .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.6))
-                                .child("QUEUES"),
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::Menu)
+                                        .size_4()
+                                        .text_color(cx.theme().sidebar_foreground),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().sidebar_foreground)
+                                        .child("Queues"),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    Button::new("add-queue-header")
+                                        .xsmall()
+                                        .ghost()
+                                        .icon(IconName::Plus)
+                                        .tooltip("New queue")
+                                        .on_click(move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            view_add
+                                                .update(cx, |this, cx| this.new_queue(window, cx));
+                                        }),
+                                )
+                                .child(
+                                    Button::new("queues-caret")
+                                        .xsmall()
+                                        .ghost()
+                                        .icon(
+                                            Icon::new(IconName::ChevronRight)
+                                                .size_4()
+                                                .when(is_open, |this| {
+                                                    this.rotate(percentage(90. / 360.))
+                                                }),
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            view_toggle
+                                                .update(cx, |this, cx| this.toggle_queues(cx));
+                                        }),
+                                ),
                         ),
                 )
             })
+            .on_click(move |_, _, cx| {
+                view_click.update(cx, |this, cx| this.toggle_queues(cx));
+            });
+
+        let view_items = self.view.clone();
+        let selected_queue = self.selected_queue;
+        let handles = self.handles.clone();
+
+        let submenu = v_flex()
+            .id("queues-submenu")
+            .w_full()
+            .gap(px(2.))
+            .pt(px(2.))
             .when(self.queues.is_empty(), |this| {
-                this.when(!is_collapsed, |this| {
-                    this.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("No queues"),
-                    )
-                })
+                this.child(
+                    div()
+                        .w_full()
+                        .pl_5()
+                        .py_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No queues"),
+                )
             })
-            .children(self.queues.into_iter().map(|snapshot| {
+            .children(self.queues.into_iter().map(move |snapshot| {
                 let queue_id = snapshot.queue.id;
                 let count = snapshot.items.len();
                 let running = snapshot.active;
-                let is_active = self.selected_queue == Some(queue_id);
+                let is_active = selected_queue == Some(queue_id);
                 let name = snapshot.queue.name;
-                let handles = self.handles.clone();
-                let view = self.view.clone();
+                let handles = handles.clone();
+                let view = view_items.clone();
 
-                let text_color = if is_active {
-                    cx.theme().sidebar_accent_foreground
+                let row_text_color = if is_active {
+                    cx.theme().foreground
                 } else {
                     cx.theme().sidebar_foreground
                 };
@@ -1146,21 +1404,51 @@ impl SidebarItem for QueueSection {
                     "{name} · {count} · {}",
                     if running { "Active" } else { "Stopped" }
                 );
-                div()
+
+                h_flex()
+                    .id(item_id)
                     .w_full()
+                    .h(px(28.))
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .overflow_hidden()
+                    .when(!is_active, |this| {
+                        this.hover(|this| {
+                            this.bg(cx.theme().list_hover)
+                                .text_color(cx.theme().foreground)
+                        })
+                    })
+                    .when(is_active, |this| {
+                        this.font_weight(FontWeight::MEDIUM)
+                            .bg(cx.theme().list_active)
+                            .text_color(cx.theme().foreground)
+                    })
                     .child(
-                        Button::new(item_id)
-                            .ghost()
-                            .w_full()
-                            .icon(IconName::Menu)
-                            .when(!is_collapsed, |this| this.label(label.clone()))
-                            .tooltip(label)
-                            .text_color(text_color)
-                            .when(is_active, |this| this.bg(cx.theme().sidebar_accent))
-                            .on_click(move |_, _, cx| {
-                                view.update(cx, |this, cx| this.select_queue(Some(queue_id), cx));
-                            }),
+                        div()
+                            .w(px(3.0))
+                            .h(px(14.0))
+                            .rounded_full()
+                            .when(is_active, |this| this.bg(cx.theme().info))
+                            .when(!is_active, |this| this.bg(gpui::transparent_black())),
                     )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .items_center()
+                            .gap_2()
+                            .pl_4()
+                            .pr_2()
+                            .child(
+                                Icon::new(IconName::Menu)
+                                    .size_4()
+                                    .text_color(row_text_color),
+                            )
+                            .child(div().text_sm().text_color(row_text_color).child(label)),
+                    )
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| this.select_queue(Some(queue_id), cx));
+                    })
                     .can_drop(|payload, _, _| payload.is::<crate::downloads::QueueDrag>())
                     .on_drop(move |drag: &crate::downloads::QueueDrag, window, cx| {
                         handles.dispatch_in(
@@ -1172,6 +1460,14 @@ impl SidebarItem for QueueSection {
                             cx,
                         );
                     })
-            }))
+            }));
+
+        v_flex().id(id).w_full().pt(px(6.)).child(
+            UiCollapsible::new()
+                .motion_id("queues-motion")
+                .open(is_open)
+                .child(header)
+                .content(submenu),
+        )
     }
 }

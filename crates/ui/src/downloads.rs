@@ -10,10 +10,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use raijin_core::download::{DownloadId, DownloadStatus, FailureKind};
+use raijin_core::download::{DownloadId, DownloadStatus, FailureKind, QueueId};
 use raijin_core::monitor::DownloadView;
 
-use crate::bridge::{EngineCommand, EngineHandles};
+use crate::bridge::{EngineCommand, EngineHandles, QueueAction};
 use crate::category::{CategoryFilter, FileCategory, StatusFilter, infer_category};
 use crate::format::{
     format_bytes, format_eta, format_relative_time, format_speed, progress_percent,
@@ -560,6 +560,7 @@ pub struct DownloadsDelegate {
     sort_column: SortColumn,
     sort_dir: SortDir,
     queue_order: bool,
+    reorderable_queue: Option<QueueId>,
     loaded: bool,
     checklist: RowChecklist,
     commands: EngineHandles,
@@ -583,6 +584,7 @@ impl DownloadsDelegate {
             sort_column: SortColumn::DateAdded,
             sort_dir: SortDir::Descending,
             queue_order: false,
+            reorderable_queue: None,
             loaded: false,
             checklist: RowChecklist::default(),
             commands,
@@ -609,6 +611,10 @@ impl DownloadsDelegate {
 
     pub fn set_queue_order(&mut self, enabled: bool) {
         self.queue_order = enabled;
+    }
+
+    pub fn set_reorderable_queue(&mut self, queue: Option<QueueId>) {
+        self.reorderable_queue = queue;
     }
 
     /// Marks the initial monitor snapshot as received (hides the skeleton).
@@ -732,6 +738,71 @@ impl DownloadsDelegate {
     fn cell_icon(category: FileCategory) -> IconName {
         category_icon(category)
     }
+
+    pub fn handle_row_drop(
+        &mut self,
+        drag: &QueueDrag,
+        target_id: DownloadId,
+        queue_id: QueueId,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let current_order: Vec<DownloadId> = self.rows.iter().map(|r| r.id).collect();
+        let Some(new_order) = reorder_items(&current_order, &drag.downloads, target_id) else {
+            return;
+        };
+        if new_order == current_order {
+            return;
+        }
+
+        let positions: std::collections::HashMap<_, _> = new_order
+            .iter()
+            .enumerate()
+            .map(|(ix, id)| (*id, ix))
+            .collect();
+        self.rows.sort_by_key(|row| positions.get(&row.id).copied());
+
+        self.commands.dispatch_in(
+            EngineCommand::Queue(QueueAction::Reorder {
+                id: queue_id,
+                order: new_order,
+            }),
+            window,
+            cx,
+        );
+    }
+}
+
+/// Calculates the new order of items when `dragged` items are dropped onto `target`.
+#[must_use]
+pub fn reorder_items(
+    items: &[DownloadId],
+    dragged: &[DownloadId],
+    target: DownloadId,
+) -> Option<Vec<DownloadId>> {
+    if dragged.is_empty() || dragged.contains(&target) {
+        return None;
+    }
+    let target_orig_ix = items.iter().position(|id| *id == target)?;
+    let first_dragged_ix = items.iter().position(|id| *id == dragged[0])?;
+
+    let dragged_set: std::collections::HashSet<_> = dragged.iter().copied().collect();
+    let remaining: Vec<DownloadId> = items
+        .iter()
+        .copied()
+        .filter(|id| !dragged_set.contains(id))
+        .collect();
+
+    let target_rem_ix = remaining.iter().position(|id| *id == target)?;
+    let insert_ix = if first_dragged_ix < target_orig_ix {
+        target_rem_ix + 1
+    } else {
+        target_rem_ix
+    };
+
+    let mut result = remaining;
+    result.splice(insert_ix..insert_ix, dragged.iter().copied());
+    Some(result)
 }
 
 impl TableDelegate for DownloadsDelegate {
@@ -991,6 +1062,31 @@ impl TableDelegate for DownloadsDelegate {
                     cx.new(|_| QueueDragPreview::new(label.clone()))
                 },
             );
+
+            if let Some(queue_id) = self.reorderable_queue {
+                let table_drop = table.clone();
+                row_el = row_el
+                    .cursor_grab()
+                    .drag_over::<QueueDrag>(|mut style, _, _, cx| {
+                        style.border_style = Some(gpui::BorderStyle::Dashed);
+                        style.border_color = Some(cx.theme().primary);
+                        style.border_widths.top = Some(px(2.).into());
+                        style.border_widths.bottom = Some(px(2.).into());
+                        style.border_widths.left = Some(px(2.).into());
+                        style.border_widths.right = Some(px(2.).into());
+                        style.background = Some(cx.theme().primary.opacity(0.08).into());
+                        style
+                    })
+                    .can_drop(|payload, _, _| payload.is::<QueueDrag>())
+                    .on_drop(move |drag: &QueueDrag, window, cx| {
+                        table_drop.update(cx, |table, cx| {
+                            table
+                                .delegate_mut()
+                                .handle_row_drop(drag, id, queue_id, window, cx);
+                        });
+                    });
+            }
+
             row_el = row_el.on_click(move |event: &ClickEvent, _: &mut Window, cx: &mut App| {
                 table.update(cx, |table, cx| {
                     table.delegate_mut().select_row(id);
@@ -1607,6 +1703,63 @@ mod tests {
             .expect("selected id must survive sorting");
         assert_eq!(rows[new_ix].file_name, "c.zip");
         assert_eq!(new_ix, 2);
+    }
+
+    #[test]
+    fn reorder_items_should_handle_up_down_and_self_drop() {
+        let items = vec![
+            DownloadId::new(1),
+            DownloadId::new(2),
+            DownloadId::new(3),
+            DownloadId::new(4),
+            DownloadId::new(5),
+        ];
+
+        // Drag 4 onto 2 (move up): 4 is inserted before 2
+        assert_eq!(
+            super::reorder_items(&items, &[DownloadId::new(4)], DownloadId::new(2)),
+            Some(vec![
+                DownloadId::new(1),
+                DownloadId::new(4),
+                DownloadId::new(2),
+                DownloadId::new(3),
+                DownloadId::new(5),
+            ])
+        );
+
+        // Drag 2 onto 4 (move down): 2 is inserted after 4
+        assert_eq!(
+            super::reorder_items(&items, &[DownloadId::new(2)], DownloadId::new(4)),
+            Some(vec![
+                DownloadId::new(1),
+                DownloadId::new(3),
+                DownloadId::new(4),
+                DownloadId::new(2),
+                DownloadId::new(5),
+            ])
+        );
+
+        // Drag onto self: returns None
+        assert!(super::reorder_items(&items, &[DownloadId::new(2)], DownloadId::new(2)).is_none());
+
+        // Empty dragged: returns None
+        assert!(super::reorder_items(&items, &[], DownloadId::new(2)).is_none());
+
+        // Drag multiple items [2, 3] onto 5 (move down)
+        assert_eq!(
+            super::reorder_items(
+                &items,
+                &[DownloadId::new(2), DownloadId::new(3)],
+                DownloadId::new(5),
+            ),
+            Some(vec![
+                DownloadId::new(1),
+                DownloadId::new(4),
+                DownloadId::new(5),
+                DownloadId::new(2),
+                DownloadId::new(3),
+            ])
+        );
     }
 
     fn view(

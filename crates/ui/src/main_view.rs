@@ -5,11 +5,13 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::collapsible::Collapsible as UiCollapsible;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::sidebar::{Sidebar, SidebarItem};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Collapsible, Disableable as _, Icon, IconName, Sizable as _, TitleBar,
     h_flex, v_flex,
@@ -32,6 +34,7 @@ use crate::downloads::{
 use crate::format::{format_bytes, format_speed, now_ms};
 use crate::settings::{SettingsHandles, open_settings_window};
 use crate::tray::TraySession;
+use crate::{ReorderQueueDown, ReorderQueueUp};
 
 /// Default sidebar width in pixels, matching the product sketch.
 const SIDEBAR_WIDTH: f32 = 220.0;
@@ -253,10 +256,19 @@ impl MainView {
         self.visible_count = filtered.len();
         self.active_count = self.cache.iter().filter(|row| row.is_active).count();
         self.total_speed_bps = self.cache.iter().map(|row| row.speed_bps).sum();
+        let reorderable_queue = if self.query.trim().is_empty() && self.status == StatusFilter::All
+        {
+            self.selected_queue
+        } else {
+            None
+        };
         self.table.update(cx, |table, cx| {
             table
                 .delegate_mut()
                 .set_queue_order(self.selected_queue.is_some());
+            table
+                .delegate_mut()
+                .set_reorderable_queue(reorderable_queue);
             table.delegate_mut().set_rows(filtered);
             table.delegate_mut().set_loaded(true);
             table.refresh(cx);
@@ -648,119 +660,217 @@ impl MainView {
             )
             .child(Progress::new("storage-bar").value(fraction).small())
     }
+}
 
+/// Renders a vertical action button for the ABDM-styled toolbar (icon on top, label on bottom).
+fn toolbar_button(
+    id: impl Into<ElementId>,
+    icon: impl Into<Icon>,
+    label: &'static str,
+    disabled: bool,
+    tooltip: Option<&'static str>,
+    cx: &App,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let text_color = if disabled {
+        cx.theme().muted_foreground.opacity(0.4)
+    } else {
+        cx.theme().foreground
+    };
+    let icon_color = if disabled {
+        cx.theme().muted_foreground.opacity(0.4)
+    } else {
+        cx.theme().foreground
+    };
+
+    v_flex()
+        .id(id.into())
+        .items_center()
+        .justify_center()
+        .gap(px(2.))
+        .py_1()
+        .px(px(6.))
+        .min_w(px(54.))
+        .h(px(48.))
+        .rounded_md()
+        .when(!disabled, |this| {
+            this.cursor_pointer()
+                .hover(|s| {
+                    s.bg(cx.theme().list_hover)
+                        .text_color(cx.theme().foreground)
+                })
+                .active(|s| s.bg(cx.theme().list_active))
+                .on_click(on_click)
+        })
+        .when(disabled, |this| this.cursor_not_allowed())
+        .when_some(tooltip, |this, tip| {
+            this.tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        })
+        .child(icon.into().size(px(18.)).text_color(icon_color))
+        .child(div().text_xs().text_color(text_color).child(label))
+}
+
+/// Subtle vertical divider separating toolbar action groups.
+fn toolbar_divider(cx: &App) -> impl IntoElement {
+    div()
+        .w(px(1.0))
+        .h(px(24.0))
+        .self_center()
+        .mx(px(2.0))
+        .bg(cx.theme().border.opacity(0.6))
+}
+
+impl MainView {
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Toolbar acts on the checked set when non-empty, else the current
-        // row — Resume/Pause enable only when a target actually supports the
-        // action, so a Finished selection leaves only Remove enabled.
         let targets = self.target_statuses(cx);
         let has_targets = !targets.is_empty();
-        let reorder_enabled = self.selected_queue.is_some()
-            && self.query.trim().is_empty()
-            && self.selected_id(cx).is_some()
-            && self.table.read(cx).delegate().checked_ids().len() <= 1;
         let all: Vec<DownloadStatus> = self.cache.iter().map(|row| row.status).collect();
         let actions = toolbar_actions(&targets, &all);
+
+        let (all_count, unfinished_count, finished_count) = self.status_counts();
+        let current_status = self.status;
+        let view = cx.entity();
+
+        let (active_label, active_count) = match current_status {
+            StatusFilter::All => ("All", all_count),
+            StatusFilter::Unfinished => ("Downloading", unfinished_count),
+            StatusFilter::Finished => ("Finished", finished_count),
+        };
+
+        let status_dropdown = {
+            let view_all = view.clone();
+            let view_unf = view.clone();
+            let view_fin = view;
+            Button::new("status-filter-dropdown")
+                .ghost()
+                .small()
+                .icon(Icon::new(gpui_kit::assets::IconName::ListFilter))
+                .label(format!("{active_label} ({active_count})"))
+                .dropdown_caret(true)
+                .tooltip("Filter by status")
+                .dropdown_menu(move |menu, _window, _cx| {
+                    let view_all = view_all.clone();
+                    let view_unf = view_unf.clone();
+                    let view_fin = view_fin.clone();
+                    menu.item(
+                        PopupMenuItem::new(format!("All ({all_count})"))
+                            .checked(current_status == StatusFilter::All)
+                            .on_click(move |_, _, cx| {
+                                view_all.update(cx, |this, cx| {
+                                    this.set_status_filter(StatusFilter::All, cx);
+                                });
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(format!("Downloading ({unfinished_count})"))
+                            .checked(current_status == StatusFilter::Unfinished)
+                            .on_click(move |_, _, cx| {
+                                view_unf.update(cx, |this, cx| {
+                                    this.set_status_filter(StatusFilter::Unfinished, cx);
+                                });
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(format!("Finished ({finished_count})"))
+                            .checked(current_status == StatusFilter::Finished)
+                            .on_click(move |_, _, cx| {
+                                view_fin.update(cx, |this, cx| {
+                                    this.set_status_filter(StatusFilter::Finished, cx);
+                                });
+                            }),
+                    )
+                })
+        };
+
         h_flex()
             .flex_wrap()
-            .gap_2()
+            .gap(px(2.))
             .items_center()
-            .child(
-                Button::new("toolbar-resume")
-                    .secondary()
-                    .outline()
-                    .small()
-                    .rounded(px(999.))
-                    .icon(IconName::Play)
-                    .label("Resume")
-                    .disabled(!actions.can_resume)
-                    .on_click(cx.listener(|this, _, window, cx| this.resume_selected(window, cx))),
-            )
-            .child(
-                Button::new("toolbar-pause")
-                    .secondary()
-                    .outline()
-                    .small()
-                    .rounded(px(999.))
-                    .icon(IconName::Pause)
-                    .label("Pause")
-                    .disabled(!actions.can_pause)
-                    .on_click(cx.listener(|this, _, window, cx| this.pause_selected(window, cx))),
-            )
-            .child(
-                Button::new("move-to-queue")
-                    .small()
-                    .label("Move to queue…")
-                    .disabled(!has_targets)
-                    .on_click(cx.listener(|this, _, window, cx| this.move_to_queue(window, cx))),
-            )
-            .child(
-                Button::new("new-queue")
-                    .small()
-                    .label("New queue…")
-                    .on_click(cx.listener(|this, _, window, cx| this.new_queue(window, cx))),
-            )
-            .when(self.selected_queue.is_some(), |this| {
-                this.child(
-                    Button::new("queue-move-up")
-                        .small()
-                        .label("Move up")
-                        .disabled(!reorder_enabled)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.reorder_selected(true, window, cx)
-                        })),
-                )
-                .child(
-                    Button::new("queue-move-down")
-                        .small()
-                        .label("Move down")
-                        .disabled(!reorder_enabled)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.reorder_selected(false, window, cx)
-                        })),
-                )
-            })
+            .p(px(2.5))
+            .rounded_lg()
+            .bg(cx.theme().muted.opacity(0.3))
+            .border_1()
+            .border_color(cx.theme().border.opacity(0.5))
+            // Group 1: Item Actions
+            .child(toolbar_button(
+                "toolbar-resume",
+                IconName::Play,
+                "Resume",
+                !actions.can_resume,
+                Some("Resume selected download"),
+                cx,
+                cx.listener(|this, _, window, cx| this.resume_selected(window, cx)),
+            ))
+            .child(toolbar_button(
+                "toolbar-pause",
+                IconName::Pause,
+                "Pause",
+                !actions.can_pause,
+                Some("Pause selected download"),
+                cx,
+                cx.listener(|this, _, window, cx| this.pause_selected(window, cx)),
+            ))
+            // Divider 1
+            .child(toolbar_divider(cx))
+            // Group 2: Queue Management
+            .child(toolbar_button(
+                "move-to-queue",
+                Icon::new(gpui_kit::assets::IconName::SquareArrowRight),
+                "Move to queue",
+                !has_targets,
+                Some("Move selected download(s) to a queue"),
+                cx,
+                cx.listener(|this, _, window, cx| this.move_to_queue(window, cx)),
+            ))
+            .child(toolbar_button(
+                "new-queue",
+                Icon::new(gpui_kit::assets::IconName::LayersPlus),
+                "New queue",
+                false,
+                Some("Create a new download queue"),
+                cx,
+                cx.listener(|this, _, window, cx| this.new_queue(window, cx)),
+            ))
+            // Divider 2
+            .child(toolbar_divider(cx))
+            // Group 3: Global Actions
+            .child(toolbar_button(
+                "toolbar-pause-all",
+                gpui_kit::assets::IconName::CirclePause,
+                "Stop all",
+                !actions.can_pause_all,
+                Some("Pause all active downloads"),
+                cx,
+                cx.listener(|this, _, _, cx| this.pause_all(cx)),
+            ))
+            .child(toolbar_button(
+                "toolbar-remove",
+                gpui_kit::assets::IconName::Trash,
+                "Delete",
+                !actions.can_remove,
+                Some("Remove selected download(s)"),
+                cx,
+                cx.listener(|this, _, _, cx| this.remove_selected(cx)),
+            ))
+            // Divider 3
+            .child(toolbar_divider(cx))
+            // Spacer to keep view filter and settings on the right
             .child(div().flex_1())
-            .child(
-                Button::new("toolbar-pause-all")
-                    .secondary()
-                    .outline()
-                    .small()
-                    .w(px(36.))
-                    .h(px(36.))
-                    .rounded(px(10.))
-                    .icon(gpui_kit::assets::IconName::CirclePause)
-                    .tooltip("Pause all active downloads")
-                    .disabled(!actions.can_pause_all)
-                    .on_click(cx.listener(|this, _, _, cx| this.pause_all(cx))),
-            )
-            .child(
-                Button::new("toolbar-remove")
-                    .secondary()
-                    .outline()
-                    .small()
-                    .w(px(36.))
-                    .h(px(36.))
-                    .rounded(px(10.))
-                    .icon(gpui_kit::assets::IconName::Trash)
-                    .tooltip("Remove selected download")
-                    .disabled(!actions.can_remove)
-                    .on_click(cx.listener(|this, _, _, cx| this.remove_selected(cx))),
-            )
-            .child(
-                Button::new("toolbar-settings")
-                    .secondary()
-                    .outline()
-                    .small()
-                    .w(px(36.))
-                    .h(px(36.))
-                    .rounded(px(10.))
-                    .icon(IconName::Settings)
-                    .tooltip("Settings")
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        open_settings_window(cx, &this.settings);
-                    })),
-            )
+            // Status Filter Dropdown
+            .child(status_dropdown)
+            .child(toolbar_divider(cx))
+            // Group 5: Settings
+            .child(toolbar_button(
+                "toolbar-settings",
+                IconName::Settings,
+                "Settings",
+                false,
+                Some("Settings"),
+                cx,
+                cx.listener(|this, _, _window, cx| {
+                    open_settings_window(cx, &this.settings);
+                }),
+            ))
     }
 
     fn status_counts(&self) -> (usize, usize, usize) {
@@ -798,88 +908,6 @@ impl MainView {
         (all, unfinished, finished)
     }
 
-    fn render_status_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (all_count, unfinished_count, finished_count) = self.status_counts();
-
-        let items = [
-            (StatusFilter::All, "All", all_count),
-            (StatusFilter::Unfinished, "Downloading", unfinished_count),
-            (StatusFilter::Finished, "Finished", finished_count),
-        ];
-
-        h_flex().items_center().child(
-            h_flex()
-                .items_center()
-                .gap(px(2.))
-                .p(px(2.5))
-                .rounded(px(999.))
-                .bg(cx.theme().muted.opacity(0.4))
-                .border_1()
-                .border_color(cx.theme().border.opacity(0.5))
-                .children(items.into_iter().map(|(filter, label, count)| {
-                    let is_active = self.status == filter;
-                    let bg_color = if is_active {
-                        cx.theme().primary
-                    } else {
-                        gpui::transparent_black()
-                    };
-                    let text_color = if is_active {
-                        cx.theme().primary_foreground
-                    } else {
-                        cx.theme().muted_foreground
-                    };
-                    let count_bg = if is_active {
-                        cx.theme().primary_foreground.opacity(0.18)
-                    } else {
-                        cx.theme().background.opacity(0.6)
-                    };
-                    let count_text = if is_active {
-                        cx.theme().primary_foreground
-                    } else {
-                        cx.theme().muted_foreground
-                    };
-
-                    h_flex()
-                        .id(SharedString::from(format!("status-tab-{}", label)))
-                        .items_center()
-                        .gap_1p5()
-                        .px_3()
-                        .py(px(3.5))
-                        .rounded(px(999.))
-                        .bg(bg_color)
-                        .text_color(text_color)
-                        .text_xs()
-                        .font_weight(if is_active {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::NORMAL
-                        })
-                        .cursor_pointer()
-                        .when(!is_active, |this| {
-                            this.hover(|style| {
-                                style
-                                    .bg(cx.theme().muted.opacity(0.4))
-                                    .text_color(cx.theme().foreground)
-                            })
-                        })
-                        .child(label)
-                        .child(
-                            div()
-                                .px_1p5()
-                                .py(px(0.5))
-                                .rounded_full()
-                                .bg(count_bg)
-                                .text_xs()
-                                .text_color(count_text)
-                                .child(count.to_string()),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_status_filter(filter, cx);
-                        }))
-                })),
-        )
-    }
-
     fn render_statusbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let speed = if self.total_speed_bps == 0 {
             "Idle".to_owned()
@@ -905,6 +933,12 @@ impl Render for MainView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .on_action(cx.listener(|this, _: &ReorderQueueUp, window, cx| {
+                this.reorder_selected(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ReorderQueueDown, window, cx| {
+                this.reorder_selected(false, window, cx);
+            }))
             .child(self.render_titlebar(window, cx))
             .child(
                 div().flex_1().min_h_0().child(
@@ -928,7 +962,6 @@ impl Render for MainView {
                                         this.child(banner)
                                     })
                                     .child(self.render_toolbar(cx))
-                                    .child(self.render_status_selector(cx))
                                     .child({
                                         let view = cx.entity();
                                         div()
@@ -1078,9 +1111,7 @@ impl SidebarItem for CategoriesSection {
                                 .icon(
                                     Icon::new(IconName::ChevronRight)
                                         .size_4()
-                                        .when(is_open, |this| {
-                                            this.rotate(percentage(90. / 360.))
-                                        }),
+                                        .when(is_open, |this| this.rotate(percentage(90. / 360.))),
                                 )
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
@@ -1165,7 +1196,7 @@ impl SidebarItem for CategoriesSection {
                                     .flex_1()
                                     .items_center()
                                     .gap_2()
-                                    .pl_4()
+                                    .pl_7()
                                     .pr_2()
                                     .child(
                                         Icon::new(category_icon(item))
@@ -1377,7 +1408,7 @@ impl SidebarItem for QueueSection {
                 this.child(
                     div()
                         .w_full()
-                        .pl_5()
+                        .pl_7()
                         .py_1()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
@@ -1437,7 +1468,7 @@ impl SidebarItem for QueueSection {
                             .flex_1()
                             .items_center()
                             .gap_2()
-                            .pl_4()
+                            .pl_7()
                             .pr_2()
                             .child(
                                 Icon::new(IconName::Menu)

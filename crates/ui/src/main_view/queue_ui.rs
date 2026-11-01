@@ -251,6 +251,9 @@ impl MainView {
     }
 
     pub(super) fn reorder_selected(&self, up: bool, window: &mut Window, cx: &mut App) {
+        if !self.query.trim().is_empty() || self.status != StatusFilter::All {
+            return;
+        }
         let Some(id) = self.selected_id(cx) else {
             return;
         };

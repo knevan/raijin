@@ -56,6 +56,8 @@ gpui_kit::actions!(
     ]
 );
 
+gpui_kit::actions!(queue, [ReorderQueueUp, ReorderQueueDown,]);
+
 fn startup_failed(context: &str, error: impl std::fmt::Display) -> ! {
     eprintln!("{}", raijin_core::logging::record_fatal(context, error));
     std::process::exit(1);
@@ -157,6 +159,10 @@ fn main() {
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             gpui_kit::init(cx);
+            cx.bind_keys([
+                KeyBinding::new("alt-up", ReorderQueueUp, None),
+                KeyBinding::new("alt-down", ReorderQueueDown, None),
+            ]);
             Theme::change(ThemeMode::Dark, None, cx);
             crate::theme::apply_product_theme(cx);
             // Freshness marker + effective behavior for close-path diagnosis.

@@ -941,6 +941,9 @@ impl Render for MainView {
                                             )
                                             .child(
                                                 DataTable::new(&self.table)
+                                                    .header_row_height(px(
+                                                        crate::downloads::TABLE_HEADER_HEIGHT_PX,
+                                                    ))
                                                     .with_size(px(
                                                         crate::downloads::TABLE_ROW_HEIGHT_PX,
                                                     ))

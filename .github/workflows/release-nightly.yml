@@ -54,7 +54,7 @@ jobs:
 
   build-extension:
     name: Build Browser Extensions
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: browser-extension
@@ -97,7 +97,7 @@ jobs:
   publish:
     name: Publish Nightly Release
     needs: [build-desktop, build-extension]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:

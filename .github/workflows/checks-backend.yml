@@ -2,9 +2,9 @@ name: Checks/Backend
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    types: [ opened, synchronize, reopened ]
+    types: [opened, synchronize, reopened]
 
 concurrency:
   group: checks-backend-${{ github.ref }}
@@ -13,43 +13,43 @@ concurrency:
 jobs:
   filter-changes:
     name: Filter Changes
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
     outputs:
       backend: ${{ steps.changes.outputs.backend }}
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-    - name: Detect backend changes
-      uses: dorny/paths-filter@v3
-      id: changes
-      with:
-        filters: |
-          backend:
-            - 'crates/**'
-            - 'Cargo.toml'
-            - 'Cargo.lock'
-            - 'rustfmt.toml'
-            - 'rust-toolchain.toml'
-            - '.github/workflows/checks-backend.yml'
+      - name: Detect backend changes
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            backend:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rustfmt.toml'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/checks-backend.yml'
 
   fmt:
     name: Format
     needs: filter-changes
     if: needs.filter-changes.outputs.backend == 'true'
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-    - uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: nightly-2026-10-25
-        components: rustfmt
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-25
+          components: rustfmt
 
-    - name: Check code formatting
-      run: cargo fmt --all --check
+      - name: Check code formatting
+        run: cargo fmt --all --check
 
   clippy:
     name: Clippy
@@ -57,23 +57,23 @@ jobs:
     if: needs.filter-changes.outputs.backend == 'true'
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-    - uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: nightly-2026-10-25
-        components: clippy
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-25
+          components: clippy
 
-    - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@v2
 
-    - name: Lint core
-      run: cargo clippy --all-targets -p raijin-core -- -D warnings
+      - name: Lint core
+        run: cargo clippy --all-targets -p raijin-core -- -D warnings
 
-    - name: Lint UI
-      run: cargo clippy --all-targets -p raijin-ui -- -D warnings
+      - name: Lint UI
+        run: cargo clippy --all-targets -p raijin-ui -- -D warnings
 
-    - name: Check UI compilation
-      run: cargo check -p raijin-ui
+      - name: Check UI compilation
+        run: cargo check -p raijin-ui
 
   test:
     name: Test
@@ -81,11 +81,11 @@ jobs:
     if: needs.filter-changes.outputs.backend == 'true'
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: nightly-2026-10-25
-    - uses: swatinem/rust-cache@v2
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-25
+      - uses: swatinem/rust-cache@v2
 
-    - name: Run Tests raijin-core
-      run: cargo test -p raijin-core
+      - name: Run Tests raijin-core
+        run: cargo test -p raijin-core

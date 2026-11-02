@@ -18,7 +18,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -46,7 +46,7 @@ jobs:
             -Force
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: raijin-windows-x64
           path: raijin-windows-x64.zip
@@ -60,7 +60,7 @@ jobs:
         working-directory: browser-extension
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup pnpm and Node
         uses: pnpm/setup@v2
@@ -88,7 +88,7 @@ jobs:
             dist-extension/raijin-extension-firefox.zip
 
       - name: Upload extension artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: browser-extensions
           path: dist-extension/raijin-extension-*.zip
@@ -102,12 +102,12 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true

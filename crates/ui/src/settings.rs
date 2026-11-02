@@ -29,24 +29,24 @@ const NAV_WIDTH: f32 = 200.0;
 /// One navigable settings group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
-    BrowserIntegration,
     General,
+    BrowserIntegration,
 }
 
 impl Section {
-    const ALL: [Self; 2] = [Self::BrowserIntegration, Self::General];
+    const ALL: [Self; 2] = [Self::General, Self::BrowserIntegration];
 
     const fn label(self) -> &'static str {
         match self {
-            Self::BrowserIntegration => "Browser Integration",
             Self::General => "General",
+            Self::BrowserIntegration => "Browser Integration",
         }
     }
 
     const fn icon(self) -> IconName {
         match self {
-            Self::BrowserIntegration => IconName::Globe,
             Self::General => IconName::Settings,
+            Self::BrowserIntegration => IconName::Globe,
         }
     }
 }
@@ -83,7 +83,12 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    fn new(window: &mut Window, cx: &mut Context<Self>, handles: SettingsHandles) -> Self {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        handles: SettingsHandles,
+        section: Section,
+    ) -> Self {
         let token_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(handles.token.get())
@@ -96,7 +101,7 @@ impl SettingsView {
             .clone();
         Self {
             handles,
-            section: Section::BrowserIntegration,
+            section,
             token_input,
             busy: false,
             previous,
@@ -553,8 +558,9 @@ fn open_settings_at(cx: &mut App, handles: &SettingsHandles, section: Option<Sec
     options.is_resizable = true;
     options.focus = true;
     let handles = handles.clone();
+    let target_section = section.unwrap_or(Section::General);
     match gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(window, cx, handles.clone()))
+        cx.new(|cx| SettingsView::new(window, cx, handles.clone(), target_section))
     }) {
         Ok((any, _)) => {
             *handles

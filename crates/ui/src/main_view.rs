@@ -1,7 +1,9 @@
 mod queue_ui;
+mod queues_dialog;
 
 use std::time::{Duration, Instant};
 
+use gpui::{SpringAnimation, SpringConfig};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::collapsible::Collapsible as UiCollapsible;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -25,7 +27,7 @@ use raijin_core::platform::tray::CloseDecision;
 use raijin_core::queue::QueueSnapshot;
 
 use crate::add_download::open_add_download_window;
-use crate::bridge::{EngineCommand, EngineHandles};
+use crate::bridge::{EngineCommand, EngineHandles, QueueAction};
 use crate::category::{CategoryFilter, FileCategory, StatusFilter};
 use crate::downloads::{
     DownloadRow, DownloadsDelegate, MONITOR_POLL_INTERVAL, build_rows, can_pause, can_resume,
@@ -65,8 +67,7 @@ pub struct MainView {
     categories_open: bool,
     queues_open: bool,
     query: String,
-    /// Visible index of the selected row, if any.
-    selected: Option<usize>,
+    search_focused: bool,
     loaded: bool,
     visible_count: usize,
     active_count: usize,
@@ -155,7 +156,7 @@ impl MainView {
             categories_open: true,
             queues_open: true,
             query: String::new(),
-            selected: None,
+            search_focused: false,
             loaded: false,
             visible_count: 0,
             active_count: 0,
@@ -232,10 +233,6 @@ impl MainView {
 
     /// Rebuilds visible rows from cache + filters, preserving selection by id.
     fn recompute(&mut self, cx: &mut Context<Self>) {
-        let selected_id = self
-            .selected
-            .and_then(|ix| self.table.read(cx).delegate().row(ix))
-            .map(|row| row.id);
         let mut filtered = filter_rows(&self.cache, self.category, self.status, &self.query);
         if let Some(queue_id) = self.selected_queue {
             if let Some(snapshot) = self.queue_state.iter().find(|s| s.queue.id == queue_id) {
@@ -273,8 +270,6 @@ impl MainView {
             table.delegate_mut().set_loaded(true);
             table.refresh(cx);
         });
-        // Restore selection by stable id; drop it when the row filtered out.
-        self.selected = selected_id.and_then(|id| self.table.read(cx).delegate().row_position(id));
         cx.notify();
     }
 
@@ -285,11 +280,21 @@ impl MainView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !matches!(event, InputEvent::Change) {
-            return;
+        match event {
+            InputEvent::Change => {
+                self.query = state.read(cx).value().to_string();
+                self.recompute(cx);
+            }
+            InputEvent::Focus if !self.search_focused => {
+                self.search_focused = true;
+                cx.notify();
+            }
+            InputEvent::Blur if self.search_focused => {
+                self.search_focused = false;
+                cx.notify();
+            }
+            _ => {}
         }
-        self.query = state.read(cx).value().to_string();
-        self.recompute(cx);
     }
 
     fn on_table_event(
@@ -300,7 +305,6 @@ impl MainView {
     ) {
         match event {
             TableEvent::SelectRow(ix) => {
-                self.selected = Some(*ix);
                 self.table.update(cx, |table, cx| {
                     if let Some(id) = table.delegate().row(*ix).map(|r| r.id) {
                         table.delegate_mut().select_row(id);
@@ -318,7 +322,6 @@ impl MainView {
                 });
             }
             TableEvent::ClearSelection => {
-                self.selected = None;
                 self.table.update(cx, |table, cx| {
                     table.delegate_mut().clear_selection();
                     cx.notify();
@@ -331,9 +334,7 @@ impl MainView {
 
     /// Returns the selected download id, if the selection is still valid.
     fn selected_id(&self, cx: &App) -> Option<raijin_core::download::DownloadId> {
-        self.selected
-            .and_then(|ix| self.table.read(cx).delegate().row(ix))
-            .map(|row| row.id)
+        self.table.read(cx).delegate().selected_id()
     }
 
     /// Returns the ids toolbar actions apply to: the checked set when
@@ -378,7 +379,6 @@ impl MainView {
         }
         self.category = category;
         self.selected_queue = None;
-        self.selected = None;
         self.table.update(cx, |table, cx| {
             table.delegate_mut().clear_selection();
             table.clear_selection(cx);
@@ -392,7 +392,6 @@ impl MainView {
             return;
         }
         self.status = status;
-        self.selected = None;
         self.table.update(cx, |table, cx| {
             table.delegate_mut().clear_selection();
             table.clear_selection(cx);
@@ -405,7 +404,6 @@ impl MainView {
         self.selected_queue = queue_id;
         self.category = CategoryFilter::All;
         self.status = StatusFilter::All;
-        self.selected = None;
         self.table.update(cx, |table, cx| {
             table.delegate_mut().clear_selection();
             table.clear_selection(cx);
@@ -418,7 +416,6 @@ impl MainView {
     /// Goes through [`TableState::clear_selection`] so the emitted
     /// `ClearSelection` keeps `selected` in step via `on_table_event`.
     fn clear_table_selection(&mut self, cx: &mut Context<Self>) {
-        self.selected = None;
         self.table.update(cx, |table, cx| {
             table.delegate_mut().clear_selection();
             table.clear_selection(cx);
@@ -484,7 +481,6 @@ impl MainView {
             table.delegate_mut().uncheck_ids(&targets);
             table.refresh(cx);
         });
-        self.selected = None;
         cx.notify();
     }
 
@@ -541,6 +537,15 @@ impl MainView {
         // the `on_window_closed` path in `main.rs`. The constructor is a
         // no-op there by design, so one code path covers all OSes.
         let close_tray = self.tray.clone();
+
+        #[cfg(not(target_os = "macos"))]
+        let compensation = px(90.);
+        #[cfg(target_os = "macos")]
+        let compensation = px(0.);
+
+        let is_expanded = self.search_focused || !self.query.is_empty();
+        let target_width = if is_expanded { px(380.) } else { px(240.) };
+
         TitleBar::new()
             .on_close_window(
                 move |_, window, _| match close_tray.close_requested(false) {
@@ -553,38 +558,52 @@ impl MainView {
             )
             .child(
                 h_flex()
-                    .gap_2()
+                    .flex_1()
                     .items_center()
                     .child(
-                        div()
-                            .size_7()
-                            .rounded_md()
-                            .bg(cx.theme().primary)
-                            .text_color(cx.theme().primary_foreground)
-                            .flex()
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_2()
                             .items_center()
-                            .justify_center()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .child("R"),
+                            .child(
+                                div()
+                                    .size_7()
+                                    .rounded_md()
+                                    .bg(cx.theme().primary)
+                                    .text_color(cx.theme().primary_foreground)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("R"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().foreground)
+                                    .child("Raijin"),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(div().w(compensation).flex_shrink_0()),
+            )
+            .child(
+                div()
+                    .with_spring(
+                        "search-bar-spring",
+                        SpringAnimation::new(SpringConfig::new(300.0, 30.0, 1.0)).to(target_width),
+                        |this, width| this.w(width),
                     )
                     .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(cx.theme().foreground)
-                            .child("Raijin"),
+                        Input::new(&self.search)
+                            .prefix(Icon::new(IconName::Search).small())
+                            .cleanable(true)
+                            .small(),
                     ),
             )
             .child(div().flex_1())
-            .child(
-                div().w(px(240.)).child(
-                    Input::new(&self.search)
-                        .prefix(Icon::new(IconName::Search).small())
-                        .cleanable(true)
-                        .small(),
-                ),
-            )
     }
 
     /// Renders the sidebar with collapsible filter dropdowns and a dedicated
@@ -731,6 +750,13 @@ impl MainView {
         let current_status = self.status;
         let view = cx.entity();
 
+        let target_queue_id = self.selected_queue.unwrap_or(QueueId::MAIN);
+        let target_queue_snapshot = self
+            .queue_state
+            .iter()
+            .find(|s| s.queue.id == target_queue_id);
+        let is_queue_active = target_queue_snapshot.map(|s| s.active).unwrap_or(false);
+
         let (active_label, active_count) = match current_status {
             StatusFilter::All => ("All", all_count),
             StatusFilter::Unfinished => ("Downloading", unfinished_count),
@@ -810,9 +836,6 @@ impl MainView {
                 cx,
                 cx.listener(|this, _, window, cx| this.pause_selected(window, cx)),
             ))
-            // Divider 1
-            .child(toolbar_divider(cx))
-            // Group 2: Queue Management
             .child(toolbar_button(
                 "move-to-queue",
                 Icon::new(gpui_kit::assets::IconName::SquareArrowRight),
@@ -822,14 +845,54 @@ impl MainView {
                 cx,
                 cx.listener(|this, _, window, cx| this.move_to_queue(window, cx)),
             ))
+            // Divider 1
+            .child(toolbar_divider(cx))
+            // Group 2: Queue Actions
             .child(toolbar_button(
-                "new-queue",
-                Icon::new(gpui_kit::assets::IconName::LayersPlus),
-                "New queue",
-                false,
-                Some("Create a new download queue"),
+                "toolbar-start-queue",
+                gpui_kit::assets::IconName::SquarePlay,
+                "Start Queue",
+                is_queue_active,
+                Some("Start queue"),
                 cx,
-                cx.listener(|this, _, window, cx| this.new_queue(window, cx)),
+                cx.listener(move |this, _, window, cx| {
+                    this.handles.dispatch_in(
+                        EngineCommand::Queue(QueueAction::Start(target_queue_id)),
+                        window,
+                        cx,
+                    );
+                }),
+            ))
+            .child(toolbar_button(
+                "toolbar-stop-queue",
+                gpui_kit::assets::IconName::SquarePause,
+                "Stop Queue",
+                !is_queue_active,
+                Some("Stop queue"),
+                cx,
+                cx.listener(move |this, _, window, cx| {
+                    this.handles.dispatch_in(
+                        EngineCommand::Queue(QueueAction::Stop(target_queue_id)),
+                        window,
+                        cx,
+                    );
+                }),
+            ))
+            .child(toolbar_button(
+                "toolbar-queues",
+                gpui_kit::assets::IconName::LayersPlus,
+                "Queues",
+                false,
+                Some("Queue settings"),
+                cx,
+                cx.listener(move |this, _, window, cx| {
+                    queues_dialog::QueuesDialog::open(
+                        this.handles.clone(),
+                        Some(target_queue_id),
+                        window,
+                        cx,
+                    );
+                }),
             ))
             // Divider 2
             .child(toolbar_divider(cx))
@@ -854,12 +917,7 @@ impl MainView {
             ))
             // Divider 3
             .child(toolbar_divider(cx))
-            // Spacer to keep view filter and settings on the right
-            .child(div().flex_1())
-            // Status Filter Dropdown
-            .child(status_dropdown)
-            .child(toolbar_divider(cx))
-            // Group 5: Settings
+            // Group 4: Settings
             .child(toolbar_button(
                 "toolbar-settings",
                 IconName::Settings,
@@ -871,6 +929,12 @@ impl MainView {
                     open_settings_window(cx, &this.settings);
                 }),
             ))
+            // Divider 4
+            .child(toolbar_divider(cx))
+            // Group 5: Status Filter Dropdown
+            .child(status_dropdown)
+            // Spacer to keep toolbar layout spanning full width
+            .child(div().flex_1())
     }
 
     fn status_counts(&self) -> (usize, usize, usize) {
@@ -933,6 +997,12 @@ impl Render for MainView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && cx.has_active_drag() {
+                    crate::downloads::cancel_reorder_drag(&this.table, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .on_action(cx.listener(|this, _: &ReorderQueueUp, window, cx| {
                 this.reorder_selected(true, window, cx);
             }))
@@ -958,14 +1028,10 @@ impl Render for MainView {
                                     .min_w_0()
                                     .gap_3()
                                     .p_4()
-                                    .when_some(self.render_queue_banner(cx), |this, banner| {
-                                        this.child(banner)
-                                    })
                                     .child(self.render_toolbar(cx))
                                     .child({
                                         let view = cx.entity();
-                                        div()
-                                            .id("downloads-table-wrap")
+                                        crate::downloads::reorder_surface(&self.table)
                                             .flex_1()
                                             .min_h_0()
                                             .overflow_hidden()
@@ -1363,7 +1429,7 @@ impl SidebarItem for QueueSection {
                                     Button::new("add-queue-header")
                                         .xsmall()
                                         .ghost()
-                                        .icon(IconName::Plus)
+                                        .icon(Icon::new(gpui_kit::assets::IconName::LayersPlus))
                                         .tooltip("New queue")
                                         .on_click(move |_, window, cx| {
                                             cx.stop_propagation();

@@ -59,7 +59,7 @@ fn regenerate_should_confirm_before_rotating_and_persist_the_result(cx: &mut Tes
     let handles = settings_handles(&runtime);
     let original = handles.token.get();
     cx.update(gpui_kit::init);
-    cx.update(|cx| open_settings_window(cx, &handles));
+    cx.update(|cx| open_browser_integration(cx, &handles));
     let handle = settings_window(&handles);
 
     cx.update_window(handle, |_, window, cx| {
@@ -148,7 +148,7 @@ fn settings_should_reuse_its_root_and_reopen_after_close(cx: &mut TestAppContext
     cx.update(|cx| assert_eq!(view.read(cx).section, Section::BrowserIntegration));
     cx.update_window(first, |_, window, _| window.remove_window())
         .expect("Settings must close");
-    cx.update(|cx| open_settings_window(cx, &handles));
+    cx.update(|cx| open_browser_integration(cx, &handles));
     assert_ne!(settings_window(&handles), first);
     cx.update_window(settings_window(&handles), |_, window, cx| {
         assert!(window.root::<base::Root>().flatten().is_some());
@@ -166,7 +166,7 @@ fn stopped_integration_should_not_open_regenerate_confirmation(cx: &mut TestAppC
     handles.port = None;
     let original = handles.token.get();
     cx.update(gpui_kit::init);
-    cx.update(|cx| open_settings_window(cx, &handles));
+    cx.update(|cx| open_browser_integration(cx, &handles));
     cx.update_window(settings_window(&handles), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("settings-regenerate").disabled(), Some(true));

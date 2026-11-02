@@ -19,6 +19,10 @@ use crate::format::{
     format_bytes, format_eta, format_relative_time, format_speed, progress_percent,
 };
 
+mod reorder;
+#[cfg(test)]
+mod window_tests;
+
 /// Payload carried while dragging table rows onto a queue.
 ///
 /// The drag carries ids, never engine state: the drop handler sends one queue
@@ -29,29 +33,96 @@ pub struct QueueDrag {
     pub downloads: Vec<DownloadId>,
 }
 
-/// Floating label shown while dragging rows toward a queue.
+/// Floating card preview shown while dragging rows toward a queue or reordering.
 pub struct QueueDragPreview {
-    label: String,
+    file_name: String,
+    category: FileCategory,
+    category_label: String,
+    size_label: String,
+    total_count: usize,
 }
 
 impl QueueDragPreview {
-    /// Creates a preview carrying the drag summary text.
+    /// Creates a preview carrying item metadata and drag count.
     #[must_use]
-    pub fn new(label: String) -> Self {
-        Self { label }
+    pub fn new(
+        file_name: String,
+        category: FileCategory,
+        category_label: String,
+        size_label: String,
+        total_count: usize,
+    ) -> Self {
+        Self {
+            file_name,
+            category,
+            category_label,
+            size_label,
+            total_count,
+        }
     }
 }
 
 impl Render for QueueDragPreview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        h_flex()
+            .items_center()
+            .gap_2()
             .px_3()
-            .py_1()
+            .py_2()
+            .min_w(px(260.))
+            .max_w(px(360.))
             .rounded(px(8.))
-            .bg(cx.theme().primary)
-            .text_color(cx.theme().primary_foreground)
-            .text_sm()
-            .child(self.label.clone())
+            .border_1()
+            .border_color(cx.theme().primary.opacity(0.8))
+            .bg(crate::theme::row_card_selected_bg())
+            .shadow_xl()
+            .child(
+                Icon::new(IconName::Menu)
+                    .size_4()
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .child(
+                Icon::new(category_icon(self.category))
+                    .size_4()
+                    .text_color(cx.theme().primary),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(cx.theme().foreground)
+                            .truncate()
+                            .child(self.file_name.clone()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.category_label.clone())
+                            .when(!self.size_label.is_empty(), |this| {
+                                this.child("·").child(self.size_label.clone())
+                            }),
+                    ),
+            )
+            .when(self.total_count > 1, |this| {
+                this.child(
+                    div()
+                        .px(px(6.))
+                        .py(px(2.))
+                        .rounded_full()
+                        .bg(cx.theme().primary)
+                        .text_color(cx.theme().primary_foreground)
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("+{}", self.total_count - 1)),
+                )
+            })
     }
 }
 
@@ -67,6 +138,95 @@ pub const TABLE_ROW_HEIGHT_PX: f32 = 52.0;
 
 /// Height of the floating table header row in pixels.
 pub const TABLE_HEADER_HEIGHT_PX: f32 = 34.0;
+
+/// Wraps the unstriped downloads table with insertion hit testing and drag cleanup.
+pub fn reorder_surface(table: &Entity<TableState<DownloadsDelegate>>) -> Stateful<Div> {
+    let ending = table.downgrade();
+    let moving = table.downgrade();
+    let dropping = table.downgrade();
+    let scrolling = table.downgrade();
+    div()
+        .id("downloads-table-wrap")
+        .relative()
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    window.on_mouse_event(move |_: &ScrollWheelEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture && cx.has_active_drag() {
+                            let scrolling = scrolling.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = scrolling.update(cx, |table, cx| {
+                                    let ix = reorder_pointer_ix(table, window.mouse_position());
+                                    if let Some(order) = table.delegate_mut().reorder.update(ix) {
+                                        table.delegate_mut().apply_order(&order);
+                                        cx.notify();
+                                    }
+                                });
+                            });
+                        }
+                    });
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                            let ending = ending.clone();
+                            window.defer(cx, move |_, cx| {
+                                let _ = ending.update(cx, |table, cx| {
+                                    table.delegate_mut().cancel_active_reorder(cx);
+                                });
+                            });
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full(),
+        )
+        .on_drag_move::<QueueDrag>(move |event, _, cx| {
+            let dragged = event.drag(cx).downloads.clone();
+            let _ = moving.update(cx, |table, cx| {
+                let ix = reorder_pointer_ix(table, event.event.position);
+                table.delegate_mut().update_reorder(&dragged, ix, cx);
+            });
+        })
+        .can_drop(|payload, _, _| payload.is::<QueueDrag>())
+        .on_drop(move |drag: &QueueDrag, window, cx| {
+            let _ = dropping.update(cx, |table, cx| {
+                let ix = reorder_pointer_ix(table, window.mouse_position());
+                table.delegate_mut().update_reorder(&drag.downloads, ix, cx);
+                table.delegate_mut().commit_reorder(drag, window, cx);
+            });
+        })
+}
+
+/// Cancels the active drag without waiting for cached preview entities to be released.
+pub fn cancel_reorder_drag(
+    table: &Entity<TableState<DownloadsDelegate>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    cx.stop_active_drag(window);
+    table.update(cx, |table, cx| {
+        table.delegate_mut().cancel_active_reorder(cx);
+    });
+}
+
+fn reorder_pointer_ix(
+    table: &TableState<DownloadsDelegate>,
+    position: Point<Pixels>,
+) -> Option<usize> {
+    let count = table.delegate().rows.len();
+    if count == 0 {
+        return None;
+    }
+    let handle = table.vertical_scroll_handle.0.borrow();
+    let bounds = handle.base_handle.bounds();
+    let height = handle.last_item_size?.contents.height / count as f32;
+    if height <= px(0.) || !bounds.contains(&position) {
+        return None;
+    }
+    let y = position.y - bounds.top() - handle.base_handle.offset().y;
+    Some((f32::from(y) / f32::from(height)).floor().max(0.0) as usize)
+}
 
 /// Table column keys. Also used as stable [`Column`] keys.
 pub mod col {
@@ -565,6 +725,7 @@ pub struct DownloadsDelegate {
     checklist: RowChecklist,
     commands: EngineHandles,
     selected_id: Option<DownloadId>,
+    reorder: reorder::ReorderPresentation,
 }
 
 impl DownloadsDelegate {
@@ -589,6 +750,7 @@ impl DownloadsDelegate {
             checklist: RowChecklist::default(),
             commands,
             selected_id: None,
+            reorder: reorder::ReorderPresentation::default(),
         }
     }
 
@@ -606,6 +768,12 @@ impl DownloadsDelegate {
         {
             self.selected_id = None;
         }
+        let incoming: Vec<_> = rows.iter().map(|row| row.id).collect();
+        let order = self.reorder.project(&incoming);
+
+        let positions: std::collections::HashMap<_, _> =
+            order.iter().enumerate().map(|(ix, id)| (*id, ix)).collect();
+        rows.sort_by_key(|row| positions.get(&row.id).copied());
         self.rows = rows;
     }
 
@@ -614,7 +782,10 @@ impl DownloadsDelegate {
     }
 
     pub fn set_reorderable_queue(&mut self, queue: Option<QueueId>) {
-        self.reorderable_queue = queue;
+        if self.reorderable_queue != queue {
+            self.reorder.reset();
+            self.reorderable_queue = queue;
+        }
     }
 
     /// Marks the initial monitor snapshot as received (hides the skeleton).
@@ -642,10 +813,7 @@ impl DownloadsDelegate {
         self.rows.iter().find(|row| row.id == id)
     }
 
-    /// Returns the visible index of a download id, if currently shown.
-    ///
-    /// Used to preserve selection by domain identity across filtering and
-    /// reordering instead of pinning a positional index.
+    /// Returns the current visible index of a download's stable id.
     #[must_use]
     pub fn row_position(&self, id: DownloadId) -> Option<usize> {
         self.rows.iter().position(|row| row.id == id)
@@ -739,70 +907,79 @@ impl DownloadsDelegate {
         category_icon(category)
     }
 
-    pub fn handle_row_drop(
+    fn apply_order(&mut self, order: &[DownloadId]) {
+        let positions: std::collections::HashMap<_, _> =
+            order.iter().enumerate().map(|(ix, id)| (*id, ix)).collect();
+        self.rows.sort_by_key(|row| positions.get(&row.id).copied());
+    }
+
+    fn update_reorder(
         &mut self,
-        drag: &QueueDrag,
-        target_id: DownloadId,
-        queue_id: QueueId,
-        window: &mut Window,
-        cx: &mut App,
+        dragged: &[DownloadId],
+        hovered_ix: Option<usize>,
+        cx: &mut Context<TableState<Self>>,
     ) {
-        let current_order: Vec<DownloadId> = self.rows.iter().map(|r| r.id).collect();
-        let Some(new_order) = reorder_items(&current_order, &drag.downloads, target_id) else {
-            return;
-        };
-        if new_order == current_order {
+        if self.reorderable_queue.is_none() || !self.reorder.matches(dragged) {
             return;
         }
+        if let Some(order) = self.reorder.update(hovered_ix) {
+            self.apply_order(&order);
+            cx.notify();
+        }
+    }
 
-        let positions: std::collections::HashMap<_, _> = new_order
-            .iter()
-            .enumerate()
-            .map(|(ix, id)| (*id, ix))
-            .collect();
-        self.rows.sort_by_key(|row| positions.get(&row.id).copied());
+    fn cancel_active_reorder(&mut self, cx: &mut Context<TableState<Self>>) {
+        if let Some(order) = self.reorder.cancel_active() {
+            self.apply_order(&order);
+            cx.notify();
+        }
+    }
 
-        self.commands.dispatch_in(
+    fn cancel_reorder(&mut self, token: u64, cx: &mut Context<TableState<Self>>) {
+        if let Some(order) = self.reorder.cancel(token) {
+            self.apply_order(&order);
+            cx.notify();
+        }
+    }
+
+    fn commit_reorder(
+        &mut self,
+        drag: &QueueDrag,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let Some(queue_id) = self.reorderable_queue else {
+            return;
+        };
+        if !self.reorder.matches(&drag.downloads) {
+            return;
+        }
+        let Some((token, order)) = self.reorder.commit() else {
+            cx.notify();
+            return;
+        };
+        let table = cx.entity().downgrade();
+        self.commands.run_in(
             EngineCommand::Queue(QueueAction::Reorder {
                 id: queue_id,
-                order: new_order,
+                order,
             }),
             window,
             cx,
+            move |result, window, cx| {
+                if let Err(error) = result {
+                    window.push_notification(error.to_string(), cx);
+                    let _ = table.update(cx, |table, cx| {
+                        if let Some(order) = table.delegate_mut().reorder.reject(token) {
+                            table.delegate_mut().apply_order(&order);
+                            cx.notify();
+                        }
+                    });
+                }
+            },
         );
+        cx.notify();
     }
-}
-
-/// Calculates the new order of items when `dragged` items are dropped onto `target`.
-#[must_use]
-pub fn reorder_items(
-    items: &[DownloadId],
-    dragged: &[DownloadId],
-    target: DownloadId,
-) -> Option<Vec<DownloadId>> {
-    if dragged.is_empty() || dragged.contains(&target) {
-        return None;
-    }
-    let target_orig_ix = items.iter().position(|id| *id == target)?;
-    let first_dragged_ix = items.iter().position(|id| *id == dragged[0])?;
-
-    let dragged_set: std::collections::HashSet<_> = dragged.iter().copied().collect();
-    let remaining: Vec<DownloadId> = items
-        .iter()
-        .copied()
-        .filter(|id| !dragged_set.contains(id))
-        .collect();
-
-    let target_rem_ix = remaining.iter().position(|id| *id == target)?;
-    let insert_ix = if first_dragged_ix < target_orig_ix {
-        target_rem_ix + 1
-    } else {
-        target_rem_ix
-    };
-
-    let mut result = remaining;
-    result.splice(insert_ix..insert_ix, dragged.iter().copied());
-    Some(result)
 }
 
 impl TableDelegate for DownloadsDelegate {
@@ -1027,6 +1204,7 @@ impl TableDelegate for DownloadsDelegate {
         };
 
         let table = cx.entity();
+        let is_placeholder = id.is_some_and(|id| self.reorder.is_placeholder(id));
 
         let mut row_el = div()
             .id(SharedString::from(format!("download-row-{id_num}")))
@@ -1038,6 +1216,10 @@ impl TableDelegate for DownloadsDelegate {
             .bg(bg)
             .overflow_hidden();
 
+        if is_placeholder {
+            row_el = row_el.opacity(0.35).border_color(cx.theme().primary);
+        }
+
         if let Some(id) = id {
             let drag_ids = {
                 let checked = self.checked_ids();
@@ -1047,44 +1229,59 @@ impl TableDelegate for DownloadsDelegate {
                     vec![id]
                 }
             };
+            let row_clone = row.cloned();
+            let total_count = drag_ids.len();
+            let drag_table = table.downgrade();
             row_el = row_el.on_drag(
                 QueueDrag {
                     downloads: drag_ids,
                 },
-                move |drag: &QueueDrag, _offset, _window, cx| {
-                    let label = match drag.downloads.len() {
-                        0 => "Move".to_owned(),
-                        1 => "1 download".to_owned(),
-                        count => format!("{count} downloads"),
+                move |drag: &QueueDrag, _offset, window, cx| {
+                    let token = drag_table
+                        .update(cx, |table, cx| {
+                            let delegate = table.delegate_mut();
+                            delegate.reorderable_queue?;
+                            let items: Vec<_> = delegate.rows.iter().map(|row| row.id).collect();
+                            let token = delegate.reorder.begin(&items, &drag.downloads, id);
+                            cx.notify();
+                            token
+                        })
+                        .ok()
+                        .flatten();
+                    let preview = if let Some(r) = &row_clone {
+                        QueueDragPreview::new(
+                            r.file_name.clone(),
+                            r.category,
+                            r.category_label.clone(),
+                            r.size_label.clone(),
+                            total_count,
+                        )
+                    } else {
+                        QueueDragPreview::new(
+                            "Download".to_owned(),
+                            FileCategory::General,
+                            "General".to_owned(),
+                            String::new(),
+                            total_count,
+                        )
                     };
-                    // The preview is a fresh entity per drag; keeping it
-                    // state-free avoids leaking a view into the table.
-                    cx.new(|_| QueueDragPreview::new(label.clone()))
+                    cx.new(|cx| {
+                        if let Some(token) = token {
+                            let table = drag_table.clone();
+                            cx.on_release_in(window, move |_, _, cx| {
+                                let _ = table.update(cx, |table, cx| {
+                                    table.delegate_mut().cancel_reorder(token, cx);
+                                });
+                            })
+                            .detach();
+                        }
+                        preview
+                    })
                 },
             );
 
-            if let Some(queue_id) = self.reorderable_queue {
-                let table_drop = table.clone();
-                row_el = row_el
-                    .cursor_grab()
-                    .drag_over::<QueueDrag>(|mut style, _, _, cx| {
-                        style.border_style = Some(gpui::BorderStyle::Dashed);
-                        style.border_color = Some(cx.theme().primary);
-                        style.border_widths.top = Some(px(2.).into());
-                        style.border_widths.bottom = Some(px(2.).into());
-                        style.border_widths.left = Some(px(2.).into());
-                        style.border_widths.right = Some(px(2.).into());
-                        style.background = Some(cx.theme().primary.opacity(0.08).into());
-                        style
-                    })
-                    .can_drop(|payload, _, _| payload.is::<QueueDrag>())
-                    .on_drop(move |drag: &QueueDrag, window, cx| {
-                        table_drop.update(cx, |table, cx| {
-                            table
-                                .delegate_mut()
-                                .handle_row_drop(drag, id, queue_id, window, cx);
-                        });
-                    });
+            if self.reorderable_queue.is_some() {
+                row_el = row_el.cursor_grab();
             }
 
             row_el = row_el.on_click(move |event: &ClickEvent, _: &mut Window, cx: &mut App| {
@@ -1703,63 +1900,6 @@ mod tests {
             .expect("selected id must survive sorting");
         assert_eq!(rows[new_ix].file_name, "c.zip");
         assert_eq!(new_ix, 2);
-    }
-
-    #[test]
-    fn reorder_items_should_handle_up_down_and_self_drop() {
-        let items = vec![
-            DownloadId::new(1),
-            DownloadId::new(2),
-            DownloadId::new(3),
-            DownloadId::new(4),
-            DownloadId::new(5),
-        ];
-
-        // Drag 4 onto 2 (move up): 4 is inserted before 2
-        assert_eq!(
-            super::reorder_items(&items, &[DownloadId::new(4)], DownloadId::new(2)),
-            Some(vec![
-                DownloadId::new(1),
-                DownloadId::new(4),
-                DownloadId::new(2),
-                DownloadId::new(3),
-                DownloadId::new(5),
-            ])
-        );
-
-        // Drag 2 onto 4 (move down): 2 is inserted after 4
-        assert_eq!(
-            super::reorder_items(&items, &[DownloadId::new(2)], DownloadId::new(4)),
-            Some(vec![
-                DownloadId::new(1),
-                DownloadId::new(3),
-                DownloadId::new(4),
-                DownloadId::new(2),
-                DownloadId::new(5),
-            ])
-        );
-
-        // Drag onto self: returns None
-        assert!(super::reorder_items(&items, &[DownloadId::new(2)], DownloadId::new(2)).is_none());
-
-        // Empty dragged: returns None
-        assert!(super::reorder_items(&items, &[], DownloadId::new(2)).is_none());
-
-        // Drag multiple items [2, 3] onto 5 (move down)
-        assert_eq!(
-            super::reorder_items(
-                &items,
-                &[DownloadId::new(2), DownloadId::new(3)],
-                DownloadId::new(5),
-            ),
-            Some(vec![
-                DownloadId::new(1),
-                DownloadId::new(4),
-                DownloadId::new(5),
-                DownloadId::new(2),
-                DownloadId::new(3),
-            ])
-        );
     }
 
     fn view(

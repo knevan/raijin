@@ -11,14 +11,15 @@ use crate::bridge::QueueAction;
 use crate::queue_picker::QueueChoice;
 
 #[derive(Clone)]
-enum QueueFormKind {
+#[allow(dead_code)]
+pub(super) enum QueueFormKind {
     Create,
     Edit(QueueSnapshot),
     Delete(QueueSnapshot),
     Move(Vec<DownloadId>),
 }
 
-struct QueueForm {
+pub(super) struct QueueForm {
     handles: EngineHandles,
     kind: QueueFormKind,
     name: Entity<InputState>,
@@ -30,14 +31,17 @@ struct QueueForm {
 }
 
 impl QueueForm {
-    fn open(
+    pub(super) fn open(
         kind: QueueFormKind,
         handles: EngineHandles,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
+        let is_create = matches!(kind, QueueFormKind::Create);
+        let form_kind = kind.clone();
+        let handles_clone = handles.clone();
         let (title, commit) = match &kind {
-            QueueFormKind::Create => ("New queue".to_owned(), "Create"),
+            QueueFormKind::Create => ("Add New Queue".to_owned(), "Add"),
             QueueFormKind::Edit(s) => (format!("Queue settings: {}", s.queue.name), "Save"),
             QueueFormKind::Delete(s) => (format!("Delete “{}”?", s.queue.name), "Delete"),
             QueueFormKind::Move(ids) => {
@@ -55,8 +59,14 @@ impl QueueForm {
                 _ => None,
             };
             let name = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .default_value(initial.map(|q| q.name.clone()).unwrap_or_default())
+                let mut input = InputState::new(window, cx);
+                if is_create {
+                    input = input.placeholder("Queue Name");
+                } else {
+                    input =
+                        input.default_value(initial.map(|q| q.name.clone()).unwrap_or_default());
+                }
+                input
             });
             let limit = cx.new(|cx| {
                 InputState::new(window, cx).default_value(
@@ -86,30 +96,69 @@ impl QueueForm {
             }
         });
         let dialog_form = form.clone();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let submit = dialog_form.clone();
             let busy = dialog_form.read(cx).busy;
             let destructive = matches!(dialog_form.read(cx).kind, QueueFormKind::Delete(_));
-            dialog
+            let commit_btn = Button::new("queue-commit")
+                .label(commit)
+                .primary()
+                .when(destructive, |button| button.danger())
+                .disabled(busy);
+            let cancel_btn = DialogClose::new().trigger(|button| button.label("Cancel"));
+
+            let delete_btn = match &form_kind {
+                QueueFormKind::Edit(s) if s.queue.id != QueueId::MAIN => {
+                    let s = s.clone();
+                    let handles = handles_clone.clone();
+                    Some(
+                        Button::new("queue-delete-trigger")
+                            .label("Delete queue…")
+                            .danger()
+                            .ghost()
+                            .disabled(busy)
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                QueueForm::open(
+                                    QueueFormKind::Delete(s.clone()),
+                                    handles.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                    )
+                }
+                _ => None,
+            };
+
+            let footer = if is_create {
+                DialogFooter::new()
+                    .child(DialogAction::new().child(commit_btn))
+                    .child(cancel_btn)
+            } else {
+                DialogFooter::new()
+                    .when_some(delete_btn, |footer, btn| footer.child(btn))
+                    .child(cancel_btn)
+                    .child(DialogAction::new().child(commit_btn))
+            };
+
+            let mut dialog = dialog
                 .title(title.clone())
                 .child(dialog_form.clone())
-                .footer(
-                    DialogFooter::new()
-                        .child(DialogClose::new().trigger(|button| button.label("Cancel")))
-                        .child(
-                            DialogAction::new().child(
-                                Button::new("queue-commit")
-                                    .label(commit)
-                                    .primary()
-                                    .when(destructive, |button| button.danger())
-                                    .disabled(busy),
-                            ),
-                        ),
-                )
+                .footer(footer)
                 .on_ok(move |_, window, cx| {
                     submit.update(cx, |form, cx| form.submit(window, cx));
                     false
-                })
+                });
+
+            if is_create {
+                let view_height = window.viewport_size().height;
+                let estimated_dialog_height = px(150.);
+                let margin_top = ((view_height - estimated_dialog_height) / 2.0).max(px(40.));
+                dialog = dialog.width(px(360.)).margin_top(margin_top);
+            }
+
+            dialog
         });
         form
     }
@@ -192,7 +241,10 @@ impl QueueForm {
 impl Render for QueueForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex().gap_3()
-            .when(matches!(self.kind, QueueFormKind::Create | QueueFormKind::Edit(_)), |this| {
+            .when(matches!(self.kind, QueueFormKind::Create), |this| {
+                this.child(Input::new(&self.name).disabled(self.busy))
+            })
+            .when(matches!(self.kind, QueueFormKind::Edit(_)), |this| {
                 this.child("Name").child(Input::new(&self.name).disabled(self.busy))
             })
             .when(matches!(self.kind, QueueFormKind::Edit(_)), |this| {
@@ -228,21 +280,6 @@ impl MainView {
         QueueForm::open(QueueFormKind::Create, self.handles.clone(), window, cx);
     }
 
-    fn edit_queue(&self, delete: bool, window: &mut Window, cx: &mut App) {
-        if let Some(snapshot) = self
-            .queue_state
-            .iter()
-            .find(|s| Some(s.queue.id) == self.selected_queue)
-        {
-            let kind = if delete {
-                QueueFormKind::Delete(snapshot.clone())
-            } else {
-                QueueFormKind::Edit(snapshot.clone())
-            };
-            QueueForm::open(kind, self.handles.clone(), window, cx);
-        }
-    }
-
     pub(super) fn move_to_queue(&self, window: &mut Window, cx: &mut App) {
         let ids = self.target_ids(cx);
         if !ids.is_empty() {
@@ -275,100 +312,6 @@ impl MainView {
             window,
             cx,
         );
-    }
-
-    pub(super) fn render_queue_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let snapshot = self
-            .queue_state
-            .iter()
-            .find(|s| Some(s.queue.id) == self.selected_queue)?;
-        let id = snapshot.queue.id;
-        let active = snapshot.active;
-        let running = self
-            .cache
-            .iter()
-            .filter(|r| {
-                snapshot.items.contains(&r.id)
-                    && matches!(
-                        r.status,
-                        DownloadStatus::Downloading
-                            | DownloadStatus::PreparingFile
-                            | DownloadStatus::Retrying
-                    )
-            })
-            .count();
-        let waiting = self
-            .cache
-            .iter()
-            .filter(|r| snapshot.items.contains(&r.id) && r.status == DownloadStatus::Queued)
-            .count();
-
-        Some(
-            v_flex()
-                .gap_2()
-                .p_3()
-                .rounded_md()
-                .bg(cx.theme().muted)
-                .child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(format!("Queue: {}", snapshot.queue.name)),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!(
-                                    "{} · {running} running · {waiting} waiting · limit {} · execution order",
-                                    if active { "Active" } else { "Stopped" },
-                                    snapshot.queue.max_concurrent,
-                                )),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("queue-toggle")
-                                .small()
-                                .label(if active { "Stop queue" } else { "Start queue" })
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    let action = if active {
-                                        QueueAction::Stop(id)
-                                    } else {
-                                        QueueAction::Start(id)
-                                    };
-                                    this.handles.dispatch_in(
-                                        EngineCommand::Queue(action),
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .child(
-                            Button::new("queue-settings")
-                                .small()
-                                .label("Queue settings…")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.edit_queue(false, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("queue-delete")
-                                .small()
-                                .label("Delete queue…")
-                                .disabled(id == QueueId::MAIN)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.edit_queue(true, window, cx)
-                                })),
-                        ),
-                ),
-        )
     }
 }
 

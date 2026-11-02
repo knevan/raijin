@@ -2,9 +2,9 @@ name: Checks/Browser Extension
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    types: [ opened, synchronize, reopened ]
+    types: [opened, synchronize, reopened]
 
 concurrency:
   group: checks-extension-${{ github.ref }}
@@ -20,17 +20,17 @@ jobs:
     outputs:
       extension: ${{ steps.changes.outputs.extension }}
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-    - name: Detect extension changes
-      uses: dorny/paths-filter@v3
-      id: changes
-      with:
-        filters: |
-          extension:
-            - 'browser-extension/**'
-            - '.github/workflows/checks-extension.yml'
+      - name: Detect extension changes
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            extension:
+              - 'browser-extension/**'
+              - '.github/workflows/checks-extension.yml'
 
   typecheck:
     name: Typecheck
@@ -41,22 +41,22 @@ jobs:
       run:
         working-directory: browser-extension
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-    - name: Setup pnpm and Node
-      uses: pnpm/setup@v2
-      with:
-        runtime: node@26
-        cache: true
-        install: false
-        working-directory: browser-extension
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@v2
+        with:
+          runtime: node@26
+          cache: true
+          install: false
+          working-directory: browser-extension
 
-    - name: Install dependencies
-      run: pnpm install --frozen-lockfile
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
-    - name: Run type check
-      run: pnpm run compile
+      - name: Run type check
+        run: pnpm run compile
 
   test:
     name: Test
@@ -67,22 +67,22 @@ jobs:
       run:
         working-directory: browser-extension
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-    - name: Setup pnpm and Node
-      uses: pnpm/setup@v2
-      with:
-        runtime: node@26
-        cache: true
-        install: false
-        working-directory: browser-extension
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@v2
+        with:
+          runtime: node@26
+          cache: true
+          install: false
+          working-directory: browser-extension
 
-    - name: Install dependencies
-      run: pnpm install --frozen-lockfile
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
-    - name: Run unit tests
-      run: pnpm test
+      - name: Run unit tests
+        run: pnpm test
 
   build:
     name: Build & Lint
@@ -93,25 +93,25 @@ jobs:
       run:
         working-directory: browser-extension
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-    - name: Setup pnpm and Node
-      uses: pnpm/setup@v2
-      with:
-        runtime: node@26
-        cache: true
-        install: false
-        working-directory: browser-extension
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@v2
+        with:
+          runtime: node@26
+          cache: true
+          install: false
+          working-directory: browser-extension
 
-    - name: Install dependencies
-      run: pnpm install --frozen-lockfile
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
-    - name: Build Chromium extension (MV3)
-      run: pnpm run build
+      - name: Build Chromium extension (MV3)
+        run: pnpm run build
 
-    - name: Build Firefox extension (MV2)
-      run: pnpm run build:firefox
+      - name: Build Firefox extension (MV2)
+        run: pnpm run build:firefox
 
-    - name: Lint Firefox extension bundle
-      run: pnpm run lint:firefox
+      - name: Lint Firefox extension bundle
+        run: pnpm run lint:firefox

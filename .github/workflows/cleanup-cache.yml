@@ -15,7 +15,7 @@ permissions:
 jobs:
   prune-cache:
     name: Prune Stale and Superseded Caches
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Prune Caches
         env:

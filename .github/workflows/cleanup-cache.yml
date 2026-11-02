@@ -1,0 +1,110 @@
+name: Safe Actions Cache Cleanup
+
+on:
+  schedule:
+    - cron: '23 20 * * *'
+  workflow_dispatch:
+  pull_request:
+    types: [closed]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  prune-cache:
+    name: Prune Stale and Superseded Caches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune Caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "Fetching open pull requests..."
+          gh pr list --repo "$REPO" --state open \
+            --json number -q '.[].number' > open_prs.txt || true
+
+          echo "Fetching cache list from $REPO..."
+          gh cache list --repo "$REPO" --limit 500 \
+            --json id,key,ref,createdAt,lastAccessedAt,sizeInBytes \
+            > caches.json
+
+          node - << 'EOF' > to_delete.tsv
+          const fs = require('fs');
+
+          let caches = [];
+          try {
+            caches = JSON.parse(fs.readFileSync('caches.json', 'utf8'));
+          } catch (e) {
+            caches = [];
+          }
+
+          let openPrs = new Set();
+          try {
+            const raw = fs.readFileSync('open_prs.txt', 'utf8');
+            openPrs = new Set(
+              raw.split('\n').map(s => s.trim()).filter(Boolean)
+            );
+          } catch (e) {}
+
+          const toDelete = [];
+          const groups = {};
+
+          for (const item of caches) {
+            // Prune caches from closed or merged PRs
+            const prMatch = item.ref.match(/refs\/pull\/(\d+)\//);
+            if (prMatch && !openPrs.has(prMatch[1])) {
+              toDelete.push({
+                reason: `Closed PR #${prMatch[1]}`,
+                ...item
+              });
+              continue;
+            }
+
+            // Group by branch ref and cache key base prefix
+            const parts = item.key.split('-');
+            const prefix = item.key.startsWith('v0-rust-')
+              ? parts.slice(0, 5).join('-')
+              : parts.slice(0, 3).join('-');
+            const groupKey = `${item.ref}::${prefix}`;
+            if (!groups[groupKey]) groups[groupKey] = [];
+            groups[groupKey].push(item);
+          }
+
+          // In each group, keep only the newest cache and prune older ones
+          for (const [groupKey, items] of Object.entries(groups)) {
+            items.sort(
+              (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+            );
+            for (let i = 1; i < items.length; i++) {
+              toDelete.push({
+                reason: `Superseded in ${groupKey}`,
+                ...items[i]
+              });
+            }
+          }
+
+          for (const item of toDelete) {
+            const mb = Math.round((item.sizeInBytes || 0) / 1024 / 1024);
+            process.stdout.write(
+              `${item.id}\t${item.reason}\t${item.key}\t${mb}\n`
+            );
+          }
+          EOF
+
+          if [ ! -s to_delete.tsv ]; then
+            echo "No stale or superseded caches to delete."
+            exit 0
+          fi
+
+          echo "Deleting stale/superseded caches..."
+          while IFS=$'\t' read -r cache_id reason key size; do
+            if [ -n "$cache_id" ]; then
+              echo "Delete $cache_id: [$reason] $key (${size}MB)"
+              gh cache delete "$cache_id" --repo "$REPO" || true
+            fi
+          done < to_delete.tsv
+
+          rm -f caches.json open_prs.txt to_delete.tsv

@@ -1,0 +1,163 @@
+name: Release/Nightly
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-desktop:
+    name: Build Desktop (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-25
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: release-deploy-windows
+
+      - name: Build Raijin binary
+        run: cargo build --profile deploy -p raijin-ui
+
+      - name: Package Windows portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package
+          Copy-Item target/deploy/raijin.exe package/
+          if (Test-Path README.md) { Copy-Item README.md package/ }
+          if (Test-Path LICENSE) { Copy-Item LICENSE package/ }
+          Compress-Archive `
+            -Path package/* `
+            -DestinationPath raijin-windows-x64.zip `
+            -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raijin-windows-x64
+          path: raijin-windows-x64.zip
+          retention-days: 1
+
+  build-extension:
+    name: Build Browser Extensions
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: browser-extension
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm and Node
+        uses: pnpm/setup@v2
+        with:
+          runtime: node@26
+          cache: true
+          install: false
+          working-directory: browser-extension
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Package extensions
+        run: |
+          pnpm run zip
+          pnpm run zip:firefox
+
+      - name: Stage extension artifacts
+        working-directory: .
+        run: |
+          mkdir -p dist-extension
+          cp browser-extension/.output/*chrome*.zip \
+            dist-extension/raijin-extension-chromium.zip
+          cp browser-extension/.output/*firefox*.zip \
+            dist-extension/raijin-extension-firefox.zip
+
+      - name: Upload extension artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-extensions
+          path: dist-extension/raijin-extension-*.zip
+          retention-days: 1
+
+  publish:
+    name: Publish Nightly Release
+    needs: [build-desktop, build-extension]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate release notes
+        env:
+          ACTOR: ${{ github.actor }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+          COMMIT_URL="${REPO_URL}/commit/${COMMIT_SHA}"
+          cat << EOF > release-notes.md
+          ## Raijin Nightly Build
+
+          Automated rolling pre-release built directly from \`main\`.
+
+          - **Commit**: [${COMMIT_SHA}](${COMMIT_URL})
+          - **Triggered by**: ${ACTOR}
+          - **Date**: ${BUILD_DATE}
+
+          ### Downloads
+          - \`raijin-windows-x64.zip\`: Portable executable for Windows x64
+          - \`raijin-extension-chromium.zip\`: Chrome / Edge / Brave extension
+          - \`raijin-extension-firefox.zip\`: Firefox extension (MV2)
+
+          > ⚠️ **Development Build**: Automated rolling development build.
+          > Database schemas may change without backwards compatibility.
+          EOF
+
+      - name: Publish or update rolling release
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -f nightly "${COMMIT_SHA}"
+          git push -f origin nightly
+
+          if gh release view nightly > /dev/null 2>&1; then
+            gh release edit nightly \
+              --title "Raijin Nightly (Latest)" \
+              --notes-file release-notes.md \
+              --prerelease
+            gh release upload nightly dist/* --clobber
+          else
+            gh release create nightly dist/* \
+              --title "Raijin Nightly (Latest)" \
+              --notes-file release-notes.md \
+              --prerelease
+          fi

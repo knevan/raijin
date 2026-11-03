@@ -13,7 +13,7 @@ concurrency:
 jobs:
   filter-changes:
     name: Filter Changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       pull-requests: read
@@ -36,7 +36,7 @@ jobs:
     name: Typecheck
     needs: filter-changes
     if: needs.filter-changes.outputs.extension == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: browser-extension
@@ -62,7 +62,7 @@ jobs:
     name: Test
     needs: filter-changes
     if: needs.filter-changes.outputs.extension == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: browser-extension
@@ -88,7 +88,7 @@ jobs:
     name: Build & Lint
     needs: filter-changes
     if: needs.filter-changes.outputs.extension == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: browser-extension

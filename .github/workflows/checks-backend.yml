@@ -13,7 +13,7 @@ concurrency:
 jobs:
   filter-changes:
     name: Filter Changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       pull-requests: read
@@ -39,7 +39,7 @@ jobs:
     name: Format
     needs: filter-changes
     if: needs.filter-changes.outputs.backend == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 

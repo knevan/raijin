@@ -5958,6 +5958,7 @@ dependencies = [
  "hotpath",
  "log",
  "raijin-core",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

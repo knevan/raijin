@@ -121,6 +121,141 @@ fn folder_picker_should_preserve_category_and_handle_selection_and_cancel(cx: &m
 }
 
 #[gpui_kit::test]
+fn queue_picker_should_open_without_adding_and_dismiss_with_escape(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let handles = test_handles(&runtime, std::env::temp_dir());
+    let custom = runtime
+        .block_on(handles.queues.create("Later"))
+        .expect("queue");
+    cx.update(gpui_kit::init);
+    let handle = cx.update(|cx| {
+        super::super::open_add_download_window(cx, &handles, "http://127.0.0.1:1/file.zip");
+        *cx.windows().last().expect("window")
+    });
+    cx.update_window(handle, |_, window, cx| {
+        let view = base::Root::read(window, cx)
+            .view()
+            .clone()
+            .downcast::<super::super::AddDownloadView>()
+            .expect("form");
+        window.render_frame(cx);
+        assert!(
+            window.find("add-cancel").bounds().right()
+                < window.find("add-queue-trigger").bounds().left()
+        );
+        assert!(
+            window.find("add-queue-trigger").bounds().right()
+                < window.find("add-submit-start").bounds().left()
+        );
+        window.click("add-queue-trigger", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).queue_picker_open);
+        assert_eq!(
+            view.read(cx).selected_queue,
+            raijin_core::download::QueueId::MAIN
+        );
+        assert!(
+            window.find("add-start-queue").bounds().bottom()
+                < window.find("add-queue-confirm").bounds().top()
+        );
+        window.click("add-start-queue", cx);
+        assert!(view.read(cx).start_queue);
+        window.within("add-queue-choices").click(1usize, cx);
+        assert_eq!(view.read(cx).selected_queue, custom);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).queue_picker_open);
+        assert!(!view.read(cx).submitting);
+        window.click("add-queue-trigger", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).queue_picker_open);
+        assert_eq!(view.read(cx).selected_queue, custom);
+        window.remove_window();
+    })
+    .expect("window update");
+    assert!(
+        runtime
+            .block_on(handles.manager.list())
+            .expect("downloads")
+            .is_empty()
+    );
+    runtime
+        .block_on(handles.queues.shutdown())
+        .expect("queue shutdown");
+    runtime
+        .block_on(handles.manager.shutdown())
+        .expect("manager shutdown");
+}
+
+#[gpui_kit::test]
+fn queue_confirmation_should_add_ready_to_the_selected_stopped_queue(cx: &mut TestAppContext) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let handles = test_handles(&runtime, std::env::temp_dir());
+    let custom = runtime
+        .block_on(handles.queues.create("Later"))
+        .expect("queue");
+    cx.update(gpui_kit::init);
+    let handle = cx.update(|cx| {
+        super::super::open_add_download_window(cx, &handles, "http://127.0.0.1:1/file.zip");
+        *cx.windows().last().expect("window")
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("add-queue-trigger", cx);
+        window.within("add-queue-choices").click(1usize, cx);
+        window.click("add-queue-confirm", cx);
+    })
+    .expect("submit window");
+    runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshots = handles.queues.list().await.expect("queues");
+                let snapshot = snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.queue.id == custom)
+                    .expect("custom queue");
+                if !snapshot.items.is_empty() {
+                    assert!(!snapshot.active);
+                    let downloads = handles.manager.list().await.expect("downloads");
+                    assert_eq!(downloads.len(), 1);
+                    assert_eq!(
+                        downloads[0].status,
+                        raijin_core::download::DownloadStatus::Queued
+                    );
+                    assert_eq!(snapshot.items, vec![downloads[0].id]);
+                    assert!(
+                        handles
+                            .manager
+                            .list_active()
+                            .await
+                            .expect("active")
+                            .is_empty()
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queue submission must finish");
+    });
+    cx.run_until_parked();
+    cx.update(|cx| assert!(!cx.windows().contains(&handle)));
+    runtime
+        .block_on(handles.queues.shutdown())
+        .expect("queue shutdown");
+    runtime
+        .block_on(handles.manager.shutdown())
+        .expect("manager shutdown");
+}
+
+#[gpui_kit::test]
 fn integration_metadata_should_seed_size_probe_missing_fields_and_preserve_user_edits(
     cx: &mut TestAppContext,
 ) {

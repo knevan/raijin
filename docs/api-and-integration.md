@@ -18,7 +18,7 @@ The `axum` API connects the browser extension, CLI, and third-party tools to the
 
 An invalid, empty, malformed, or duplicated Authorization header on `/add` is rejected with `401`; it never falls back to Basic access. `/ping` is intentionally public and is not a credential check.
 
-For authenticated `/add`, `silentAdd: true` bypasses confirmation; `silentStart` determines whether to enqueue immediately. Basic access cannot bypass confirmation through either flag or the headless endpoint. `202 Accepted` for confirmation acknowledges successful creation of every confirmation window, not user approval or download creation. If any window fails to open, windows already created for that batch are closed and the handoff fails.
+For authenticated `/add`, `silentAdd: true` bypasses confirmation; `silentStart` determines whether to start a direct download immediately or leave it paused. Silent adds do not join a queue. Confirmation windows offer direct Download or an explicit Add to queue workflow. Basic access cannot bypass confirmation through either flag or the headless endpoint. `202 Accepted` for confirmation acknowledges successful creation of every confirmation window, not user approval or download creation. If any window fails to open, windows already created for that batch are closed and the handoff fails.
 
 ## 2. Security boundaries
 

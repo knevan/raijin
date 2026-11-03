@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use raijin_core::download::{DownloadManagerHandle, QueueId};
+use raijin_core::download::DownloadManagerHandle;
 use raijin_core::integration::{
     AddDownloadRequest, DEFAULT_COMMAND_BUFFER, IntegrationCommand, IntegrationHandle,
     IntegrationReply, IntegrationResponder, PreparedItem, QueueSummary, prepare_request,
@@ -73,10 +73,7 @@ pub fn validate_confirmation(
     }
 }
 
-/// Adds items without a dialog and hands each one to the Main queue.
-///
-/// Leaving a download out of a queue would strand it: admission is the only
-/// path that starts a job, so the membership write is part of the request.
+/// Adds direct downloads without a dialog, optionally starting them.
 ///
 /// # Errors
 ///
@@ -94,21 +91,16 @@ pub async fn add_prepared(
             .await
             .map_err(|error| error.to_string())?;
         ids.push(added.id.get());
-        if !autostart {
+        if autostart {
+            engine.queues.resume(added.id).await.map_err(|error| {
+                format!("Download {} was created but could not start: {error}. Resume it in the library; do not submit it again.", added.id.get())
+            })?;
+        } else {
             engine
                 .manager
                 .pause(added.id)
                 .await
                 .map_err(|error| error.to_string())?;
-        }
-        if let Err(error) = engine.queues.enqueue(QueueId::MAIN, [added.id]).await {
-            // The download row exists; failing the whole request would discard
-            // ids the extension can still act on.
-            tracing::warn!(
-                ?error,
-                id = added.id.get(),
-                "queue enqueue after add failed"
-            );
         }
     }
     Ok(IntegrationReply::Accepted { ids })
@@ -345,13 +337,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn silent_add_should_keep_membership_and_only_start_when_requested() {
+    async fn silent_add_should_keep_direct_mode_and_only_start_when_requested() {
         use raijin_core::db::{DownloadRepository, PartRepository, QueueRepository};
         use raijin_core::download::{
-            DownloadManagerHandle, DownloadManagerOptions, DownloadStatus, QueueId,
+            DownloadManagerHandle, DownloadManagerOptions, DownloadStatus,
         };
         use raijin_core::queue::{QueueManagerHandle, QueueManagerOptions};
 
+        let folder = tempfile::tempdir().expect("destination");
         let pool = raijin_core::db::bootstrap("sqlite::memory:")
             .await
             .expect("database");
@@ -379,7 +372,7 @@ mod tests {
             manager,
             queues,
             runtime: tokio::runtime::Handle::current(),
-            default_folder: std::env::temp_dir(),
+            default_folder: folder.path().to_path_buf(),
         };
         for start in [false, true] {
             let prepared = raijin_core::integration::prepare_request(
@@ -400,7 +393,7 @@ mod tests {
                 .expect("added item");
             assert_eq!(added.status == DownloadStatus::Paused, !start);
             let queues = engine.queues.list().await.expect("queues");
-            assert!(queues.iter().any(|queue| queue.queue.id == QueueId::MAIN && queue.items.contains(&added.id)));
+            assert!(queues.iter().all(|queue| !queue.items.contains(&added.id)));
         }
         engine.queues.shutdown().await.expect("queue shutdown");
         queue_task.await.expect("queue task").expect("queue result");

@@ -3,7 +3,7 @@ pub(crate) mod queue_tests;
 
 use std::path::PathBuf;
 
-use gpui_kit::{App, Window};
+use gpui_kit::{App, Entity, Task, Window};
 use raijin_core::download::{DownloadId, DownloadManagerHandle, NewDownload, QueueId};
 use raijin_core::monitor::DownloadMonitorHandle;
 use raijin_core::queue::QueueManagerHandle;
@@ -71,7 +71,7 @@ pub struct EngineHandles {
 pub enum EngineCommand {
     /// Pause one download.
     Pause(DownloadId),
-    /// Resume one download (re-queues it for worker startup).
+    /// Resume one download while preserving direct or queued execution.
     Resume(DownloadId),
     /// Remove one download and delete its files.
     Remove(DownloadId),
@@ -81,10 +81,13 @@ pub enum EngineCommand {
     PauseAll,
     /// Resume every paused download (tray "Resume all", one actor command).
     ResumeAll,
+    AddDirect {
+        request: NewDownload,
+    },
     AddToQueue {
         request: NewDownload,
         queue_id: QueueId,
-        autostart: bool,
+        start_queue: bool,
     },
     Queue(QueueAction),
     /// Move downloads into a queue (drag onto a queue).
@@ -134,6 +137,18 @@ impl CommandFailure {
 }
 
 impl EngineHandles {
+    pub(crate) fn observe_queues<T: 'static>(&self, view: &Entity<T>, cx: &mut App) -> Task<()> {
+        let view = view.downgrade();
+        let mut snapshots = self.queues.snapshots();
+        cx.spawn(async move |cx| {
+            while snapshots.changed().await.is_ok() {
+                if view.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
     /// Dispatches a command for windowless callers; failures are logged.
     pub fn dispatch(&self, command: EngineCommand) {
         self.execute(command);
@@ -211,18 +226,25 @@ impl EngineCommand {
         }
         let result = match self {
             Self::Pause(id) => manager.pause(id).await.map(|_| ()),
-            Self::Resume(id) => manager.resume(id).await.map(|_| ()),
+            Self::Resume(id) => return queues.resume(id).await.map(|_| ()),
             Self::Remove(id) => manager.remove(id).await.map(|_| ()),
             Self::Reset(id) => manager.reset(id).await.map(|_| ()),
             Self::PauseAll => manager.pause_all().await.map(|_| ()),
-            Self::ResumeAll => manager.resume_all().await.map(|_| ()),
-            // Adds must go through the queue: admission is the only path that
-            // starts a job, so an add without membership would never run.
+            Self::ResumeAll => return queues.resume_all().await.map(|_| ()),
+            Self::AddDirect { request } => {
+                let added = manager.add(request).await?;
+                return queues.resume(added.id).await.map(|_| ()).map_err(|source| {
+                    raijin_core::queue::QueueManagerError::AdmissionAfterAdd {
+                        id: added.id,
+                        source: Box::new(source),
+                    }
+                });
+            }
             Self::AddToQueue {
                 request,
                 queue_id,
-                autostart,
-            } => return Self::add_queued(manager, queues, request, queue_id, autostart).await,
+                start_queue,
+            } => return Self::add_queued(manager, queues, request, queue_id, start_queue).await,
             Self::MoveToQueue {
                 queue_id,
                 downloads,
@@ -243,7 +265,7 @@ impl EngineCommand {
         queues: &QueueManagerHandle,
         request: NewDownload,
         queue_id: QueueId,
-        start: bool,
+        start_queue: bool,
     ) -> raijin_core::queue::QueueManagerResult<()> {
         if !queues
             .list()
@@ -257,10 +279,11 @@ impl EngineCommand {
         }
         let added = manager.add(request).await?;
         let admission = async {
-            if !start {
-                manager.pause(added.id).await?;
+            queues.enqueue(queue_id, [added.id]).await?;
+            if start_queue {
+                queues.start(queue_id).await?;
             }
-            queues.enqueue(queue_id, [added.id]).await
+            Ok(())
         }
         .await;
         admission.map_err(

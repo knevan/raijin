@@ -4,6 +4,8 @@ use std::time::Duration;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _, TitleBar,
@@ -11,12 +13,18 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use raijin_core::download::QueueId;
 
 use crate::bridge::{EngineCommand, EngineHandles, build_new_download, is_http_url_str};
 use crate::category::{FileCategory, infer_category};
 use crate::downloads::category_icon;
 use crate::format::format_bytes;
-use crate::queue_picker::QueueChoice;
+
+#[derive(Clone, Copy)]
+enum AddMode {
+    Direct,
+    Queued,
+}
 
 /// Width of the category dropdown, matching the sketch (300).
 const CATEGORY_DROP_WIDTH: f32 = 300.0;
@@ -53,7 +61,9 @@ pub struct AddDownloadView {
     folder: Entity<InputState>,
     file: Entity<InputState>,
     categories: Entity<SelectState<SearchableVec<SharedString>>>,
-    queues: Entity<SelectState<SearchableVec<QueueChoice>>>,
+    selected_queue: QueueId,
+    queue_picker_open: bool,
+    start_queue: bool,
     submitting: bool,
     record_created: bool,
     submit_error: Option<String>,
@@ -75,6 +85,7 @@ pub struct AddDownloadView {
     probe_url: Option<String>,
     probe_abort: Option<tokio::task::AbortHandle>,
     _subscriptions: [Subscription; 4],
+    _queue_updates: Task<()>,
 }
 
 impl AddDownloadView {
@@ -109,39 +120,22 @@ impl AddDownloadView {
                 cx,
             )
         });
-        let snapshots = handles.queues.state();
-        let choices: Vec<_> = if snapshots.is_empty() {
-            vec![QueueChoice::new(
-                raijin_core::download::QueueId::MAIN,
-                "Main",
-            )]
-        } else {
-            snapshots
-                .into_iter()
-                .map(|s| QueueChoice::new(s.queue.id, s.queue.name))
-                .collect()
-        };
-        let queues = cx.new(|cx| {
-            SelectState::new(
-                SearchableVec::new(choices),
-                Some(IndexPath::new(0)),
-                window,
-                cx,
-            )
-        });
         let subscriptions = [
             cx.subscribe_in(&url, window, Self::on_url_event),
             cx.subscribe_in(&folder, window, Self::on_folder_event),
             cx.subscribe_in(&file, window, Self::on_file_event),
             cx.subscribe_in(&categories, window, Self::on_category_event),
         ];
+        let queue_updates = handles.observe_queues(&cx.entity(), cx);
         let mut view = Self {
             handles,
             url,
             folder,
             file,
             categories,
-            queues,
+            selected_queue: QueueId::MAIN,
+            queue_picker_open: false,
+            start_queue: false,
             submitting: false,
             record_created: false,
             submit_error: None,
@@ -158,6 +152,7 @@ impl AddDownloadView {
             probe_url: None,
             probe_abort: None,
             _subscriptions: subscriptions,
+            _queue_updates: queue_updates,
         };
         // Seed category root + checkbox default from engine handles, then run
         // one derivation pass so folder/file/probe match the seeded URL.
@@ -410,7 +405,9 @@ impl AddDownloadView {
     ) {
         match event {
             InputEvent::Change => self.refresh_derived(window, cx),
-            InputEvent::PressEnter { .. } => self.submit(true, window, cx),
+            InputEvent::PressEnter { .. } if !self.queue_picker_open => {
+                self.submit(AddMode::Direct, window, cx)
+            }
             _ => {}
         }
     }
@@ -438,7 +435,9 @@ impl AddDownloadView {
                     }
                 }
             }
-            InputEvent::PressEnter { .. } => self.submit(true, window, cx),
+            InputEvent::PressEnter { .. } if !self.queue_picker_open => {
+                self.submit(AddMode::Direct, window, cx)
+            }
             _ => {}
         }
     }
@@ -537,16 +536,22 @@ impl AddDownloadView {
         self.refresh_derived(window, cx);
     }
 
-    /// Submits the form: `autostart` selects Download (resume) vs Add (idle).
-    fn submit(&mut self, autostart: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn submit(&mut self, mode: AddMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.submitting || self.record_created {
             return;
         }
-        let Some(queue_id) = self.queues.read(cx).selected_value().copied() else {
-            self.submit_error = Some("Choose a queue.".to_owned());
+        if matches!(mode, AddMode::Queued)
+            && !self
+                .handles
+                .queues
+                .state()
+                .iter()
+                .any(|snapshot| snapshot.queue.id == self.selected_queue)
+        {
+            self.submit_error = Some("Choose an available queue.".to_owned());
             cx.notify();
             return;
-        };
+        }
         let url = self.url.read(cx).value().to_string();
         let raw_file = self.file.read(cx).value().to_string();
         let file_name = sanitize_filename(&raw_file);
@@ -568,12 +573,16 @@ impl AddDownloadView {
                 self.submit_error = None;
                 cx.notify();
                 let weak = cx.entity().downgrade();
-                self.handles.run_in(
-                    EngineCommand::AddToQueue {
+                let command = match mode {
+                    AddMode::Direct => EngineCommand::AddDirect { request },
+                    AddMode::Queued => EngineCommand::AddToQueue {
                         request,
-                        queue_id,
-                        autostart,
+                        queue_id: self.selected_queue,
+                        start_queue: self.start_queue,
                     },
+                };
+                self.handles.run_in(
+                    command,
                     window,
                     cx,
                     move |result, window, cx| {
@@ -584,7 +593,7 @@ impl AddDownloadView {
                                 Err(error) => {
                                 view.record_created = error.created_download().is_some();
                                 view.submit_error = Some(if view.record_created {
-                                    format!("{error}. Close this window and use Move to queue in the library; do not add the download again.")
+                                    format!("{error}. Close this window and use Resume or Move to queue in the library; do not add the download again.")
                                 } else { error.to_string() });
                             }
                             }
@@ -595,6 +604,100 @@ impl AddDownloadView {
             }
             Err(error) => window.push_notification(error.to_string(), cx),
         }
+    }
+
+    fn render_queue_trigger(&self, valid: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        Popover::new("add-queue-picker")
+            .anchor(Anchor::BottomRight)
+            .open(self.queue_picker_open)
+            .on_open_change(cx.listener(|this, open, _, cx| {
+                this.queue_picker_open = *open;
+                cx.notify();
+            }))
+            .trigger(
+                Button::new("add-queue-trigger")
+                    .outline()
+                    .label("Add to queue…")
+                    .disabled(!valid),
+            )
+            .content(move |_, window, cx| {
+                view.update(cx, |view, cx| view.render_queue_picker(window, cx))
+            })
+    }
+
+    fn render_queue_picker(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let snapshots = self.handles.queues.state();
+        let selected = snapshots
+            .iter()
+            .position(|snapshot| snapshot.queue.id == self.selected_queue);
+        let radios = snapshots
+            .iter()
+            .map(|snapshot| {
+                Radio::new(SharedString::from(format!(
+                    "add-queue-{}",
+                    snapshot.queue.id.get()
+                )))
+                .label(format!(
+                    "{} · {}",
+                    snapshot.queue.name,
+                    if snapshot.active { "Active" } else { "Stopped" }
+                ))
+            })
+            .collect::<Vec<_>>();
+        v_flex()
+            .w_64()
+            .gap_3()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Select queue"),
+            )
+            .child(
+                div()
+                    .id("add-queue-options")
+                    .max_h_32()
+                    .overflow_y_scroll()
+                    .child(
+                        RadioGroup::new("add-queue-choices")
+                            .selected_index(selected)
+                            .disabled(self.submitting)
+                            .children(radios)
+                            .on_change(cx.listener(move |this, index: &usize, _, cx| {
+                                if let Some(snapshot) = snapshots.get(*index) {
+                                    this.selected_queue = snapshot.queue.id;
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            )
+            .child(
+                h_flex().gap_3().child(
+                    Checkbox::new("add-start-queue")
+                        .label("Start queue")
+                        .checked(self.start_queue)
+                        .disabled(self.submitting)
+                        .on_click(cx.listener(|this, checked, _, cx| {
+                            this.start_queue = *checked;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .when_some(self.submit_error.clone(), |this, error| {
+                this.child(div().text_sm().text_color(cx.theme().danger).child(error))
+            })
+            .when(self.submitting, |this| this.child("Adding download…"))
+            .child(
+                h_flex().justify_end().child(
+                    Button::new("add-queue-confirm")
+                        .label("Add to queue")
+                        .disabled(!self.is_valid(cx) || selected.is_none())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.submit(AddMode::Queued, window, cx);
+                        })),
+                ),
+            )
+            .into_any_element()
     }
 
     fn render_probe_badge(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -823,20 +926,7 @@ impl Render for AddDownloadView {
                             ),
                     )
                     .child(Input::new(&self.file))
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .child("Queue")
-                            .child(Select::new(&self.queues).disabled(self.submitting)),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(
-                                "Queued downloads wait for an active queue and an available slot.",
-                            ),
-                    )
+                    .child(div().flex_1())
                     .when_some(self.submit_error.clone(), |this, error| {
                         this.child(div().text_sm().text_color(cx.theme().danger).child(error))
                     })
@@ -849,8 +939,8 @@ impl Render for AddDownloadView {
                                 Button::new("add-cancel")
                                     .outline()
                                     .secondary()
-                                    .w(px(130.))
                                     .label("Cancel")
+                                    .disabled(self.submitting)
                                     .on_click(|_, window, _| {
                                         window.remove_window();
                                     }),
@@ -859,27 +949,14 @@ impl Render for AddDownloadView {
                                 h_flex()
                                     .gap_3()
                                     .items_center()
-                                    .child(
-                                        Button::new("add-submit-idle")
-                                            .outline()
-                                            .secondary()
-                                            .w(px(130.))
-                                            .label("Add paused")
-                                            .disabled(!valid)
-                                            .tooltip("Add without starting; resume manually")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.submit(false, window, cx);
-                                            })),
-                                    )
+                                    .child(self.render_queue_trigger(valid, cx))
                                     .child(
                                         Button::new("add-submit-start")
                                             .primary()
-                                            .w(px(170.))
-                                            .label("Add to queue")
+                                            .label("Download")
                                             .disabled(!valid)
-                                            .tooltip("Add ready to run when the queue admits it")
                                             .on_click(cx.listener(|this, _, window, cx| {
-                                                this.submit(true, window, cx);
+                                                this.submit(AddMode::Direct, window, cx);
                                             })),
                                     ),
                             ),
@@ -916,13 +993,13 @@ fn open_download_window(
     integration: Option<raijin_core::integration::PreparedItem>,
     pending: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
 ) -> Result<AnyWindowHandle, String> {
-    // Icon-button rows sit at the 32px field height (down from 44px), so the
-    // frame shrinks by the same 2 x 12px to stay snug.
-    let dialog_size = size(px(500.), px(284.));
+    // Frame accommodates URL, category, folder, file name, and actions
+    // snugly while providing safe clearance for the queue picker popover.
+    let dialog_size = size(px(500.), px(340.));
     let mut options = TitleBar::window_options();
     options.window_bounds = Some(WindowBounds::centered(dialog_size, cx));
     options.window_min_size = Some(dialog_size);
-    options.is_resizable = false;
+    options.is_resizable = true;
     let focus = pending.is_none();
     options.focus = focus;
     let handles = handles.clone();

@@ -84,10 +84,13 @@ are read by nobody outside `crates/core/src/config/mod.rs`:
 | Field | State |
 | --- | --- |
 | `thread_count` | unused |
-| `max_concurrent_downloads` | unused (queue is on hold) |
 | `max_download_retries` | unused |
 | `dynamic_part_creation` | unused |
 | `global_speed_limit_bps` | unused |
+
+`max_concurrent_downloads` is wired as the aggregate queued-download limit and
+initial Main queue budget. It does not limit direct downloads; queue concurrency
+editing is available through queue settings, not this deferred Settings form.
 
 For contrast, the fields that *are* wired: `default_download_folder`,
 `category_root`, and `use_category_by_default` reach `EngineHandles`;

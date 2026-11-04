@@ -25,6 +25,7 @@ This file holds only what applies to every task. Detailed rules are split into a
 | read or touch anything under `crates/core/` | `crates/core/AGENTS.md`, then the skills it lists |
 | read or touch anything under `crates/ui/` | `crates/ui/AGENTS.md`, then the skills it lists |
 | touch the download engine, range splitting, or resume validation | `docs/download-engine.md` |
+| improve adaptive connections, split scheduling, or download performance | `docs/dynamic-splitting-improvements.md` |
 | add or change a migration, table, or SQLite repository | `docs/database.md` |
 | touch queue scheduling or queue models | `docs/queue-rules.md` |
 | touch the system tray, window minimize/hide, or autostart lifecycle | `docs/tray.md` and `docs/startup-deferred.md` |

@@ -22,10 +22,13 @@ use crate::download::{BytesPerSecond, DownloadId, DownloadKind};
 const CHUNK_SIZE: usize = 256 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+const CSV_HEADER: &str = "scenario,run,strategy,first_byte_upper_ms,duration_ms,throughput_mib_s,probe_requests,range_requests,sampled_peak_workers,worker_transitions,initial_target,first_progress_workers";
+const BASELINE_STRATEGIES: &[Strategy] = &[Strategy::Adaptive, Strategy::Single, Strategy::Fixed4];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Strategy {
     Adaptive,
+    AdaptiveFloor,
     Single,
     Fixed4,
     Fixed8,
@@ -35,6 +38,7 @@ impl Strategy {
     fn name(self) -> &'static str {
         match self {
             Self::Adaptive => "Adaptive",
+            Self::AdaptiveFloor => "Adaptive-Floor",
             Self::Single => "Single",
             Self::Fixed4 => "Fixed-4",
             Self::Fixed8 => "Fixed-8",
@@ -43,7 +47,7 @@ impl Strategy {
 
     fn preferred_connections(self) -> Option<NonZeroU16> {
         match self {
-            Self::Adaptive => None,
+            Self::Adaptive | Self::AdaptiveFloor => None,
             Self::Single => NonZeroU16::new(1),
             Self::Fixed4 => NonZeroU16::new(4),
             Self::Fixed8 => NonZeroU16::new(8),
@@ -321,7 +325,7 @@ async fn run_single_baseline(
     db.download_repo.add(&item).await?;
 
     let live_progress = Arc::new(LiveDownloadProgress::new(Bytes::ZERO));
-    let job = HttpDownloadJob::new(
+    let mut job = HttpDownloadJob::new(
         db.download_repo.clone(),
         db.part_repo.clone(),
         ReqwestHttpClient::new()?,
@@ -329,6 +333,21 @@ async fn run_single_baseline(
     )
     .with_live_progress(Arc::clone(&live_progress));
 
+    if strategy == Strategy::AdaptiveFloor {
+        job.config.default_connections =
+            floor_startup_connections(&job.config, u64::try_from(payload.len())?);
+    }
+    let initial_target = if job.preferred_connections().get() == 1 {
+        1
+    } else {
+        ConnectionController::new(
+            &job.config,
+            job.item.preferred_connections,
+            u64::try_from(payload.len())?,
+            0,
+        )
+        .target()
+    };
     let start = Instant::now();
     let mut poll = tokio::time::interval(POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -337,6 +356,7 @@ async fn run_single_baseline(
     tokio::pin!(job_fut);
 
     let mut ttfb: Option<Duration> = None;
+    let mut first_progress_workers = None;
     let mut peak_workers = 0_u16;
     let mut transitions: Vec<(u32, u16)> = Vec::new();
     let mut last_workers = 0_u16;
@@ -354,6 +374,7 @@ async fn run_single_baseline(
                 let elapsed = start.elapsed();
                 if ttfb.is_none() && downloaded.get() > 0 {
                     ttfb = Some(elapsed);
+                    first_progress_workers = Some(workers);
                 }
                 if workers != last_workers {
                     transitions.push((elapsed.as_millis() as u32, workers));
@@ -394,7 +415,7 @@ async fn run_single_baseline(
         .join("->");
 
     println!(
-        "{scenario_id},{},{},{:.2},{:.2},{:.4},{},{},{peak_workers},\"{transitions_str}\"",
+        "{scenario_id},{},{},{:.2},{:.2},{:.4},{},{},{peak_workers},\"{transitions_str}\",{initial_target},{}",
         run_index,
         strategy.name(),
         ttfb_upper.as_secs_f64() * 1000.0,
@@ -402,6 +423,9 @@ async fn run_single_baseline(
         throughput_bps / (1024.0 * 1024.0),
         server.probe_requests(),
         server.range_requests(),
+        first_progress_workers
+            .map(|workers| workers.to_string())
+            .unwrap_or_default(),
     );
 
     Ok(())
@@ -411,9 +435,10 @@ async fn run_scenario(
     scenario_id: &str,
     payload_len: usize,
     throttle: ServerThrottle,
+    strategies: &[Strategy],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    assert!(!strategies.is_empty());
     let payload = (0..=255).cycle().take(payload_len).collect::<Vec<u8>>();
-    let strategies = [Strategy::Adaptive, Strategy::Single, Strategy::Fixed4];
 
     for rep in 0..3 {
         for offset in 0..strategies.len() {
@@ -451,17 +476,124 @@ async fn run_long_scenario(
     Ok(())
 }
 
+fn floor_startup_connections(config: &HttpDownloadJobConfig, remaining: u64) -> u16 {
+    let capacity = (remaining / config.min_part_size.get().max(1)).max(1);
+    config
+        .default_connections
+        .max(1)
+        .min(u16::try_from(capacity).unwrap_or(u16::MAX))
+}
+
+#[test]
+fn floor_startup_candidate_should_only_reduce_requested_default_at_size_boundaries() {
+    let config = HttpDownloadJobConfig::default();
+    let minimum = config.min_part_size.get();
+    for (remaining, expected) in [
+        (0, 1),
+        (minimum - 1, 1),
+        (minimum, 1),
+        (minimum + 1, 1),
+        (minimum * 4 - 1, 3),
+        (minimum * 4, 4),
+        (minimum * 4 + 1, 4),
+        (
+            minimum * u64::from(config.default_connections) + 1,
+            config.default_connections,
+        ),
+        (u64::MAX, config.default_connections),
+    ] {
+        assert_eq!(floor_startup_connections(&config, remaining), expected);
+    }
+    let zero_minimum = HttpDownloadJobConfig {
+        min_part_size: Bytes::ZERO,
+        ..config
+    };
+    assert_eq!(
+        floor_startup_connections(&zero_minimum, u64::MAX),
+        zero_minimum.default_connections
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual startup performance baseline"]
+async fn run_startup_baseline() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_startup_matrix(BASELINE_STRATEGIES).await
+}
+
+#[tokio::test]
+#[ignore = "manual startup candidate comparison"]
+async fn run_startup_candidate() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_startup_matrix(&[Strategy::Adaptive, Strategy::AdaptiveFloor]).await
+}
+
+async fn run_startup_matrix(
+    strategies: &[Strategy],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("{CSV_HEADER}");
+    let config = HttpDownloadJobConfig::default();
+    let minimum = usize::try_from(config.min_part_size.get())?;
+    let default_target = usize::from(config.default_connections);
+    assert!(minimum > 1 && default_target >= 2);
+    let middle = minimum
+        .checked_mul(default_target / 2)
+        .ok_or("startup fixture size overflow")?;
+    let full = minimum
+        .checked_mul(default_target)
+        .ok_or("startup fixture size overflow")?;
+    let sizes = [
+        ("minimum_below", minimum - 1),
+        (
+            "minimum_above",
+            minimum
+                .checked_add(1)
+                .ok_or("startup fixture size overflow")?,
+        ),
+        ("mid_target_below", middle - 1),
+        (
+            "mid_target_above",
+            middle
+                .checked_add(1)
+                .ok_or("startup fixture size overflow")?,
+        ),
+        (
+            "default_target_above",
+            full.checked_add(1).ok_or("startup fixture size overflow")?,
+        ),
+    ];
+    for (label, size) in sizes {
+        for (profile, throttle) in [
+            ("uncapped", ServerThrottle::Uncapped),
+            (
+                "shared",
+                ServerThrottle::Shared(BytesPerSecond::new(10 * 1024 * 1024)),
+            ),
+            (
+                "per_connection",
+                ServerThrottle::PerConnection(BytesPerSecond::new(4 * 1024 * 1024)),
+            ),
+        ] {
+            run_scenario(
+                &format!("startup_{label}_{profile}"),
+                size,
+                throttle,
+                strategies,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "manual performance baseline"]
 async fn run_performance_baseline() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!(
-        "scenario,run,strategy,first_byte_upper_ms,duration_ms,throughput_mib_s,probe_requests,range_requests,sampled_peak_workers,worker_transitions"
-    );
+    println!("{CSV_HEADER}");
 
     run_scenario(
         "small_file_startup",
         2 * 1024 * 1024,
         ServerThrottle::Uncapped,
+        BASELINE_STRATEGIES,
     )
     .await?;
 
@@ -469,6 +601,7 @@ async fn run_performance_baseline() -> Result<(), Box<dyn std::error::Error + Se
         "shared_bandwidth_contention",
         40 * 1024 * 1024,
         ServerThrottle::Shared(BytesPerSecond::new(10 * 1024 * 1024)),
+        BASELINE_STRATEGIES,
     )
     .await?;
 
@@ -476,6 +609,7 @@ async fn run_performance_baseline() -> Result<(), Box<dyn std::error::Error + Se
         "per_connection_throttling",
         40 * 1024 * 1024,
         ServerThrottle::PerConnection(BytesPerSecond::new(4 * 1024 * 1024)),
+        BASELINE_STRATEGIES,
     )
     .await?;
 
@@ -485,9 +619,7 @@ async fn run_performance_baseline() -> Result<(), Box<dyn std::error::Error + Se
 #[tokio::test]
 #[ignore = "manual performance baseline"]
 async fn run_long_ramp_up_baseline() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!(
-        "scenario,run,strategy,first_byte_upper_ms,duration_ms,throughput_mib_s,probe_requests,range_requests,sampled_peak_workers,worker_transitions"
-    );
+    println!("{CSV_HEADER}");
 
     run_long_scenario(
         "long_per_connection_throttling",

@@ -4,6 +4,8 @@ Status: **Active core engine (M2 complete, hardening ongoing)**.
 
 This document records the architectural invariants and design decisions for Raijin's native HTTP multi-part download engine.
 
+For the agreed, not-yet-implemented scheduling and hardening improvement plan, see [Dynamic Splitting: Smarter Scheduling and Hardening](dynamic-splitting-improvements.md).
+
 ---
 
 ## 1. Engine Invariants

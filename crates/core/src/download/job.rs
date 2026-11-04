@@ -156,6 +156,13 @@ pub enum HttpDownloadJobError {
     /// Destination file already exists and could not be disambiguated.
     #[error("destination file conflict for `{0}`")]
     DestinationConflict(String),
+    /// A ranged response ended before its current exclusive boundary.
+    #[error("part `{index}` ended prematurely: expected offset {expected}, reached {actual}")]
+    PrematureEof {
+        index: u32,
+        expected: u64,
+        actual: u64,
+    },
     /// Retry policy was exhausted.
     #[error("too many retries: {0}")]
     TooManyRetries(String),
@@ -614,6 +621,9 @@ impl HttpDownloadJob {
                         self.part_repo.set(&part).await?;
                         pending.push_back(part);
                     } else {
+                        part.status = PartStatus::Error;
+                        part.updated_at = now_ms()?;
+                        self.part_repo.set(&part).await?;
                         first_error = Some(HttpDownloadJobError::TooManyRetries(format!(
                             "part `{}` failed after {} retries: {error}",
                             part.index, self.config.max_retries
@@ -994,9 +1004,9 @@ fn failure_kind(error: &HttpDownloadJobError) -> FailureKind {
         HttpDownloadJobError::Probe(_)
         | HttpDownloadJobError::ResumeUnsupported
         | HttpDownloadJobError::RangeIgnored => FailureKind::Validation,
-        HttpDownloadJobError::Request(_) | HttpDownloadJobError::UnexpectedStatus(_) => {
-            FailureKind::Network
-        }
+        HttpDownloadJobError::Request(_)
+        | HttpDownloadJobError::UnexpectedStatus(_)
+        | HttpDownloadJobError::PrematureEof { .. } => FailureKind::Network,
         // Full disks surface as `ErrorKind::StorageFull`; other filesystem
         // failures (permissions, missing media) stay under `Disk`.
         HttpDownloadJobError::Io(error) if error.kind() == std::io::ErrorKind::StorageFull => {
@@ -1622,6 +1632,9 @@ async fn part_worker_inner(
                 let Some(chunk) = chunk.map_err(|error| worker_failure(&request.part, error.into()))? else {
                     break;
                 };
+                if chunk.is_empty() {
+                    continue;
+                }
                 let chunk_len = u64::try_from(chunk.len()).map_err(|_| worker_failure(&request.part, HttpDownloadJobError::ByteCountOverflow))?;
                 let writable_len = writable_chunk_len(request.part.current_byte.get(), target_end, chunk_len)
                     .map_err(|error| worker_failure(&request.part, error))?;
@@ -1656,14 +1669,27 @@ async fn part_worker_inner(
         }
     }
 
+    file.flush()
+        .await
+        .map_err(|error| worker_failure(&request.part, error.into()))?;
+    let expected_end = target_end.saturating_add(1);
+    if request.part.current_byte.get() != expected_end {
+        let actual = request.part.current_byte.get();
+        return Err(worker_failure(
+            &request.part,
+            HttpDownloadJobError::PrematureEof {
+                index: request.part.index,
+                expected: expected_end,
+                actual,
+            },
+        ));
+    }
+
     request.part.status = PartStatus::Completed;
     request.part.updated_at = now_ms().map_err(|error| worker_failure(&request.part, error))?;
     request
         .part_repo
         .set(&request.part)
-        .await
-        .map_err(|error| worker_failure(&request.part, error.into()))?;
-    file.flush()
         .await
         .map_err(|error| worker_failure(&request.part, error.into()))?;
     Ok(PartWorkerOutcome::Completed)
@@ -1838,6 +1864,7 @@ mod tests {
         range_supported: bool,
         slow_body: bool,
         transient_range_failures: AtomicUsize,
+        premature_eof_failures: AtomicUsize,
     }
 
     impl TestServer {
@@ -1853,6 +1880,7 @@ mod tests {
                 range_supported,
                 slow_body,
                 transient_range_failures: AtomicUsize::new(0),
+                premature_eof_failures: AtomicUsize::new(0),
             });
             let task = tokio::spawn(async move {
                 loop {
@@ -1879,6 +1907,35 @@ mod tests {
                 range_supported: true,
                 slow_body: false,
                 transient_range_failures: AtomicUsize::new(failures),
+                premature_eof_failures: AtomicUsize::new(0),
+            });
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        let _ = handle_connection(stream, state).await;
+                    });
+                }
+            });
+            Ok(Self { addr, task })
+        }
+
+        async fn spawn_with_premature_eof_failures(
+            body: Vec<u8>,
+            failures: usize,
+            slow_body: bool,
+        ) -> std::io::Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let state = Arc::new(ServerState {
+                body,
+                range_supported: true,
+                slow_body,
+                transient_range_failures: AtomicUsize::new(0),
+                premature_eof_failures: AtomicUsize::new(failures),
             });
             let task = tokio::spawn(async move {
                 loop {
@@ -2003,6 +2060,25 @@ mod tests {
                 .and_then(|end| usize::try_from(end).ok())
                 .unwrap_or(total - 1)
                 .min(total - 1);
+            let full_len = end.saturating_sub(start).saturating_add(1);
+            if !is_probe_range(range)
+                && state
+                    .premature_eof_failures
+                    .try_update(
+                        AtomicOrdering::Relaxed,
+                        AtomicOrdering::Relaxed,
+                        |current| current.checked_sub(1),
+                    )
+                    .is_ok()
+            {
+                let truncated_len = (full_len / 2).min(full_len.saturating_sub(1));
+                return (
+                    206,
+                    "Partial Content",
+                    &state.body[start..start + truncated_len],
+                    Some(format!("bytes {start}-{end}/{total}")),
+                );
+            }
             return (
                 206,
                 "Partial Content",
@@ -2905,4 +2981,343 @@ mod tests {
 
         assert_eq!(error.to_failure().kind, FailureKind::Disk);
     }
+
+    #[test]
+    fn premature_eof_should_be_retryable_and_map_to_network_failure() {
+        let error = HttpDownloadJobError::PrematureEof {
+            index: 2,
+            expected: 2048,
+            actual: 1024,
+        };
+
+        assert!(!error.requires_manual_action());
+        assert_eq!(error.to_failure().kind, FailureKind::Network);
+        assert!(error.to_string().contains("part `2`"));
+        assert!(error.to_string().contains("2048"));
+        assert!(error.to_string().contains("1024"));
+    }
+
+    #[tokio::test]
+    async fn ranged_job_should_retry_on_premature_eof_and_complete_successfully()
+    -> HttpDownloadJobResult<()> {
+        let body = (0..=255).cycle().take(8 * 1024 * 1024).collect::<Vec<u8>>();
+        let server = TestServer::spawn_with_premature_eof_failures(body.clone(), 1, false).await?;
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let mut item = sample_item(server.url(), folder.path().to_path_buf(), 0);
+        item.preferred_connections = Some(four_connections());
+
+        let live_progress = Arc::new(LiveDownloadProgress::new(Bytes::ZERO));
+        db.download_repo.add(&item).await?;
+        let completed = HttpDownloadJob::new(
+            db.download_repo.clone(),
+            db.part_repo.clone(),
+            ReqwestHttpClient::new()?,
+            item.clone(),
+        )
+        .with_live_progress(Arc::clone(&live_progress))
+        .run(CancellationToken::new())
+        .await?;
+
+        let final_bytes = fs::read(folder.path().join("file.bin")).await?;
+        let parts = db.part_repo.list_for_download(item.id).await?;
+
+        assert_eq!(completed.status, DownloadStatus::Completed);
+        assert_eq!(final_bytes, body);
+        assert!(parts.len() > 1);
+        assert!(parts.iter().any(|part| part.retry_count > 0));
+        assert_contiguous_completed_ranges(&parts, body.len() as u64);
+
+        let (live_downloaded, active_parts) = live_progress.snapshot();
+        assert_eq!(live_downloaded.get(), body.len() as u64);
+        assert_eq!(active_parts, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumed_retry_after_premature_eof_should_not_double_count_live_progress()
+    -> HttpDownloadJobResult<()> {
+        let total_len = 2 * 1024 * 1024;
+        let body = (0..=255).cycle().take(total_len).collect::<Vec<u8>>();
+        let server = TestServer::spawn_with_premature_eof_failures(body.clone(), 2, false).await?;
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let mut item = sample_item(server.url(), folder.path().to_path_buf(), 0);
+        item.preferred_connections = Some(four_connections());
+
+        let live_progress = Arc::new(LiveDownloadProgress::new(Bytes::ZERO));
+        db.download_repo.add(&item).await?;
+        let completed = HttpDownloadJob::new(
+            db.download_repo.clone(),
+            db.part_repo.clone(),
+            ReqwestHttpClient::new()?,
+            item.clone(),
+        )
+        .with_live_progress(Arc::clone(&live_progress))
+        .run(CancellationToken::new())
+        .await?;
+
+        let final_bytes = fs::read(folder.path().join("file.bin")).await?;
+        let parts = db.part_repo.list_for_download(item.id).await?;
+
+        assert_eq!(completed.status, DownloadStatus::Completed);
+        assert_eq!(final_bytes, body);
+        assert!(parts.iter().any(|part| part.retry_count > 0));
+
+        let (live_downloaded, active_parts) = live_progress.snapshot();
+        assert_eq!(live_downloaded.get(), total_len as u64);
+        assert_eq!(active_parts, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_job_should_fail_when_premature_eof_retries_exhausted()
+    -> HttpDownloadJobResult<()> {
+        let body = (0..=255).cycle().take(8 * 1024 * 1024).collect::<Vec<u8>>();
+        let server = TestServer::spawn_with_premature_eof_failures(body.clone(), 10, false).await?;
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let mut item = sample_item(server.url(), folder.path().to_path_buf(), 0);
+        item.preferred_connections = Some(four_connections());
+
+        let paused = run_job(&db, item.clone(), CancellationToken::new()).await?;
+        let final_path = folder.path().join("file.bin");
+        let parts = db.part_repo.list_for_download(item.id).await?;
+
+        assert_eq!(paused.status, DownloadStatus::Paused);
+        let failure = paused
+            .failure
+            .expect("must record failure on retry exhaustion");
+        assert_eq!(failure.kind, FailureKind::TooManyRetries);
+        assert!(failure.message.contains("too many retries"));
+        assert!(failure.message.contains("ended prematurely"));
+        assert!(!path_exists(&final_path).await?);
+        assert!(!parts.iter().all(part_is_complete));
+        assert!(parts.iter().any(|part| part.retry_count == 3));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_job_should_resume_premature_eof_after_pending_split()
+    -> HttpDownloadJobResult<()> {
+        let completed_len = 1024 * 1024;
+        let total_len = 8 * 1024 * 1024;
+        let body = (0..=255).cycle().take(total_len).collect::<Vec<u8>>();
+        let server = TestServer::spawn_with_premature_eof_failures(body.clone(), 1, false).await?;
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let mut item = sample_item(
+            server.url(),
+            folder.path().to_path_buf(),
+            completed_len as u64,
+        );
+        item.preferred_connections = Some(four_connections());
+        item.total_bytes = Some(Bytes::new(total_len as u64));
+        item.etag = Some("\"job-etag\"".to_owned());
+        db.download_repo.add(&item).await?;
+        let now = now_ms()?;
+        let parts = vec![
+            DownloadPart {
+                id: PartId::new(65_537),
+                download_id: item.id,
+                index: 0,
+                start_byte: Bytes::ZERO,
+                end_byte: Some(Bytes::new(completed_len as u64 - 1)),
+                current_byte: Bytes::new(completed_len as u64),
+                status: PartStatus::Completed,
+                retry_count: 0,
+                updated_at: now,
+            },
+            DownloadPart {
+                id: PartId::new(65_538),
+                download_id: item.id,
+                index: 1,
+                start_byte: Bytes::new(completed_len as u64),
+                end_byte: Some(Bytes::new(total_len as u64 - 1)),
+                current_byte: Bytes::new(completed_len as u64),
+                status: PartStatus::Idle,
+                retry_count: 0,
+                updated_at: now,
+            },
+        ];
+        db.part_repo.set_for_download(item.id, &parts).await?;
+        let mut partial = vec![0_u8; total_len];
+        partial[..completed_len].copy_from_slice(&body[..completed_len]);
+        fs::write(folder.path().join("file.bin.raijin-part"), partial).await?;
+        let mut job = HttpDownloadJob::new(
+            db.download_repo.clone(),
+            db.part_repo.clone(),
+            ReqwestHttpClient::new()?,
+            item.clone(),
+        );
+        job.config.min_part_size = Bytes::new(1024 * 1024);
+
+        let completed = job.run(CancellationToken::new()).await?;
+        let final_bytes = fs::read(folder.path().join("file.bin")).await?;
+        let persisted_parts = db.part_repo.list_for_download(item.id).await?;
+
+        assert_eq!(completed.status, DownloadStatus::Completed);
+        assert_eq!(final_bytes, body);
+        assert!(persisted_parts.len() > parts.len());
+        assert!(persisted_parts.iter().any(|part| part.retry_count > 0));
+        assert_contiguous_completed_ranges(&persisted_parts, total_len as u64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn part_worker_should_fail_with_committed_split_boundary_on_premature_eof()
+    -> HttpDownloadJobResult<()> {
+        let total_len = 256 * 1024;
+        let original_end = (total_len - 1) as u64;
+        let body = (0..=255).cycle().take(total_len).collect::<Vec<u8>>();
+        let server = TestServer::spawn_with_premature_eof_failures(body.clone(), 1, true).await?;
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let incomplete_path = folder.path().join("file.bin.raijin-part");
+
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&incomplete_path)
+            .await?;
+        file.set_len(total_len as u64).await?;
+        drop(file);
+
+        let mut item = sample_item(server.url(), folder.path().to_path_buf(), 0);
+        item.total_bytes = Some(Bytes::new(total_len as u64));
+        item.etag = Some("\"job-etag\"".to_owned());
+        db.download_repo.add(&item).await?;
+
+        let now = now_ms()?;
+        let part = DownloadPart {
+            id: PartId::new(65_537),
+            download_id: item.id,
+            index: 0,
+            start_byte: Bytes::ZERO,
+            end_byte: Some(Bytes::new(original_end)),
+            current_byte: Bytes::ZERO,
+            status: PartStatus::Idle,
+            retry_count: 0,
+            updated_at: now,
+        };
+        db.part_repo
+            .set_for_download(item.id, std::slice::from_ref(&part))
+            .await?;
+
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let active_state = Arc::new(ActivePartState::new(&part));
+        let mut worker_controls = std::collections::HashMap::new();
+        worker_controls.insert(
+            0,
+            ActivePartControl {
+                tx: control_tx,
+                state: Arc::clone(&active_state),
+            },
+        );
+
+        let cancellation = CancellationToken::new();
+        let request = PartWorkerRequest {
+            part_repo: db.part_repo.clone(),
+            client: ReqwestHttpClient::new()?,
+            url: item.url.clone(),
+            headers: item.headers.clone(),
+            path: incomplete_path.clone(),
+            part,
+            cancellation: cancellation.clone(),
+            progress_interval: Duration::from_millis(10),
+            speed_limiter: None,
+            global_limiter: None,
+            live_progress: None,
+            control_rx,
+            active_state: Arc::clone(&active_state),
+        };
+
+        let mut workers = JoinSet::new();
+        workers.spawn(async move { part_worker(request).await });
+
+        let mut progress_seen = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if active_state.current_byte.load(AtomicOrdering::Relaxed) > 0 {
+                progress_seen = true;
+                break;
+            }
+        }
+        assert!(
+            progress_seen,
+            "worker must make progress before in-flight split"
+        );
+
+        let mut next_part_index = 1;
+        let child = request_inflight_split(
+            &worker_controls,
+            &db.part_repo,
+            &mut next_part_index,
+            Bytes::new(4 * 1024),
+            now_ms()?,
+            &cancellation,
+        )
+        .await?;
+        let child = child.expect("in-flight split must succeed");
+
+        let worker_joined = tokio::time::timeout(Duration::from_secs(5), workers.join_next())
+            .await
+            .expect("worker must finish within timeout")
+            .expect("worker joined")
+            .expect("worker task must not panic")?;
+
+        let (failed_parent, error) = match worker_joined {
+            PartWorkerOutcome::Failed(parent, error) => (parent, error),
+            other => panic!("expected worker to fail with premature EOF, got {other:?}"),
+        };
+
+        let (index, expected, actual) = match error {
+            HttpDownloadJobError::PrematureEof {
+                index,
+                expected,
+                actual,
+            } => (index, expected, actual),
+            other => panic!("expected PrematureEof error, got {other:?}"),
+        };
+
+        assert_eq!(index, 0);
+
+        let persisted_parts = db.part_repo.list_for_download(item.id).await?;
+        let persisted_parent = persisted_parts
+            .iter()
+            .find(|p| p.index == 0)
+            .expect("parent part exists in database");
+        let persisted_child = persisted_parts
+            .iter()
+            .find(|p| p.index == child.index)
+            .expect("child part exists in database");
+
+        let parent_end = persisted_parent
+            .end_byte
+            .expect("parent has end_byte")
+            .get();
+        let parent_exclusive_end = parent_end.saturating_add(1);
+
+        assert_eq!(expected, parent_exclusive_end);
+        assert_ne!(parent_end, original_end);
+        assert!(actual < expected);
+        assert_eq!(failed_parent.current_byte, Bytes::new(actual));
+        assert_eq!(child.status, PartStatus::Idle);
+        assert_eq!(persisted_child.status, PartStatus::Idle);
+        assert_eq!(child.start_byte.get(), parent_exclusive_end);
+        assert_eq!(
+            child.end_byte.expect("child has end_byte").get(),
+            original_end
+        );
+        assert_eq!(persisted_child.start_byte, child.start_byte);
+        assert_eq!(persisted_child.end_byte, child.end_byte);
+        assert_eq!(failed_parent.end_byte, persisted_parent.end_byte);
+        assert_eq!(failed_parent.end_byte, Some(Bytes::new(parent_end)));
+
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+mod baseline;

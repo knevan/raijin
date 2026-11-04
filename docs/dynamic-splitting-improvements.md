@@ -29,7 +29,7 @@ The discussion inspected these implementation points:
 - `crates/core/src/download/model.rs`: `DownloadConfig` defaults.
 - `crates/core/src/db/repositories.rs`: transactional `PartRepository::set_many()`.
 
-Current behavior:
+Behavior before the ConnectionController increments in §6.2:
 
 - Initial ranges are partitioned according to connection target and file size.
 - Vacant worker slots consume pending parts first; pending parts can be split when more work is needed.
@@ -119,9 +119,9 @@ Recovery should target the affected worker when appropriate, preserving committe
 ### 3.6 Smart / Performance Acceptance Checklist
 
 - [ ] Initial parallelism is size-aware and starts transfer without waiting for adaptive sampling; small-file startup and large-file ramp-up are measured against the baseline.
-- [ ] Throughput samples use actual elapsed time and smoothing rather than raw byte deltas alone.
-- [ ] Bounded connection probes compare baseline and post-settling throughput to evaluate useful gain.
-- [ ] Settling, hysteresis, and cooldown prevent expansion or oscillation driven by individual noisy samples.
+- [x] Throughput samples use actual elapsed time and smoothing rather than raw byte deltas alone. Verified by `download::job::connections_tests::throughput_` deterministic timestamp tests; see §6.2.
+- [x] Bounded connection probes compare baseline and post-settling throughput to evaluate useful gain. Verified by `adaptive_probe_should_wait_for_activation_and_exclude_settling_bytes` and `adaptive_probe_should_retain_sustained_gain_then_allow_only_one_new_worker`; see §6.2.
+- [x] Settling, hysteresis, and cooldown prevent expansion or oscillation driven by individual noisy samples. Verified by `adaptive_probe_should_not_accept_one_noisy_sample_or_oscillate_after_low_gain` and worker-change/activation-timeout tests; see §6.2.
 - [ ] Adaptation evaluates actual active workers and handles gradual target reduction without unsafe termination or lost progress.
 - [ ] Manual connection overrides and configured bounds remain authoritative; adaptation avoids futile expansion under local/global speed limits.
 - [ ] Local throttling and competing downloads are considered when interpreting throughput changes.
@@ -224,13 +224,13 @@ The ignored test in `crates/core/src/download/job/baseline.rs` runs all scenario
 | Per-connection bottleneck | 40 MiB | 4 MiB/s per data request |
 
 ```bash
-cargo test --release -p raijin-core download::job::baseline -- --ignored --nocapture
+cargo test --release -p raijin-core download::job::baseline::run_performance_baseline -- --ignored --nocapture
 ```
 
 On the inspected Windows/MSVC 14.44 environment, the default release dependency build failed with `aws-lc-sys` error C1056 while writing COFF timestamps. A session-local build workaround succeeded without changing repository configuration or dependencies:
 
 ```bash
-CRATE_CC_NO_DEFAULTS=1 CFLAGS='-MD -O2' CARGO_BUILD_JOBS=4 cargo test --release -p raijin-core download::job::baseline -- --ignored --nocapture
+CRATE_CC_NO_DEFAULTS=1 CFLAGS='-MD -O2' CARGO_BUILD_JOBS=4 cargo test --release -p raijin-core download::job::baseline::run_performance_baseline -- --ignored --nocapture
 ```
 
 This workaround omits cc-rs default native compiler flags (including `-Brepro`) and explicitly retains the dynamic CRT and optimization flags. It limits build parallelism only, not test threads. Use the same build environment for all compared revisions and record it with results; it is not a required application setting.
@@ -276,7 +276,7 @@ Static inspection of `HttpDownloadJob::run_inner()`, `probe()`, `probe_http()`, 
 - Each `run_inner()` attempt performs an HTTP metadata probe before starting body workers. Resume validation runs when the incomplete file has nonzero length; a job-level retry re-enters this setup path, whereas ranged part retries remain inside `run_ranged()`.
 - `probe_http()` first requests `Range: bytes=0-255`. A valid `206` supplies range metadata. Selected fallback statuses trigger a second, non-range request; the production client captures at most 4096 useful body bytes for metadata inspection.
 - Transfer requests are separate from the probe: one body request for the single-stream path or one request per ranged worker, plus retries and split children. Probe latency and worker setup must not be attributed to connection-controller sampling.
-- `ConnectionController::observe()` currently uses byte deltas without actual elapsed-time normalization. This is a confirmed measurement limitation, not measured proof that adaptation dominates user-visible latency.
+- At this audit's base revision, `ConnectionController::observe()` used byte deltas without actual elapsed-time normalization. This confirmed measurement limitation is addressed in §6.2; it was not measured proof that adaptation dominates user-visible latency.
 
 No probe request has been removed or reused in this increment. Potential request reuse requires separate evidence and must preserve range rejection and remote-change validation.
 
@@ -285,6 +285,82 @@ No probe request has been removed or reused in this increment. Potential request
 This increment retains the existing ranged retry policy: exhaustion pauses the download with a `TooManyRetries` failure rather than silently finalizing it. Persisted part retry counts are retained on a later resume. Whether explicit resume should renew the retry budget, and whether exhaustion should emit a failed rather than paused manager event, are separate policy decisions; changing outer job retries at the same time could multiply attempts.
 
 Checkpoint ordering under forced termination, cancellation during a delayed split commit, and a separate post-application worker ACK remain unverified. Passing EOF and split tests does not establish the entire process-interruption recovery checklist.
+
+### 6.2 ConnectionController Increments: Measurement and Bounded Probes
+
+Scope: elapsed-time throughput measurement and bounded probe-and-observe only. Startup defaults, initial partitioning, split candidate selection, split boundaries, persistence, and schema remain unchanged. Size-aware startup tuning is a separate increment.
+
+Measurement uses explicit monotonic timestamps and useful byte deltas. The first sample establishes the byte/time baseline; zero progress is valid. Zero, reversed, and shorter-than-minimum intervals do not consume accumulated bytes. A regressing byte counter resets the measurement. Time-aware EWMA uses `alpha = 1 - exp(-elapsed / tau)` with `tau = 2 * connection_probe_interval`; the minimum accepted interval is the larger of 1 ms and one tenth of the probe interval.
+
+The controller follows `Baseline -> AwaitActivation -> Settling -> Observe`, with `Cooldown` after insufficient gain, invalidation, or activation timeout:
+
+- Baseline requires a stable actual active count equal to the target, at least two valid samples, and at least two probe intervals. Positive throughput is required before requesting exactly one additional worker.
+- Activation must be observed in the live active counter before settling begins. Connecting workers are counted, not proven productive streams. Activation waiting is bounded to four probe intervals. An unavailable/invalid activation withdraws the extra target slot and enters cooldown; any worker that races with that withdrawal drains naturally.
+- Settling lasts two probe intervals; its bytes are excluded from the post-probe measurement. The baseline is frozen rather than continuously mixed into the post-probe EWMA.
+- Observation requires at least two valid samples over two probe intervals. Both raw and smoothed rates must exceed the frozen baseline by the configured gain threshold for two consecutive samples. Useful gain permits a new baseline, not an immediate additional probe.
+- Low gain retains the worker and suspends expansion for four probe intervals. There is no probe rollback or forced termination. Cooldown permits later remeasurement; it does not permanently infer a server connection cap.
+- Worker starts/completions observed by the scheduler invalidate baseline/settling/observation windows as appropriate, including replacement at the same sampled active count. A completion also invalidates pending activation, even if other starts hide it in the sampled count. Retry-driven target reduction remains separate; no new expansion occurs while actual workers exceed or fall short of the target. Stable unfilled slots are reconciled to the observed count after a measurement window, respecting configured minimums and without terminating workers.
+- Local or global limiter presence conservatively suspends adaptive expansion. This does not claim the download is limit-bound: it can miss useful parallelism below a high cap. Limiter-pressure feedback, competing-download attribution, and the broad limiter acceptance checkbox remain deferred. Explicit manual overrides stay fixed and still use existing worker-side shaping.
+- Debug tracing records requested probes, observed activation, baseline/post-probe rates, and cooldown reasons. A measured gain is evidence to continue cautiously, not proof of causality.
+
+These interval multipliers are initial internal policy parameters, not new settings or validated universal optima.
+
+#### Comparison Protocol and Budgets
+
+Before collecting this increment's comparison results, use the same release build environment and harness on base revision `5291258` and the changed controller. Keep the existing three scenarios and add separate long per-connection/shared-cap scenarios. Long per-connection shaping must allow multiple full control cycles at the unchanged eight-worker startup; compare Adaptive with Fixed-8 there, while Single and Fixed-4 remain covered by the original matrix. Run performance tests sequentially to avoid cross-scenario contention. Use separate invocations of `download::job::baseline::run_performance_baseline` and `download::job::baseline::run_long_ramp_up_baseline` with `--release -- --ignored --nocapture`; do not use the broad `download::job::baseline` filter, which runs both tests concurrently.
+
+Initial acceptance budgets for this loopback experiment:
+
+- Shared-cap median completion regression: at most 5% for each shared scenario.
+- Small-file median completion regression: at most 10 ms absolute; all strategies must retain one data request.
+- Adaptive data-request overhead relative to the old controller: at most one extra request in the original short shared-cap scenario and at most three in the long shared-cap scenario.
+- Long per-connection completion and request overhead are reported together; no speedup target is promised. Every download must complete with exact final bytes.
+
+Three repetitions are a screening comparison, not a statistical guarantee. A budget miss requires investigation/repetition rather than retrospective budget changes. The benchmark still does not model WAN latency, loss, disk pressure, or real competing downloads.
+
+#### Functional Validation
+
+- `cargo test -p raijin-core download::job:: --lib`: **47 passed**, **2 ignored**. This includes 18 deterministic controller/measurement tests, existing EOF/retry/split/cancellation tests, and a ranged adaptive transfer exercising local and global speed limits separately. The limiter integration test checks useful bytes, contiguous completed coverage, sampled workers within the initial target, and retained shaping; persisted part count may grow when an existing slot is refilled by splitting.
+- `cargo test -p raijin-core download::speed:: --lib`: **3 passed**.
+- `cargo check -p raijin-core`: **passed**.
+- `cargo clippy --all-targets -p raijin-core -- -D warnings`: **passed**.
+- Active LSP probes were inconclusive because the primary server did not answer; Cargo checks are the type/lint evidence.
+
+Review fixes withdraw an unrealized probe target after activation timeout, reconcile stable unfilled slots without terminating workers, and invalidate activation if a completion was hidden by other starts. Existing minimum-connection precedence in `cap_by_remaining` is intentionally unchanged; changing startup/remaining-work bounds is outside these increments. Actual elapsed-time window minimums are kept strict: timer jitter may lengthen a window by a tick, not silently shorten the required measurement/settling period.
+
+#### Release Comparison Results
+
+Environment: Windows x86_64, `rustc 1.101.0-nightly (12433c307 2026-10-24)`, base `5291258` versus this increment's working tree. Both use the session-local `CRATE_CC_NO_DEFAULTS=1 CFLAGS='-MD -O2' CARGO_BUILD_JOBS=4` build workaround described above. Old and new binaries are run sequentially. The old binary exposes the original controller tests (214 total tests with the extended harness); the new binary exposes all 18 `connections_tests` tests (230 total). Shared-target build artifacts were cleaned for `raijin-core --release` before the verified new build, preventing a relocated worktree's cached binary from being mislabeled. Earlier unverified executions are excluded.
+
+The original matrix completed 27 exact-byte-verified downloads per revision; the added long matrix completed 12 per revision. The two long scenarios use 128 MiB payloads, 512 KiB/s per-connection shaping or 10 MiB/s shared shaping, Adaptive/Fixed-8 strategies, three rotated repetitions, and a 120-second per-run timeout. Original and long benchmark invocations both passed on each revision.
+
+Adaptive completion distributions below are milliseconds, three runs per row. Requests are data requests only; each run also used one metadata probe.
+
+| Scenario | Old min / median / max (ms) | New min / median / max (ms) | Data requests old -> new | Peak workers old -> new |
+| --- | --- | --- | --- | --- |
+| Small | 20.61 / 22.02 / 27.27 | 14.95 / 35.72 / 40.59 | 1 -> 1 | 1 -> 1 |
+| Shared cap | 4018.79 / 4031.32 / 4033.58 | 4001.22 / 4012.10 / 4014.22 | 8 -> 8 | 8 -> 8 |
+| Per-connection cap | 1247.67 / 1280.50 / 1297.66 | 1273.17 / 1278.50 / 1292.23 | 8 -> 8 | 8 -> 8 |
+| Long shared cap | 12855.50 / 12856.41 / 12958.42 | 12858.16 / 12901.58 / 12907.14 | 8 -> 9 | 8 -> 9 |
+| Long per-connection cap | 31561.81 / 31567.19 / 31599.61 | 31552.17 / 31576.43 / 31592.15 | 8 -> 10 | 8 -> 10 |
+
+Adaptive first-useful-byte upper-bound medians (old -> new, ms) were 16.06 -> 20.60, 25.83 -> 26.07, 22.19 -> 20.18, 31.41 -> 19.82, and 31.58 -> 19.71 in the same scenario order. These are sampled bounds, not socket-level TTFB. Fixed-8 long-scenario median completion stayed near the same levels: per-connection 31582.99 -> 31591.45 ms and shared 12880.85 -> 12847.59 ms, with eight data requests throughout.
+
+In all three new long per-connection runs, workers expanded from eight to nine at approximately 3-4 seconds and to ten at approximately 12-13 seconds, then drained naturally. The old controller stayed at eight until completion. This exercises multiple probes, but the completion tail still reaches approximately 31.5 seconds: **there is no demonstrated completion-time speedup**, despite two extra requests. Long shared-cap runs used one additional worker/request; median completion changed by about +0.35%, inside the 5% budget. The original shared-cap median changed by about -0.48%, with no request increase. These measurements support bounded behavior, not universally beneficial parallelism.
+
+The first small-file comparison exceeded the predeclared absolute median budget by 3.70 ms: +13.70 ms observed versus +10 ms allowed. Every run still used one data request, and the transfer finishes before the first controller sample. Small-file Fixed-4 moved in the opposite direction (median 51.08 -> 30.76 ms), while Single remained near 12 ms. This screening failure triggered a paired repeat rather than a larger budget.
+
+The full original matrix was then repeated sequentially using the preserved old binary and the verified new binary: **27 further exact-byte-verified downloads per revision**, both tests passed. Small-file Adaptive completion was 17.07 / 41.98 / 42.04 ms old versus 25.90 / 31.50 / 38.25 ms new. The repeat's median difference is -10.48 ms. Across both batches (six runs per strategy/revision), small-file pooled medians are:
+
+| Strategy | Old pooled median (ms) | New pooled median (ms) | Difference (ms) |
+| --- | --- | --- | --- |
+| Adaptive | 24.645 | 33.610 | +8.965 |
+| Single | 13.895 | 12.525 | -1.370 |
+| Fixed-4 | 35.525 | 33.965 | -1.560 |
+
+All remain within the unchanged +10 ms screening budget when pooled; the initial miss remains recorded above. The repeat shared-cap Adaptive median was 4009.45 -> 4026.27 ms (+0.42%), still within 5%, with eight requests. Repeated per-connection Adaptive median was 1292.80 -> 1279.73 ms, also with eight requests. Large variation and only six small-file samples per revision prevent a strong no-regression or speedup claim. No startup setting or threshold was changed to obtain these results.
+
+In total, the verified comparisons completed **132 exact-byte-verified downloads** (39 initial plus 27 repeated per revision). The three functional §3.6 controller checkboxes are checked; broad performance coverage, limiter-pressure attribution, startup tuning, and parameter optimality remain unchecked. Raw CSV logs for the initial short/long matrices and paired short repeat are temporary external test artifacts under `$TEMP/raijin-baseline-logs/` (`old_`/`new_performance_baseline.log`, `old_`/`new_long_ramp_up_baseline.log`, and `old_`/`new_performance_repeat.log`), not durable engine state. The tables above retain the comparison evidence in the repository.
 
 ## 7. Alternatives and Open Parameters
 

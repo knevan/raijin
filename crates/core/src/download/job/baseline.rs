@@ -28,6 +28,7 @@ enum Strategy {
     Adaptive,
     Single,
     Fixed4,
+    Fixed8,
 }
 
 impl Strategy {
@@ -36,6 +37,7 @@ impl Strategy {
             Self::Adaptive => "Adaptive",
             Self::Single => "Single",
             Self::Fixed4 => "Fixed-4",
+            Self::Fixed8 => "Fixed-8",
         }
     }
 
@@ -44,6 +46,7 @@ impl Strategy {
             Self::Adaptive => None,
             Self::Single => NonZeroU16::new(1),
             Self::Fixed4 => NonZeroU16::new(4),
+            Self::Fixed8 => NonZeroU16::new(8),
         }
     }
 }
@@ -305,6 +308,7 @@ async fn run_single_baseline(
     strategy: Strategy,
     payload: &[u8],
     throttle: &ServerThrottle,
+    timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = BaselineServer::spawn(payload.to_vec(), throttle.clone()).await?;
     let db = create_test_db().await?;
@@ -337,13 +341,13 @@ async fn run_single_baseline(
     let mut transitions: Vec<(u32, u16)> = Vec::new();
     let mut last_workers = 0_u16;
 
-    let timeout_sleep = tokio::time::sleep(RUN_TIMEOUT);
+    let timeout_sleep = tokio::time::sleep(timeout);
     tokio::pin!(timeout_sleep);
 
     let completed = loop {
         tokio::select! {
             _ = &mut timeout_sleep => {
-                panic!("baseline run timed out after {RUN_TIMEOUT:?}");
+                panic!("baseline run timed out after {timeout:?}");
             }
             _ = poll.tick() => {
                 let (downloaded, workers) = live_progress.snapshot();
@@ -414,7 +418,34 @@ async fn run_scenario(
     for rep in 0..3 {
         for offset in 0..strategies.len() {
             let strategy = strategies[(offset + rep) % strategies.len()];
-            run_single_baseline(scenario_id, rep + 1, strategy, &payload, &throttle).await?;
+            run_single_baseline(
+                scenario_id,
+                rep + 1,
+                strategy,
+                &payload,
+                &throttle,
+                RUN_TIMEOUT,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_long_scenario(
+    scenario_id: &str,
+    payload_len: usize,
+    throttle: ServerThrottle,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let payload = (0..=255).cycle().take(payload_len).collect::<Vec<u8>>();
+    let strategies = [Strategy::Adaptive, Strategy::Fixed8];
+
+    for rep in 0..3 {
+        for offset in 0..strategies.len() {
+            let strategy = strategies[(offset + rep) % strategies.len()];
+            run_single_baseline(scenario_id, rep + 1, strategy, &payload, &throttle, timeout)
+                .await?;
         }
     }
     Ok(())
@@ -445,6 +476,32 @@ async fn run_performance_baseline() -> Result<(), Box<dyn std::error::Error + Se
         "per_connection_throttling",
         40 * 1024 * 1024,
         ServerThrottle::PerConnection(BytesPerSecond::new(4 * 1024 * 1024)),
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "manual performance baseline"]
+async fn run_long_ramp_up_baseline() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!(
+        "scenario,run,strategy,first_byte_upper_ms,duration_ms,throughput_mib_s,probe_requests,range_requests,sampled_peak_workers,worker_transitions"
+    );
+
+    run_long_scenario(
+        "long_per_connection_throttling",
+        128 * 1024 * 1024,
+        ServerThrottle::PerConnection(BytesPerSecond::new(512 * 1024)),
+        Duration::from_secs(120),
+    )
+    .await?;
+
+    run_long_scenario(
+        "long_shared_bandwidth_contention",
+        128 * 1024 * 1024,
+        ServerThrottle::Shared(BytesPerSecond::new(10 * 1024 * 1024)),
+        Duration::from_secs(120),
     )
     .await?;
 

@@ -12,6 +12,7 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{DbError, DownloadRepository, PartRepository};
@@ -28,6 +29,10 @@ const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 const SPLIT_REPLY_TIMEOUT: Duration = Duration::from_millis(25);
 const SPLIT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const SINGLE_PART_INDEX: u32 = 0;
+
+#[cfg(test)]
+#[path = "job/connections_tests.rs"]
+mod connections_tests;
 
 /// Result type returned by single-connection HTTP jobs.
 pub type HttpDownloadJobResult<T> = Result<T, HttpDownloadJobError>;
@@ -455,6 +460,8 @@ impl HttpDownloadJob {
         );
         let mut connection_target = connection_controller.target();
         let mut retries_since_probe = 0_u32;
+        let mut workers_changed_since_probe = false;
+        let mut workers_finished_since_probe = false;
         let mut parts = if existing_parts.is_empty() || existing_parts.len() == 1 {
             let desired_parts = u16::try_from(connection_target).unwrap_or(u16::MAX);
             split_fixed_ranges_with_min_part_size(
@@ -546,6 +553,7 @@ impl HttpDownloadJob {
                         control_rx,
                         active_state,
                     };
+                    workers_changed_since_probe = true;
                     workers.spawn(async move {
                         let outcome = part_worker(request).await;
                         (part_index, outcome)
@@ -587,12 +595,18 @@ impl HttpDownloadJob {
                         .map(|progress| progress.snapshot())
                         .unwrap_or((Bytes::ZERO, u16::try_from(workers.len()).unwrap_or(u16::MAX)));
                     connection_target = connection_controller.observe(ConnectionSample {
+                        now: Instant::now(),
+                        locally_limited: speed_limiter.is_some() || global_limiter.is_some(),
+                        workers_changed: workers_changed_since_probe,
+                        workers_finished: workers_finished_since_probe,
                         downloaded_bytes: downloaded.get(),
                         active_part_count,
                         retry_count: retries_since_probe,
                         remaining_bytes: total.get().saturating_sub(downloaded.get()),
                     });
                     retries_since_probe = 0;
+                    workers_changed_since_probe = false;
+                    workers_finished_since_probe = false;
                     continue;
                 }
                 () = tokio::time::sleep(SPLIT_RETRY_INTERVAL), if should_wait_for_split => continue,
@@ -601,6 +615,8 @@ impl HttpDownloadJob {
             let (part_index, outcome) = joined.ok_or(HttpDownloadJobError::ResumeUnsupported)??;
             let outcome = outcome?;
             worker_controls.remove(&part_index);
+            workers_changed_since_probe = true;
+            workers_finished_since_probe = true;
             match outcome {
                 PartWorkerOutcome::Completed => {}
                 PartWorkerOutcome::Canceled => {
@@ -1160,6 +1176,10 @@ enum ConnectionMode {
 
 #[derive(Debug, Clone, Copy)]
 struct ConnectionSample {
+    now: Instant,
+    locally_limited: bool,
+    workers_changed: bool,
+    workers_finished: bool,
     downloaded_bytes: u64,
     active_part_count: u16,
     retry_count: u32,
@@ -1174,9 +1194,9 @@ struct ConnectionController {
     min_part_size: u64,
     gain_threshold: u8,
     target: usize,
-    last_downloaded_bytes: u64,
-    last_speed_bps: Option<u64>,
-    slow_probe_count: u8,
+    interval: Duration,
+    meter: ThroughputMeter,
+    phase: ConnectionPhase,
 }
 
 impl ConnectionController {
@@ -1211,9 +1231,11 @@ impl ConnectionController {
             min_part_size: config.min_part_size.get(),
             gain_threshold: config.connection_gain_threshold,
             target,
-            last_downloaded_bytes: downloaded_bytes,
-            last_speed_bps: None,
-            slow_probe_count: 0,
+            interval: config
+                .connection_probe_interval
+                .max(Duration::from_millis(1)),
+            meter: ThroughputMeter::default(),
+            phase: ConnectionPhase::Baseline { active: 0 },
         }
     }
 
@@ -1230,59 +1252,166 @@ impl ConnectionController {
             return self.target;
         }
 
-        let speed_bps = sample
-            .downloaded_bytes
-            .saturating_sub(self.last_downloaded_bytes);
-        self.last_downloaded_bytes = sample.downloaded_bytes;
         let remaining_cap = Self::cap_by_remaining(
             self.max,
             self.min,
             self.min_part_size,
             sample.remaining_bytes,
         );
-
-        if sample.retry_count > 0 {
-            self.target = self
-                .target
-                .saturating_sub(1)
-                .max(self.min)
-                .min(remaining_cap);
-            self.last_speed_bps = Some(speed_bps);
-            self.slow_probe_count = 0;
-            return self.target;
-        }
-
-        let Some(last_speed_bps) = self.last_speed_bps.replace(speed_bps) else {
-            self.target = self.target.min(remaining_cap);
-            return self.target;
-        };
-
-        if usize::from(sample.active_part_count) < self.target {
-            self.target = self.target.min(remaining_cap);
-            self.slow_probe_count = 0;
-            return self.target;
-        }
-
-        if has_meaningful_gain(last_speed_bps, speed_bps, self.gain_threshold)
-            && self.target < remaining_cap
-        {
-            self.target += 1;
-            self.slow_probe_count = 0;
-            return self.target;
-        }
-
-        if speed_bps < last_speed_bps {
-            self.slow_probe_count = self.slow_probe_count.saturating_add(1);
-            if self.slow_probe_count >= 2 && self.target > self.min {
-                self.target -= 1;
-                self.slow_probe_count = 0;
-            }
-        } else {
-            self.slow_probe_count = 0;
-        }
-
+        let previous_target = self.target;
         self.target = self.target.min(remaining_cap);
+        if sample.retry_count > 0 {
+            self.target = self.target.saturating_sub(1).max(self.min);
+        }
+        if self.target != previous_target || sample.retry_count > 0 || sample.locally_limited {
+            self.cooldown(sample, "bounds, retry, or local limiter");
+            return self.target;
+        }
+
+        let active = usize::from(sample.active_part_count);
+        match self.phase {
+            ConnectionPhase::Baseline {
+                active: baseline_active,
+            } => {
+                if active > self.target || active != baseline_active || sample.workers_changed {
+                    self.meter.reset(sample.now, sample.downloaded_bytes);
+                    self.phase = ConnectionPhase::Baseline { active };
+                    return self.target;
+                }
+                let Some(rate) =
+                    self.meter
+                        .observe(sample.now, sample.downloaded_bytes, self.interval)
+                else {
+                    return self.target;
+                };
+                if self
+                    .meter
+                    .is_ready(sample.now, self.interval.saturating_mul(2))
+                {
+                    if active < self.target {
+                        self.target = active.max(self.min);
+                        self.cooldown(sample, "unfilled worker slots");
+                        return self.target;
+                    }
+                    if rate.smoothed_bps <= 0.0 || self.target >= remaining_cap {
+                        return self.target;
+                    }
+                    self.target += 1;
+                    self.phase = ConnectionPhase::AwaitActivation {
+                        baseline_bps: rate.smoothed_bps,
+                        active,
+                        since: sample.now,
+                    };
+                    tracing::debug!(
+                        baseline_bps = rate.smoothed_bps,
+                        active,
+                        target = self.target,
+                        "connection probe requested"
+                    );
+                }
+            }
+            ConnectionPhase::AwaitActivation {
+                baseline_bps,
+                active: previous_active,
+                since,
+            } => {
+                if sample.workers_finished {
+                    self.target = self.target.saturating_sub(1).max(self.min);
+                    self.cooldown(sample, "workers finished before activation");
+                } else if active == self.target && active == previous_active + 1 {
+                    self.phase = ConnectionPhase::Settling {
+                        baseline_bps,
+                        since: sample.now,
+                    };
+                    tracing::debug!(active, "connection probe activated; settling");
+                } else if active != previous_active
+                    || sample.now.saturating_duration_since(since)
+                        >= self.interval.saturating_mul(4)
+                {
+                    self.target = self.target.saturating_sub(1).max(self.min);
+                    self.cooldown(sample, "probe activation unavailable");
+                }
+            }
+            ConnectionPhase::Settling {
+                baseline_bps,
+                since,
+            } => {
+                if active != self.target || sample.workers_changed {
+                    self.cooldown(sample, "workers changed during settling");
+                } else if sample.now.saturating_duration_since(since)
+                    >= self.interval.saturating_mul(2)
+                {
+                    self.meter.reset(sample.now, sample.downloaded_bytes);
+                    self.phase = ConnectionPhase::Observe {
+                        baseline_bps,
+                        gain_samples: 0,
+                    };
+                }
+            }
+            ConnectionPhase::Observe {
+                baseline_bps,
+                mut gain_samples,
+            } => {
+                if active != self.target || sample.workers_changed {
+                    self.cooldown(sample, "workers changed during observation");
+                    return self.target;
+                }
+                let Some(rate) =
+                    self.meter
+                        .observe(sample.now, sample.downloaded_bytes, self.interval)
+                else {
+                    return self.target;
+                };
+                if has_meaningful_gain(baseline_bps, rate.raw_bps, self.gain_threshold)
+                    && has_meaningful_gain(baseline_bps, rate.smoothed_bps, self.gain_threshold)
+                {
+                    gain_samples = gain_samples.saturating_add(1);
+                } else {
+                    gain_samples = 0;
+                }
+                self.phase = ConnectionPhase::Observe {
+                    baseline_bps,
+                    gain_samples,
+                };
+                if self
+                    .meter
+                    .is_ready(sample.now, self.interval.saturating_mul(2))
+                {
+                    let useful = gain_samples >= 2;
+                    tracing::debug!(
+                        baseline_bps,
+                        post_bps = rate.smoothed_bps,
+                        active,
+                        useful,
+                        "connection probe evaluated"
+                    );
+                    if useful {
+                        self.meter.reset(sample.now, sample.downloaded_bytes);
+                        self.phase = ConnectionPhase::Baseline { active };
+                    } else {
+                        self.cooldown(sample, "insufficient sustained gain");
+                    }
+                }
+            }
+            ConnectionPhase::Cooldown { since } => {
+                if sample.now.saturating_duration_since(since) >= self.interval.saturating_mul(4) {
+                    self.meter.reset(sample.now, sample.downloaded_bytes);
+                    self.phase = ConnectionPhase::Baseline { active };
+                }
+            }
+        }
         self.target
+    }
+
+    fn cooldown(&mut self, sample: ConnectionSample, reason: &'static str) {
+        tracing::debug!(
+            reason,
+            target = self.target,
+            active = sample.active_part_count,
+            "connection expansion suspended"
+        );
+        self.phase = ConnectionPhase::Cooldown { since: sample.now };
+        self.meter.reset(sample.now, sample.downloaded_bytes);
     }
 
     fn cap_by_remaining(
@@ -1303,14 +1432,97 @@ impl ConnectionController {
     }
 }
 
-fn has_meaningful_gain(previous_bps: u64, current_bps: u64, threshold_percent: u8) -> bool {
-    if current_bps <= previous_bps {
-        return false;
+#[derive(Debug, Clone, Copy)]
+enum ConnectionPhase {
+    Baseline {
+        active: usize,
+    },
+    AwaitActivation {
+        baseline_bps: f64,
+        active: usize,
+        since: Instant,
+    },
+    Settling {
+        baseline_bps: f64,
+        since: Instant,
+    },
+    Observe {
+        baseline_bps: f64,
+        gain_samples: u8,
+    },
+    Cooldown {
+        since: Instant,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+struct ThroughputMeter {
+    last: Option<(Instant, u64)>,
+    started: Option<Instant>,
+    smoothed_bps: Option<f64>,
+    samples: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThroughputRate {
+    raw_bps: f64,
+    smoothed_bps: f64,
+}
+
+impl ThroughputMeter {
+    fn reset(&mut self, now: Instant, downloaded: u64) {
+        *self = Self {
+            last: Some((now, downloaded)),
+            started: Some(now),
+            ..Self::default()
+        };
     }
-    let threshold = previous_bps
-        .saturating_mul(u64::from(threshold_percent))
-        .div_ceil(100);
-    current_bps.saturating_sub(previous_bps) >= threshold.max(1)
+
+    fn observe(
+        &mut self,
+        now: Instant,
+        downloaded: u64,
+        interval: Duration,
+    ) -> Option<ThroughputRate> {
+        let Some((previous_time, previous_bytes)) = self.last else {
+            self.reset(now, downloaded);
+            return None;
+        };
+        let elapsed = now.checked_duration_since(previous_time)?;
+        if elapsed < (interval / 10).max(Duration::from_millis(1)) {
+            return None;
+        }
+        let Some(delta) = downloaded.checked_sub(previous_bytes) else {
+            self.reset(now, downloaded);
+            return None;
+        };
+        let raw_bps = delta as f64 / elapsed.as_secs_f64();
+        let tau = interval.max(Duration::from_millis(1)).as_secs_f64() * 2.0;
+        let alpha = -(-elapsed.as_secs_f64() / tau).exp_m1();
+        let smoothed_bps = self
+            .smoothed_bps
+            .map_or(raw_bps, |previous| previous + alpha * (raw_bps - previous));
+        self.last = Some((now, downloaded));
+        self.smoothed_bps = Some(smoothed_bps);
+        self.samples = self.samples.saturating_add(1);
+        Some(ThroughputRate {
+            raw_bps,
+            smoothed_bps,
+        })
+    }
+
+    fn is_ready(&self, now: Instant, window: Duration) -> bool {
+        self.samples >= 2
+            && self
+                .started
+                .is_some_and(|start| now.saturating_duration_since(start) >= window)
+    }
+}
+
+fn has_meaningful_gain(previous_bps: f64, current_bps: f64, threshold_percent: u8) -> bool {
+    previous_bps > 0.0
+        && current_bps > previous_bps
+        && current_bps - previous_bps >= previous_bps * f64::from(threshold_percent) / 100.0
 }
 
 fn probe_error_requires_manual_action(error: &crate::download::HttpProbeError) -> bool {
@@ -2108,13 +2320,6 @@ mod tests {
         }
     }
 
-    fn non_zero_connection(value: u16) -> NonZeroU16 {
-        match NonZeroU16::new(value) {
-            Some(value) => value,
-            None => panic!("test connection count must be non-zero"),
-        }
-    }
-
     fn adaptive_test_config() -> HttpDownloadJobConfig {
         HttpDownloadJobConfig {
             incomplete_extension: ".part".to_owned(),
@@ -2162,65 +2367,6 @@ mod tests {
             next_start = end.get().saturating_add(1);
         }
         assert_eq!(next_start, total_len);
-    }
-
-    #[test]
-    fn adaptive_connections_should_increase_after_meaningful_gain() {
-        let config = adaptive_test_config();
-        let mut controller = ConnectionController::new(&config, None, 64 * 1_024, 0);
-
-        assert_eq!(controller.target(), 4);
-        assert_eq!(
-            controller.observe(ConnectionSample {
-                downloaded_bytes: 10_000,
-                active_part_count: 4,
-                retry_count: 0,
-                remaining_bytes: 54_000,
-            }),
-            4
-        );
-        assert_eq!(
-            controller.observe(ConnectionSample {
-                downloaded_bytes: 22_000,
-                active_part_count: 4,
-                retry_count: 0,
-                remaining_bytes: 42_000,
-            }),
-            5
-        );
-    }
-
-    #[test]
-    fn adaptive_connections_should_decrease_after_retries() {
-        let config = adaptive_test_config();
-        let mut controller = ConnectionController::new(&config, None, 64 * 1_024, 0);
-
-        let target = controller.observe(ConnectionSample {
-            downloaded_bytes: 10_000,
-            active_part_count: 4,
-            retry_count: 1,
-            remaining_bytes: 54_000,
-        });
-
-        assert_eq!(target, 3);
-    }
-
-    #[test]
-    fn fixed_connections_should_clamp_custom_values_to_safe_cap() {
-        let config = adaptive_test_config();
-        let mut controller =
-            ConnectionController::new(&config, Some(non_zero_connection(64)), 128 * 1_024, 0);
-
-        assert_eq!(controller.target(), 8);
-        assert_eq!(
-            controller.observe(ConnectionSample {
-                downloaded_bytes: 32_000,
-                active_part_count: 8,
-                retry_count: 2,
-                remaining_bytes: 96_000,
-            }),
-            8
-        );
     }
 
     fn sample_item(url: String, folder: PathBuf, downloaded: u64) -> DownloadItem {
@@ -2815,6 +2961,53 @@ mod tests {
         assert!(proposed);
         assert_eq!(part.end_byte, Some(Bytes::new(999)));
         assert_eq!(target_end, 999);
+    }
+
+    #[tokio::test]
+    async fn ranged_adaptive_job_should_preserve_local_and_global_speed_limits()
+    -> HttpDownloadJobResult<()> {
+        for global in [false, true] {
+            let body = vec![b'l'; 512 * 1024];
+            let server = TestServer::spawn(body.clone(), true, false).await?;
+            let db = test_db().await?;
+            let folder = tempfile::tempdir()?;
+            let mut item = sample_item(server.url(), folder.path().to_path_buf(), 0);
+            item.preferred_connections = None;
+            let limit = crate::download::BytesPerSecond::new(1024 * 1024);
+            if !global {
+                item.speed_limit = Some(limit);
+            }
+            db.download_repo.add(&item).await?;
+            let mut job = HttpDownloadJob::new(
+                db.download_repo.clone(),
+                db.part_repo.clone(),
+                ReqwestHttpClient::new()?,
+                item.clone(),
+            );
+            job.config = adaptive_test_config();
+            if global {
+                job = job.with_global_limiter(SpeedLimiter::new(limit));
+            }
+            let progress = Arc::new(LiveDownloadProgress::new(Bytes::ZERO));
+            job = job.with_live_progress(Arc::clone(&progress));
+            let started = Instant::now();
+            let mut poll = tokio::time::interval(Duration::from_millis(1));
+            let run = job.run(CancellationToken::new());
+            tokio::pin!(run);
+            let completed = loop {
+                tokio::select! {
+                    result = &mut run => break result?,
+                    _ = poll.tick() => assert!(progress.snapshot().1 <= 4),
+                }
+            };
+            assert_eq!(completed.status, DownloadStatus::Completed);
+            assert!(started.elapsed() >= Duration::from_millis(250));
+            assert_eq!(fs::read(folder.path().join("file.bin")).await?, body);
+            let parts = db.part_repo.list_for_download(item.id).await?;
+            assert!(parts.len() >= 4);
+            assert_contiguous_completed_ranges(&parts, body.len() as u64);
+        }
+        Ok(())
     }
 
     #[tokio::test]

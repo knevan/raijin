@@ -118,7 +118,7 @@ Recovery should target the affected worker when appropriate, preserving committe
 
 ### 3.6 Smart / Performance Acceptance Checklist
 
-- [ ] Initial parallelism is size-aware and starts transfer without waiting for adaptive sampling; small-file startup and large-file ramp-up are measured against the baseline.
+- [ ] Initial parallelism is size-aware and starts transfer without waiting for adaptive sampling; small-file startup and large-file ramp-up are measured against the baseline. Medium-file boundary measurements and one rejected initial-target candidate are recorded in §6.3; no new startup tuning is accepted.
 - [x] Throughput samples use actual elapsed time and smoothing rather than raw byte deltas alone. Verified by `download::job::connections_tests::throughput_` deterministic timestamp tests; see §6.2.
 - [x] Bounded connection probes compare baseline and post-settling throughput to evaluate useful gain. Verified by `adaptive_probe_should_wait_for_activation_and_exclude_settling_bytes` and `adaptive_probe_should_retain_sustained_gain_then_allow_only_one_new_worker`; see §6.2.
 - [x] Settling, hysteresis, and cooldown prevent expansion or oscillation driven by individual noisy samples. Verified by `adaptive_probe_should_not_accept_one_noisy_sample_or_oscillate_after_low_gain` and worker-change/activation-timeout tests; see §6.2.
@@ -307,7 +307,7 @@ These interval multipliers are initial internal policy parameters, not new setti
 
 #### Comparison Protocol and Budgets
 
-Before collecting this increment's comparison results, use the same release build environment and harness on base revision `5291258` and the changed controller. Keep the existing three scenarios and add separate long per-connection/shared-cap scenarios. Long per-connection shaping must allow multiple full control cycles at the unchanged eight-worker startup; compare Adaptive with Fixed-8 there, while Single and Fixed-4 remain covered by the original matrix. Run performance tests sequentially to avoid cross-scenario contention. Use separate invocations of `download::job::baseline::run_performance_baseline` and `download::job::baseline::run_long_ramp_up_baseline` with `--release -- --ignored --nocapture`; do not use the broad `download::job::baseline` filter, which runs both tests concurrently.
+Before collecting this increment's comparison results, use the same release build environment and harness on base revision `5291258` and the changed controller. Keep the existing three scenarios and add separate long per-connection/shared-cap scenarios. Long per-connection shaping must allow multiple full control cycles at the unchanged eight-worker startup; compare Adaptive with Fixed-8 there, while Single and Fixed-4 remain covered by the original matrix. Run performance tests sequentially to avoid cross-scenario contention. Use separate invocations of `download::job::baseline::run_performance_baseline` and `download::job::baseline::run_long_ramp_up_baseline` with `--release -- --ignored --nocapture`; do not use the broad `download::job::baseline` filter, which runs multiple manual benchmarks concurrently.
 
 Initial acceptance budgets for this loopback experiment:
 
@@ -361,6 +361,97 @@ The full original matrix was then repeated sequentially using the preserved old 
 All remain within the unchanged +10 ms screening budget when pooled; the initial miss remains recorded above. The repeat shared-cap Adaptive median was 4009.45 -> 4026.27 ms (+0.42%), still within 5%, with eight requests. Repeated per-connection Adaptive median was 1292.80 -> 1279.73 ms, also with eight requests. Large variation and only six small-file samples per revision prevent a strong no-regression or speedup claim. No startup setting or threshold was changed to obtain these results.
 
 In total, the verified comparisons completed **132 exact-byte-verified downloads** (39 initial plus 27 repeated per revision). The three functional §3.6 controller checkboxes are checked; broad performance coverage, limiter-pressure attribution, startup tuning, and parameter optimality remain unchecked. Raw CSV logs for the initial short/long matrices and paired short repeat are temporary external test artifacts under `$TEMP/raijin-baseline-logs/` (`old_`/`new_performance_baseline.log`, `old_`/`new_long_ramp_up_baseline.log`, and `old_`/`new_performance_repeat.log`), not durable engine state. The tables above retain the comparison evidence in the repository.
+
+### 6.3 Size-Aware Startup: Medium-File Measurement
+
+Base revision: `2a4d9c7` (bounded connection probing). The agreed scope is to measure medium-file startup first, evaluate one simple size-aware initial-target candidate with the same adaptive controller, and change production startup only if the evidence supports it. Retaining the existing policy is an acceptable outcome. Manual overrides, connection bounds, `min_part_size`, initial partitioning, split selection, metadata validation, and single-stream fallback are not changed by this experiment. The precedence of minimum connections over byte caps remains unchanged.
+
+The existing initial cap is `ceil(remaining_bytes / min_part_size)`, bounded by the requested default and configured limits. The startup benchmark derives its sizes from the existing configuration rather than inventing production size thresholds. With current defaults, it covers 4 MiB - 1 byte, 4 MiB + 1 byte, 16 MiB - 1 byte, 16 MiB + 1 byte, and 32 MiB + 1 byte. These exercise the transitions from one to two, four to five, and the eight-worker default plateau. Each size runs uncapped, shared 10 MiB/s, and per-connection 4 MiB/s shaping. Existing Adaptive, Single, and Fixed-4 are compared in three rotated repetitions per case.
+
+The shared harness now appends two CSV fields after the existing fields: `initial_target` is the planned target calculated before transfer through the same controller constructor (one for the single-stream strategy); `first_progress_workers` is the sampled actual count at the first useful-progress observation, blank if polling missed the entire transfer. Neither is a count of productive HTTP streams. Existing peak-worker and timestamped-transition fields remain. First-byte measurements are still polled upper bounds, and byte-for-byte completion verification is mandatory.
+
+Run only this manual performance test, separately from other benchmarks:
+
+```bash
+CRATE_CC_NO_DEFAULTS=1 CFLAGS='-MD -O2' CARGO_BUILD_JOBS=4 cargo test --release -p raijin-core download::job::baseline::run_startup_baseline -- --ignored --nocapture
+```
+
+Before selecting a candidate, use these screening budgets against existing Adaptive under identical shaping and sizes:
+
+- Uncapped completion and first-useful-byte median regression: at most 10 ms absolute per case.
+- Shaped completion median regression: at most the larger of 10 ms and 5% per case, for both shared and per-connection profiles. Improving shared/request overhead does not excuse a per-connection regression.
+- Data requests must not increase for medium cases. A candidate needs a reproducible completion/startup benefit or fewer requests while remaining inside all completion budgets; merely reducing initial worker count is not a win.
+- Do not weaken correctness or change budgets after a miss. Repeat ambiguous cases; reject a candidate with a material shaped regression. Recheck small/large baseline scenarios before shipping any production change.
+
+These loopback measurements are screening evidence, not WAN latency, TCP loss, real-server connection overhead, competing downloads, or durable per-server tuning. The startup acceptance checkbox remains unchecked until a policy has supporting measurements and retained invariants.
+
+#### Candidate and Decision
+
+After measuring existing Adaptive against Single/Fixed-4, evaluate one candidate: `floor(remaining_bytes / min_part_size).max(1)`, capped at the existing default. The test-only `Adaptive-Floor` strategy changes only the fixture job's initial requested default. The same `ConnectionController::new` applies existing min/max bounds, and the same `observe()` policy, partitioning, validation, limiter handling, and split scheduling execute thereafter. Both paired arms use `preferred_connections = None` and the ranged path, including when the floor candidate starts one worker; Single's different engine path is not used as a substitute for this comparison.
+
+```bash
+CRATE_CC_NO_DEFAULTS=1 CFLAGS='-MD -O2' CARGO_BUILD_JOBS=4 cargo test --release -p raijin-core download::job::baseline::run_startup_candidate -- --ignored --nocapture
+```
+
+Run it separately after the baseline. It compares Adaptive/Adaptive-Floor in three rotated repetitions for the same 15 cases (90 transfers). The candidate has no production flag, config/schema change, or application-facing option; it is compiled only in the existing test-only baseline module. It remains reproducible as a rejected experiment, not a shipping policy.
+
+**Decision: reject floor-based startup; retain production startup unchanged.** Fewer initial requests help some uncapped loopback cases but materially regress every changed-size per-connection case. Those transfers finish before the adaptive controller can collect a baseline and compensate. Request savings cannot override the predeclared shaped completion budgets. No additional size thresholds or alternate candidates are introduced in this increment.
+
+#### Measurements
+
+Environment: Windows x86_64, `rustc 1.101.0-nightly (12433c307 2026-10-24)`, base `2a4d9c7` plus the test/documentation changes. Release builds used the same session-local native-build workaround as §6.2. Baseline and paired-candidate tests ran sequentially; all **225 downloads** completed with exact payload bytes, `Completed` status, and exact useful progress. The baseline's 135 runs finished in 161.90 seconds and the paired experiment's 90 in 81.62 seconds, excluding builds.
+
+The baseline's median completion times below are milliseconds (three repetitions per cell):
+
+| Payload | Profile | Adaptive | Single | Fixed-4 |
+| --- | --- | --- | --- | --- |
+| 4 MiB + 1 byte | Uncapped | 54.64 | 18.37 | 44.27 |
+| 4 MiB + 1 byte | Shared cap | 440.43 | 421.63 | 433.28 |
+| 4 MiB + 1 byte | Per-connection cap | 542.69 | 1015.52 | 540.35 |
+| 16 MiB + 1 byte | Uncapped | 98.13 | 41.40 | 79.12 |
+| 16 MiB + 1 byte | Shared cap | 1616.97 | 1630.02 | 1640.40 |
+| 16 MiB + 1 byte | Per-connection cap | 820.30 | 4015.79 | 1038.36 |
+
+Use the paired experiment, not these separate baseline runs, to compare the candidate under the same engine path and controller. The paired medians and data-request counts are:
+
+| Payload | Profile | Adaptive (ms) | Floor (ms) | Completion change | Data requests / initial target |
+| --- | --- | --- | --- | --- | --- |
+| 4 MiB - 1 byte | Uncapped | 31.46 | 24.97 | -6.49 ms | 1 -> 1 |
+| 4 MiB - 1 byte | Shared cap | 399.34 | 397.98 | -0.34% | 1 -> 1 |
+| 4 MiB - 1 byte | Per-connection cap | 962.53 | 970.10 | +0.79% | 1 -> 1 |
+| 4 MiB + 1 byte | Uncapped | 41.41 | 25.48 | -15.93 ms | 2 -> 1 |
+| 4 MiB + 1 byte | Shared cap | 435.29 | 437.72 | +0.56% | 2 -> 1 |
+| 4 MiB + 1 byte | Per-connection cap | 544.13 | 1029.65 | **+89.23%** | 2 -> 1 |
+| 16 MiB - 1 byte | Uncapped | 81.59 | 65.78 | -15.81 ms | 4 -> 3 |
+| 16 MiB - 1 byte | Shared cap | 1607.71 | 1627.52 | +1.23% | 4 -> 3 |
+| 16 MiB - 1 byte | Per-connection cap | 1012.79 | 1379.67 | **+36.22%** | 4 -> 3 |
+| 16 MiB + 1 byte | Uncapped | 82.78 | 64.14 | -18.64 ms | 5 -> 4 |
+| 16 MiB + 1 byte | Shared cap | 1608.35 | 1628.12 | +1.23% | 5 -> 4 |
+| 16 MiB + 1 byte | Per-connection cap | 815.54 | 1046.70 | **+28.34%** | 5 -> 4 |
+| 32 MiB + 1 byte | Uncapped | 98.05 | 130.47 | +32.42 ms | 8 -> 8 |
+| 32 MiB + 1 byte | Shared cap | 3241.07 | 3223.95 | -0.53% | 8 -> 8 |
+| 32 MiB + 1 byte | Per-connection cap | 1057.84 | 1042.92 | -1.41% | 8 -> 8 |
+
+The three materially slower per-connection cases have nonoverlapping completion ranges across all three repetitions: 525.44-550.91 vs 1027.67-1032.25 ms (4 MiB + 1), 998.22-1051.00 vs 1372.87-1380.50 ms (16 MiB - 1), and 806.70-824.94 vs 1030.59-1079.74 ms (16 MiB + 1). This is an unambiguous rejection under the fixed budgets, not a noisy borderline miss requiring threshold adjustment.
+
+The unchanged eight-worker control also misses the uncapped +10 ms screen despite identical effective startup parameters. Together with variable first-byte bounds, this demonstrates why three uncapped runs must not be used to claim reliable startup speedups. No extra repetitions are needed to decide against this candidate: it is already rejected for large shaped regressions. Shared-cap savings are not a universal argument for fewer workers, and per-connection gains are not a universal argument for more.
+
+Data requests happen to equal initial targets throughout the paired experiment; this is not an engine invariant. In the separate baseline, Fixed-4 sometimes used five data requests at 32 MiB + 1 byte while remaining at four sampled active workers because dynamic splitting can refill a vacant slot. Actual counts at the first progress observation, peak workers, and timestamped transitions are all retained in the CSV. A first-progress count of zero is possible when worker guards have already drained before progress is sampled; blank means the entire transfer escaped polling, not zero requests.
+
+#### Verification and Remaining Scope
+
+- `cargo test -p raijin-core download::job:: --lib`: **51 passed**, **4 ignored**. New deterministic tests lock existing size-cap boundaries, immediate target availability without samples, initial range coverage, remaining-work constructor sizing on resume, overrides, bounds/disabled adaptation, and the test-only floor formula including zero minimum and very large byte counts.
+- `cargo check -p raijin-core`: **passed**.
+- `cargo clippy --all-targets -p raijin-core -- -D warnings`: **passed**.
+- Both ignored release startup tests: **passed** for correctness; the candidate's performance acceptance gate is **rejected** as described above. No wall-clock CI assertion or test-thread limit was added.
+- A fresh independent review found no actionable defects in the experiment. Rotation reduces ordering bias but does not eliminate scheduler, cache, or storage noise.
+- `cargo fmt --all -- --check` and `git diff --check`: **passed**. Active LSP probes were inconclusive; Cargo provides the compilation/lint evidence.
+
+Production `job.rs`, `part.rs`, model defaults, schema, manual override handling, and unknown-size/non-range fallback are unchanged. Existing small/large policy baselines were not rerun because no production policy is shipping; the 32 MiB + 1 byte paired control exercises the unchanged initial-target plateau. WAN latency/loss, actual request setup cost, local/global limiter pressure, and competing downloads remain outside this experiment.
+
+Static inspection also identifies an existing resume audit requirement before widening the one-worker ranged region: `run_ranged` regenerates ranges when `existing_parts.len() == 1`, potentially reinitializing a persisted partial offset. The constructor-only resume sizing test is not an end-to-end resume guarantee. This increment neither changes nor reproduces that recovery path; it must be audited separately before adopting a candidate that makes more downloads use a single ranged worker.
+
+Raw test CSV is stored temporarily outside the repository under `$TEMP/raijin-startup-logs/baseline.log` and `candidate.log`; the tables retain the relevant evidence here. These are test artifacts, not durable engine state. Startup tuning and the broad §3.6/§5.1 coverage checkboxes remain open; this increment closes the measurement gap and rejects one hypothesis rather than shipping an unsupported heuristic.
 
 ## 7. Alternatives and Open Parameters
 

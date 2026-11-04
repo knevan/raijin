@@ -1,4 +1,5 @@
 use super::*;
+use crate::download::DownloadId;
 
 const INTERVAL: Duration = Duration::from_secs(1);
 const TOTAL: u64 = 1_000_000_000;
@@ -344,6 +345,96 @@ fn adaptive_connections_should_respect_bounds_and_remaining_work() {
     let mut invalid_bounds = ConnectionController::new(&config, None, TOTAL, 0);
     assert_eq!(invalid_bounds.target(), 2);
     assert_eq!(invalid_bounds.observe(tail), 2);
+}
+
+#[test]
+fn startup_should_use_existing_size_caps_without_waiting_for_samples() {
+    let config = HttpDownloadJobConfig::default();
+    let minimum = config.min_part_size.get();
+    let default_target = usize::from(config.default_connections);
+    for (size, expected) in [
+        (0, 1),
+        (minimum - 1, 1),
+        (minimum, 1),
+        (minimum + 1, 2),
+        (minimum * 4 - 1, 4),
+        (minimum * 4, 4),
+        (minimum * 4 + 1, 5),
+        (
+            minimum * u64::from(config.default_connections) - 1,
+            default_target,
+        ),
+        (
+            minimum * u64::from(config.default_connections),
+            default_target,
+        ),
+        (
+            minimum * u64::from(config.default_connections) + 1,
+            default_target,
+        ),
+    ] {
+        let controller = ConnectionController::new(&config, None, size, 0);
+        assert_eq!(controller.target(), expected, "size: {size}");
+        assert_eq!(controller.meter.samples, 0);
+        if size > 0 {
+            let parts = split_fixed_ranges_with_min_part_size(
+                DownloadId::new(1),
+                Some(Bytes::new(size)),
+                u16::try_from(controller.target()).expect("bounded target"),
+                config.min_part_size,
+                1,
+            )
+            .expect("valid initial ranges");
+            assert_eq!(parts.len(), expected);
+            assert_eq!(parts.first().expect("first part").start_byte, Bytes::ZERO);
+            assert_eq!(
+                parts.last().expect("last part").end_byte,
+                Some(Bytes::new(size - 1))
+            );
+            for pair in parts.windows(2) {
+                assert_eq!(
+                    pair[0].end_byte.expect("ranged end").get() + 1,
+                    pair[1].start_byte.get()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn startup_should_use_remaining_work_on_resume_without_changing_overrides() {
+    let config = HttpDownloadJobConfig::default();
+    let total = config.min_part_size.get() * 16;
+    let remaining = config.min_part_size.get() + 1;
+    for (preferred, expected) in [(None, 2), (NonZeroU16::new(1), 1), (NonZeroU16::new(4), 2)] {
+        let resumed = ConnectionController::new(&config, preferred, total, total - remaining);
+        let fresh = ConnectionController::new(&config, preferred, remaining, 0);
+        assert_eq!(resumed.target(), expected);
+        assert_eq!(resumed.target(), fresh.target());
+        assert_eq!(resumed.is_adaptive(), preferred.is_none());
+    }
+}
+
+#[test]
+fn startup_should_preserve_configured_bounds_and_disabled_adaptation() {
+    let mut config = HttpDownloadJobConfig {
+        min_connections: 3,
+        max_connections: 5,
+        ..HttpDownloadJobConfig::default()
+    };
+    assert_eq!(ConnectionController::new(&config, None, 1, 0).target(), 3);
+    assert_eq!(
+        ConnectionController::new(&config, NonZeroU16::new(1), TOTAL, 0).target(),
+        3
+    );
+    assert_eq!(
+        ConnectionController::new(&config, NonZeroU16::new(64), TOTAL, 0).target(),
+        5
+    );
+    config.adaptive_connections_enabled = false;
+    let disabled = ConnectionController::new(&config, None, TOTAL, 0);
+    assert!(!disabled.is_adaptive());
+    assert_eq!(disabled.target(), 5);
 }
 
 #[test]

@@ -28,7 +28,7 @@ pub const API_TOKEN_KEY: &str = "integration.api_token";
 pub enum DownloadType {
     /// Plain HTTP(S) download.
     Http,
-    /// HLS playlist (desktop support lands with the media pipeline).
+    /// Native MPEG-TS HLS VOD playlist.
     Hls,
 }
 

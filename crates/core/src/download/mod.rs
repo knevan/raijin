@@ -1,3 +1,4 @@
+pub mod hls;
 pub mod http;
 pub mod job;
 pub mod manager;
@@ -14,7 +15,7 @@ pub use job::{HttpDownloadJob, HttpDownloadJobError, HttpDownloadJobResult};
 pub use manager::{
     DEFAULT_COMMAND_BUFFER, DEFAULT_EVENT_BUFFER, DownloadCommand, DownloadEvent,
     DownloadManagerError, DownloadManagerHandle, DownloadManagerOptions, DownloadManagerResult,
-    NewDownload,
+    NewDownload, hls_file_name, is_hls_url,
 };
 pub use model::{
     Bytes, BytesPerSecond, DownloadConfig, DownloadFailure, DownloadId, DownloadItem, DownloadKind,

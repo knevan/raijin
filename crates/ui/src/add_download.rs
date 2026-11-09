@@ -225,9 +225,15 @@ impl AddDownloadView {
         // File name follows the URL until the user takes over.
         if !self.file_manual {
             let suggestion = if url_valid {
-                self.probe_name
+                let suggestion = self
+                    .probe_name
                     .clone()
-                    .unwrap_or_else(|| crate::bridge::suggest_filename(&url))
+                    .unwrap_or_else(|| crate::bridge::suggest_filename(&url));
+                if is_approved_hls(self.integration.as_ref(), &url) {
+                    raijin_core::download::hls_file_name(&suggestion)
+                } else {
+                    suggestion
+                }
             } else {
                 String::new()
             };
@@ -286,11 +292,7 @@ impl AddDownloadView {
         self.probe_url = Some(url.clone());
         self.probe_gen += 1;
         let generation = self.probe_gen;
-        let hinted_size = self
-            .integration
-            .as_ref()
-            .filter(|item| item.source.link.trim() == url)
-            .and_then(|item| item.source.total_bytes);
+        let hinted_size = probe_size_hint(self.integration.as_ref(), &url);
         if hinted_size.is_some() && self.probe_name.is_some() {
             self.probe = ProbeState::Ready {
                 total_bytes: hinted_size,
@@ -299,6 +301,14 @@ impl AddDownloadView {
         }
         if !is_http_url_str(&url) {
             self.probe = ProbeState::Idle;
+            return;
+        }
+        if raijin_core::download::is_hls_url(&url)
+            || is_approved_hls(self.integration.as_ref(), &url)
+        {
+            // A playlist only lists segments: its own length and any browser
+            // size hint describe the manifest, never the finished video.
+            self.probe = ProbeState::Ready { total_bytes: None };
             return;
         }
         self.probe = hinted_size.map_or(ProbeState::Checking, |size| ProbeState::Ready {
@@ -1030,12 +1040,50 @@ fn preserve_integration_credentials(
     request: &mut raijin_core::download::NewDownload,
     integration: Option<&raijin_core::integration::PreparedItem>,
 ) {
-    if let Some(item) = integration
-        && request.url == item.request.url
-    {
-        request.headers = item.request.headers.clone();
-        request.download_page = item.request.download_page.clone();
+    let Some(item) = integration else {
+        return;
+    };
+    if request.url != item.request.url {
+        return;
     }
+    if item.request.kind == raijin_core::download::DownloadKind::Hls {
+        request.kind = raijin_core::download::DownloadKind::Hls;
+        request.file_name = raijin_core::download::hls_file_name(&request.file_name);
+    }
+    request.headers = item.request.headers.clone();
+    request.download_page = item.request.download_page.clone();
+}
+
+/// Browser size hint for `url`, only when it describes the media itself.
+///
+/// HLS media sizes live in the playlist, so a playlist `Content-Length` or a
+/// browser hint for it is never the total of the finished video.
+fn probe_size_hint(
+    integration: Option<&raijin_core::integration::PreparedItem>,
+    url: &str,
+) -> Option<u64> {
+    if raijin_core::download::is_hls_url(url) {
+        return None;
+    }
+    integration
+        .filter(|item| {
+            item.source.link.trim() == url
+                && item.request.kind != raijin_core::download::DownloadKind::Hls
+        })
+        .and_then(|item| item.source.total_bytes)
+}
+
+/// True when `url` is the approved integration item and it is HLS.
+///
+/// An extensionless playlist URL carries no `.m3u8` hint, so only the payload
+/// type says the saved file is MPEG-TS.
+fn is_approved_hls(
+    integration: Option<&raijin_core::integration::PreparedItem>,
+    url: &str,
+) -> bool {
+    integration.is_some_and(|item| {
+        item.request.kind == raijin_core::download::DownloadKind::Hls && item.request.url == url
+    })
 }
 
 /// Probe result feeding the size badge plus the file-name suggestion.
@@ -1310,6 +1358,82 @@ mod tests {
             assert_eq!(request.headers.contains_key("Cookie"), url == source.link);
             assert_eq!(request.download_page.is_some(), url == source.link);
         }
+    }
+
+    #[test]
+    fn integration_hls_should_keep_the_explicit_kind_and_credentials() {
+        use raijin_core::download::DownloadKind;
+        use raijin_core::integration::{DownloadRequestItem, DownloadType, prepare_item};
+
+        // Extensionless playlist URL: only the payload type can say HLS.
+        let source = DownloadRequestItem {
+            link: "https://cdn.example.com/live/index".to_owned(),
+            download_page: Some("https://example.com/watch".to_owned()),
+            headers: Some([("Cookie".to_owned(), "session=secret".to_owned())].into()),
+            description: None,
+            suggested_name: Some("Episode.m3u8".to_owned()),
+            total_bytes: Some(4096),
+            r#type: DownloadType::Hls,
+        };
+        let folder = PathBuf::from("C:/Downloads");
+        let prepared = prepare_item(&source, &folder).expect("prepared");
+        let mut request =
+            crate::bridge::build_new_download(&source.link, "Episode.ts", folder.clone())
+                .expect("request");
+        assert_eq!(request.kind, DownloadKind::Http);
+
+        super::preserve_integration_credentials(&mut request, Some(&prepared));
+        assert_eq!(request.kind, DownloadKind::Hls);
+        assert_eq!(request.file_name, "Episode.ts");
+        assert_eq!(
+            request.headers.get("Cookie"),
+            Some(&"session=secret".to_owned())
+        );
+        assert_eq!(
+            request.download_page.as_deref(),
+            Some("https://example.com/watch")
+        );
+
+        let mut edited =
+            crate::bridge::build_new_download("https://different.example/index", "x.zip", folder)
+                .expect("request");
+        super::preserve_integration_credentials(&mut edited, Some(&prepared));
+        assert_eq!(edited.kind, DownloadKind::Http);
+        assert_eq!(edited.file_name, "x.zip");
+        assert!(edited.headers.is_empty());
+    }
+
+    #[test]
+    fn probe_size_hint_should_ignore_playlist_manifests() {
+        use raijin_core::integration::{DownloadRequestItem, DownloadType, prepare_item};
+
+        let folder = PathBuf::from("C:/Downloads");
+        let hls_source = DownloadRequestItem {
+            link: "https://cdn.example.com/show/episode.m3u8".to_owned(),
+            download_page: None,
+            headers: None,
+            description: None,
+            suggested_name: None,
+            total_bytes: Some(4096),
+            r#type: DownloadType::Http,
+        };
+        let hls = prepare_item(&hls_source, &folder).expect("prepared");
+        assert_eq!(
+            super::probe_size_hint(Some(&hls), &hls.request.url),
+            None,
+            "a playlist length is not the media total"
+        );
+
+        let plain_source = DownloadRequestItem {
+            link: "https://cdn.example.com/a.zip".to_owned(),
+            total_bytes: Some(123456),
+            ..hls_source
+        };
+        let plain = prepare_item(&plain_source, &folder).expect("prepared");
+        assert_eq!(
+            super::probe_size_hint(Some(&plain), &plain.request.url),
+            Some(123456)
+        );
     }
 
     #[test]

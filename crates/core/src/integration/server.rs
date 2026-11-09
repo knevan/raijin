@@ -7,7 +7,6 @@
 //! [`IntegrationCommand`] values and awaits a [`IntegrationReply`], so the UI
 //! (or a headless client) stays the only thing that touches the download engine.
 
-use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -23,7 +22,7 @@ use axum::routing::{get, post};
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
-use crate::download::{Bytes, DownloadItem, NewDownload};
+use crate::download::{Bytes, DownloadItem, NewDownload, is_hls_url};
 use crate::integration::auth::TokenCell;
 use crate::integration::{
     AddDownloadRequest, ApiErrorBody, DownloadRequestItem, DownloadRequestOptions, DownloadSummary,
@@ -168,38 +167,33 @@ pub struct PreparedItem {
 
 /// Builds a [`NewDownload`] from an integration item.
 ///
-/// Rejects `hls` items: the desktop engine speaks HTTP only until the media
-/// pipeline lands, and silently degrading an HLS link to a raw HTTP download
-/// would save a playlist instead of a video.
+/// An `hls` type, or an `http` item whose URL is a `.m3u8` playlist, becomes a
+/// native HLS request named after the MPEG-TS output. Treating such a link as a
+/// plain HTTP download would save the playlist instead of the video. Variant
+/// selection and the unknown media size are the engine's problem, not this
+/// boundary's.
 ///
 /// # Errors
 ///
-/// Returns [`ApiFailure`] when the URL is not http(s) or the type is unsupported.
+/// Returns [`ApiFailure`] when the URL is not http(s).
 pub fn prepare_item(item: &DownloadRequestItem, folder: &Path) -> Result<PreparedItem, ApiFailure> {
-    if item.r#type == DownloadType::Hls {
-        return Err(ApiFailure::bad_request("unsupported_type"));
-    }
     let link = item.link.trim();
     if !is_http_url(link) {
         return Err(ApiFailure::bad_request("invalid_url"));
     }
-    let headers: BTreeMap<String, String> = item
+    let mut request = if item.r#type == DownloadType::Hls || is_hls_url(link) {
+        NewDownload::hls(link, file_name_for(item), folder.to_path_buf())
+    } else {
+        NewDownload::http(link, file_name_for(item), folder.to_path_buf())
+    };
+    request.download_page = item.download_page.clone();
+    request.headers = item
         .headers
         .clone()
         .unwrap_or_default()
         .into_iter()
         .filter(|(name, value)| !name.trim().is_empty() && !value.is_empty())
         .collect();
-    let request = NewDownload {
-        url: link.to_owned(),
-        download_page: item.download_page.clone(),
-        headers,
-        file_name: file_name_for(item),
-        folder: folder.to_path_buf(),
-        category: None,
-        preferred_connections: None,
-        speed_limit: None,
-    };
     Ok(PreparedItem {
         request,
         source: item.clone(),
@@ -426,7 +420,7 @@ fn validate_items(request: &AddDownloadRequest, limit: usize) -> Result<(), ApiF
         return Err(ApiFailure::bad_request("invalid_item_count"));
     }
     for item in &request.items {
-        if item.r#type != DownloadType::Http || !is_http_url(item.link.trim()) {
+        if !is_http_url(item.link.trim()) {
             return Err(ApiFailure::bad_request("invalid_item"));
         }
     }
@@ -537,9 +531,11 @@ fn presented_token(headers: &HeaderMap) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use super::*;
+    use crate::download::DownloadKind;
 
     fn item(link: &str, kind: DownloadType) -> DownloadRequestItem {
         DownloadRequestItem {
@@ -558,13 +554,38 @@ mod tests {
     }
 
     #[test]
-    fn prepare_should_reject_hls_until_the_media_pipeline_lands() {
-        let failure = prepare_item(
-            &item("https://cdn.example.com/master.m3u8", DownloadType::Hls),
+    fn prepare_should_accept_hls_as_a_native_playlist_download() {
+        let mut request = item("https://cdn.example.com/master.m3u8", DownloadType::Hls);
+        request.suggested_name = Some("My Show.mp4".to_owned());
+
+        let prepared = prepare_item(&request, &folder()).expect("hls is supported");
+        assert_eq!(prepared.request.kind, DownloadKind::Hls);
+        assert_eq!(prepared.request.file_name, "My Show.ts");
+    }
+
+    #[test]
+    fn prepare_should_upgrade_a_playlist_url_even_when_the_payload_says_http() {
+        let prepared = prepare_item(
+            &item(
+                "https://cdn.example.com/show/episode.m3u8",
+                DownloadType::Http,
+            ),
             &folder(),
         )
-        .expect_err("hls is unsupported");
-        assert_eq!(failure.status, StatusCode::BAD_REQUEST);
+        .expect("valid item");
+        assert_eq!(prepared.request.kind, DownloadKind::Hls);
+        assert_eq!(prepared.request.file_name, "episode.ts");
+    }
+
+    #[test]
+    fn prepare_should_keep_http_kind_for_plain_links() {
+        let prepared = prepare_item(
+            &item("https://cdn.example.com/a.zip", DownloadType::Http),
+            &folder(),
+        )
+        .expect("valid item");
+        assert_eq!(prepared.request.kind, DownloadKind::Http);
+        assert_eq!(prepared.request.file_name, "a.zip");
     }
 
     #[test]

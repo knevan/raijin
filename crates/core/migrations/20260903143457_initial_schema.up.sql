@@ -81,6 +81,31 @@ CREATE TABLE queue_items (
     CHECK (position >= 0)
 ) WITHOUT ROWID;
 
+CREATE TABLE hls_jobs (
+    download_id INTEGER PRIMARY KEY REFERENCES downloads(id) ON DELETE CASCADE,
+    playlist_url TEXT NOT NULL,
+    CHECK (length(playlist_url) > 0)
+);
+
+CREATE TABLE hls_segments (
+    download_id INTEGER NOT NULL REFERENCES hls_jobs(download_id) ON DELETE CASCADE,
+    segment_index INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    duration REAL NOT NULL,
+    length INTEGER,
+    sha256 TEXT,
+    etag TEXT,
+    last_modified TEXT,
+    PRIMARY KEY (download_id, segment_index),
+    CHECK (segment_index >= 0),
+    CHECK (sequence >= 0),
+    CHECK (length(url) > 0),
+    CHECK (duration > 0 AND duration < 1.0e12),
+    CHECK (length IS NULL OR length >= 0),
+    CHECK ((length IS NULL) = (sha256 IS NULL))
+) WITHOUT ROWID;
+
 CREATE TABLE settings (
     key TEXT PRIMARY KEY,
     value_json TEXT NOT NULL,

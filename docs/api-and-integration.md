@@ -66,6 +66,12 @@ The submission keeps the original download URL and only gathers headers for that
 
 Cold-start and Native Messaging remain deferred. Browser smoke testing is required with Save As enabled, especially for redirect endpoints such as the VS Code installer: verify response handoff before filename selection, one window per download, size display, context-menu probing, and browser fallback when the app rejects or cannot accept a handoff.
 
+### HLS submissions
+
+The API accepts `type: "hls"` for native MPEG-TS HLS VOD, including extensionless playlist URLs. HTTP items with a `.m3u8` URL path are also routed to HLS instead of saving the manifest as a file. Confirmation retains the explicit media type and credentials only while the original URL is unchanged. Output names use `.ts`; playlist response lengths and browser size hints are not treated as final media sizes.
+
+This does not add browser media discovery, website extraction, or automatic signed-URL refresh. Unsupported streams fail explicitly. See [Native HLS VOD downloads](hls-media.md) for supported features, security boundaries, and resume behavior.
+
 ## 4. Rationale and deferred work
 
 Rejected: a global authentication-OFF toggle that exposes silent downloads and private lists to every local client. It simplifies setup by removing the security boundary rather than narrowing the unauthenticated capability.

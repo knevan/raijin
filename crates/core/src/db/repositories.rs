@@ -52,6 +52,27 @@ pub enum DbError {
     /// OS entropy source failed while generating an API token.
     #[error("token generation failed: {0}")]
     TokenGeneration(String),
+    /// Required text value is blank.
+    #[error("field `{field}` must not be empty")]
+    EmptyValue { field: &'static str },
+    /// HLS segment indices are not contiguous and ordered.
+    #[error("hls segments out of order: expected index {expected}, found {found}")]
+    HlsSegmentsOutOfOrder { expected: u32, found: u32 },
+    /// HLS segment duration is not a finite positive number.
+    #[error("hls segment duration is not a finite positive number: {value}")]
+    InvalidDuration { value: f64 },
+    /// HLS segment declares only one half of its completion metadata.
+    #[error("hls segment {index} must set both length and sha256, or neither")]
+    HlsCompletionMetadataMismatch { index: u32 },
+    /// HLS segment checksum is not a 64-character hexadecimal SHA-256 digest.
+    #[error("hls segment {index} checksum must be 64 hexadecimal characters")]
+    InvalidChecksum { index: u32 },
+    /// Completed HLS segment has no payload bytes.
+    #[error("hls segment {index} completed length must be greater than zero")]
+    InvalidCompletedLength { index: u32 },
+    /// Stored aggregate value is not an exact 64-bit integer.
+    #[error("integer field `{field}` out of range: {value}")]
+    NonIntegerAggregate { field: &'static str, value: String },
 }
 
 /// Repository for persisted downloads.
@@ -190,7 +211,13 @@ impl DownloadRepository {
         Ok(DownloadId::new(next_id))
     }
 
-    /// Removes a download. Parts and queue items are removed by foreign-key cascades.
+    /// Returns the repository for persisted HLS plans of downloads.
+    #[must_use]
+    pub fn hls_repository(&self) -> crate::db::HlsRepository {
+        crate::db::HlsRepository::new(self.pool.clone())
+    }
+
+    /// Removes a download. Parts, queue items, and HLS rows are removed by foreign-key cascades.
     ///
     /// # Errors
     ///
@@ -1007,14 +1034,14 @@ fn option_bps_to_i64(field: &'static str, value: Option<BytesPerSecond>) -> DbRe
         .transpose()
 }
 
-fn i64_to_u64(field: &'static str, value: i64) -> DbResult<u64> {
+pub(crate) fn i64_to_u64(field: &'static str, value: i64) -> DbResult<u64> {
     u64::try_from(value).map_err(|_| DbError::IntegerOutOfRange {
         field,
         value: i128::from(value),
     })
 }
 
-fn i64_to_u32(field: &'static str, value: i64) -> DbResult<u32> {
+pub(crate) fn i64_to_u32(field: &'static str, value: i64) -> DbResult<u32> {
     u32::try_from(value).map_err(|_| DbError::IntegerOutOfRange {
         field,
         value: i128::from(value),

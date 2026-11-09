@@ -52,11 +52,17 @@ pub enum DownloadManagerError {
     /// System clock value does not fit in database timestamp range.
     #[error("system clock timestamp is out of range")]
     ClockOutOfRange,
+    /// A canceled worker has not stopped safely enough to mutate its artifacts.
+    #[error("download `{0}` is still stopping; try again shortly")]
+    StillStopping(DownloadId),
 }
 
 /// New download request accepted by the manager.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewDownload {
+    /// Download implementation selected for this source.
+    #[serde(default = "http_download_kind")]
+    pub kind: DownloadKind,
     /// Primary source URL.
     pub url: String,
     /// Optional page URL where the download was discovered.
@@ -81,6 +87,7 @@ impl NewDownload {
     #[must_use]
     pub fn http(url: impl Into<String>, file_name: impl Into<String>, folder: PathBuf) -> Self {
         Self {
+            kind: DownloadKind::Http,
             url: url.into(),
             download_page: None,
             headers: BTreeMap::new(),
@@ -91,6 +98,39 @@ impl NewDownload {
             speed_limit: None,
         }
     }
+
+    /// Creates an HLS VOD request with an MPEG-TS output name.
+    #[must_use]
+    pub fn hls(url: impl Into<String>, file_name: impl Into<String>, folder: PathBuf) -> Self {
+        let mut request = Self::http(url, hls_file_name(&file_name.into()), folder);
+        request.kind = DownloadKind::Hls;
+        request
+    }
+}
+
+fn http_download_kind() -> DownloadKind {
+    DownloadKind::Http
+}
+
+/// Returns whether an HTTP source has an HLS playlist path extension.
+#[must_use]
+pub fn is_hls_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.path().to_ascii_lowercase().ends_with(".m3u8")
+    })
+}
+
+/// Normalizes an untrusted media file name to an MPEG-TS basename.
+#[must_use]
+pub fn hls_file_name(value: &str) -> String {
+    let name = crate::integration::sanitize_file_name(value);
+    let stem = Path::new(&name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty() && !stem.starts_with('.'))
+        .unwrap_or("video");
+    format!("{stem}.ts")
 }
 
 /// Commands owned by the download manager actor.
@@ -163,7 +203,7 @@ pub enum DownloadCommand {
         reply: oneshot::Sender<DownloadManagerResult<()>>,
     },
     #[doc(hidden)]
-    JobFinished { id: DownloadId },
+    JobFinished { id: DownloadId, identity: Arc<()> },
 }
 
 /// Events published by the download manager.
@@ -481,6 +521,9 @@ impl DownloadManagerHandle {
 
 #[derive(Debug)]
 struct ActiveJob {
+    kind: DownloadKind,
+    identity: Arc<()>,
+    completion_cancellation: CancellationToken,
     cancellation: CancellationToken,
     live_progress: Arc<LiveDownloadProgress>,
     task: JoinHandle<()>,
@@ -521,12 +564,16 @@ impl DownloadManager {
         self.boot().await?;
 
         while let Some(command) = self.commands.recv().await {
+            self.active_jobs.retain(|_, job| !job.task.is_finished());
             if self.handle_command(command).await? {
                 break;
             }
         }
 
-        self.cancel_active_jobs();
+        let active_ids: Vec<_> = self.active_jobs.keys().copied().collect();
+        for id in active_ids {
+            self.stop_active_job(id).await?;
+        }
         self.publish(DownloadEvent::Shutdown);
         Ok(())
     }
@@ -611,8 +658,14 @@ impl DownloadManager {
                 send_reply(reply, Ok(()));
                 Ok(true)
             }
-            DownloadCommand::JobFinished { id } => {
-                self.active_jobs.remove(&id);
+            DownloadCommand::JobFinished { id, identity } => {
+                if self
+                    .active_jobs
+                    .get(&id)
+                    .is_some_and(|job| Arc::ptr_eq(&job.identity, &identity))
+                {
+                    self.active_jobs.remove(&id);
+                }
                 Ok(false)
             }
         }
@@ -621,10 +674,15 @@ impl DownloadManager {
     async fn add_download(&mut self, request: NewDownload) -> DownloadManagerResult<DownloadItem> {
         let now_ms = now_ms()?;
         let folder = request.folder;
-        let file_name = unique_file_name(&folder, &request.file_name).await?;
+        let requested_name = if request.kind == DownloadKind::Hls {
+            hls_file_name(&request.file_name)
+        } else {
+            request.file_name.clone()
+        };
+        let file_name = unique_file_name(&folder, &requested_name).await?;
         let item = DownloadItem {
             id: self.repository.next_id().await?,
-            kind: DownloadKind::Http,
+            kind: request.kind,
             url: request.url,
             download_page: request.download_page,
             headers: request.headers,
@@ -652,6 +710,13 @@ impl DownloadManager {
 
     async fn pause_download(&mut self, id: DownloadId) -> DownloadManagerResult<DownloadItem> {
         let mut item = self.item_for_update(id).await?;
+        if item.kind == DownloadKind::Hls {
+            self.stop_active_job(id).await?;
+            item = self.item_for_update(id).await?;
+            if item.status == DownloadStatus::Completed {
+                return Ok(item);
+            }
+        }
         item.status = DownloadStatus::Paused;
         item.updated_at = now_ms()?;
 
@@ -679,6 +744,7 @@ impl DownloadManager {
     }
 
     async fn start_download(&mut self, id: DownloadId) -> DownloadManagerResult<DownloadItem> {
+        self.stop_active_job(id).await?;
         let mut item = self.item_for_update(id).await?;
         if item.status != DownloadStatus::Queued {
             item.status = DownloadStatus::Queued;
@@ -694,7 +760,8 @@ impl DownloadManager {
         let Some(item) = self.repository.get(id).await? else {
             return Ok(false);
         };
-        self.stop_active_job(id).await;
+        self.stop_active_job(id).await?;
+        let item = self.repository.get(id).await?.unwrap_or(item);
         delete_download_files(&item).await?;
 
         let removed = self.repository.remove(id).await?;
@@ -705,9 +772,13 @@ impl DownloadManager {
     }
 
     async fn reset_download(&mut self, id: DownloadId) -> DownloadManagerResult<DownloadItem> {
+        self.stop_active_job(id).await?;
         let mut item = self.item_for_update(id).await?;
-        self.stop_active_job(id).await;
         self.part_repository.remove_for_download(id).await?;
+        if item.kind == DownloadKind::Hls {
+            self.repository.hls_repository().clear(id).await?;
+            remove_segment_directory(&item).await?;
+        }
         remove_file_if_exists(&incomplete_path_for_item(&item)).await?;
 
         // Drop stale validators so the next run skips resume validation
@@ -768,18 +839,28 @@ impl DownloadManager {
         Ok(resumed)
     }
 
-    async fn stop_active_job(&mut self, id: DownloadId) {
-        if let Some(job) = self.active_jobs.remove(&id) {
+    async fn stop_active_job(&mut self, id: DownloadId) -> DownloadManagerResult<()> {
+        if let Some(mut job) = self.active_jobs.remove(&id) {
+            job.completion_cancellation.cancel();
             job.cancellation.cancel();
-            job.task.abort();
-            match job.task.await {
-                Ok(()) => {}
-                Err(error) if error.is_cancelled() => {}
-                Err(error) => {
-                    tracing::warn!(%id, ?error, "download job stopped with join error during remove")
+            if job.kind != DownloadKind::Hls {
+                job.task.abort();
+                let _ = job.task.await;
+                return Ok(());
+            }
+            match tokio::time::timeout(Duration::from_secs(15), &mut job.task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%id, ?error, "download job failed during cancellation")
+                }
+                Err(_) => {
+                    self.active_jobs.insert(id, job);
+                    return Err(DownloadManagerError::StillStopping(id));
                 }
             }
         }
+        Ok(())
     }
 
     async fn item_for_update(&self, id: DownloadId) -> DownloadManagerResult<DownloadItem> {
@@ -789,22 +870,14 @@ impl DownloadManager {
             .ok_or(DownloadManagerError::NotFound(id))
     }
 
-    fn cancel_active_jobs(&mut self) {
-        for job in self.active_jobs.values() {
-            job.cancellation.cancel();
-            job.task.abort();
-        }
-    }
-
     fn start_job(&mut self, item: DownloadItem) {
-        if let Some(job) = self.active_jobs.remove(&item.id) {
-            job.cancellation.cancel();
-            job.task.abort();
-        }
-
+        let identity = Arc::new(());
+        let completion_cancellation = CancellationToken::new();
         let cancellation = CancellationToken::new();
         let live_progress = Arc::new(LiveDownloadProgress::new(item.downloaded_bytes));
-        let task = tokio::spawn(run_http_job_task(JobTaskContext {
+        let task = tokio::spawn(run_job_task(JobTaskContext {
+            identity: Arc::clone(&identity),
+            completion_cancellation: completion_cancellation.clone(),
             download_repo: self.repository.clone(),
             part_repo: self.part_repository.clone(),
             events: self.events.clone(),
@@ -817,6 +890,9 @@ impl DownloadManager {
         self.active_jobs.insert(
             item.id,
             ActiveJob {
+                kind: item.kind,
+                identity,
+                completion_cancellation,
                 cancellation,
                 live_progress,
                 task,
@@ -842,6 +918,8 @@ fn send_reply<T>(
 }
 
 struct JobTaskContext {
+    identity: Arc<()>,
+    completion_cancellation: CancellationToken,
     download_repo: DownloadRepository,
     part_repo: PartRepository,
     events: broadcast::Sender<DownloadEvent>,
@@ -852,13 +930,12 @@ struct JobTaskContext {
     global_limiter: Option<Arc<SpeedLimiter>>,
 }
 
-async fn run_http_job_task(context: JobTaskContext) {
+async fn run_job_task(context: JobTaskContext) {
     let id = context.item.id;
-    let result = run_http_job_task_inner(&context).await;
+    let result = run_job_task_inner(&context).await;
     match result {
         Ok(item) => publish_terminal_item(&context.events, item),
-        Err(error) => {
-            let failure = error.to_failure();
+        Err(failure) => {
             match context.download_repo.get(id).await {
                 Ok(Some(item)) => publish_terminal_item(&context.events, item),
                 Ok(None) => {}
@@ -874,39 +951,73 @@ async fn run_http_job_task(context: JobTaskContext) {
             );
         }
     }
-    if context
-        .commands
-        .send(DownloadCommand::JobFinished { id })
-        .await
-        .is_err()
-    {
-        tracing::trace!(
-            download_id = id.get(),
-            "download manager stopped before job cleanup"
-        );
+    tokio::select! {
+        biased;
+        _ = context.completion_cancellation.cancelled() => {}
+        result = context.commands.send(DownloadCommand::JobFinished {
+            id,
+            identity: Arc::clone(&context.identity),
+        }) => {
+            if result.is_err() {
+                tracing::trace!(download_id = id.get(), "download manager stopped before job cleanup");
+            }
+        }
     }
 }
 
-async fn run_http_job_task_inner(
-    context: &JobTaskContext,
-) -> Result<DownloadItem, crate::download::HttpDownloadJobError> {
-    let client = ReqwestHttpClient::new()?;
-    let job = HttpDownloadJob::new(
-        context.download_repo.clone(),
-        context.part_repo.clone(),
-        client,
-        context.item.clone(),
-    )
-    .with_live_progress(Arc::clone(&context.live_progress))
-    .with_global_limiter(context.global_limiter.clone());
-    let job_future = job.run(context.cancellation.clone());
+async fn run_job_task_inner(context: &JobTaskContext) -> Result<DownloadItem, DownloadFailure> {
+    let job_future = async {
+        match context.item.kind {
+            DownloadKind::Http => HttpDownloadJob::new(
+                context.download_repo.clone(),
+                context.part_repo.clone(),
+                ReqwestHttpClient::new().map_err(|error| {
+                    crate::download::HttpDownloadJobError::from(error).to_failure()
+                })?,
+                context.item.clone(),
+            )
+            .with_live_progress(Arc::clone(&context.live_progress))
+            .with_global_limiter(context.global_limiter.clone())
+            .run(context.cancellation.clone())
+            .await
+            .map_err(|error| error.to_failure()),
+            DownloadKind::Hls => crate::download::hls::HlsDownloadJob::new(
+                context.download_repo.clone(),
+                context.item.clone(),
+            )
+            .with_live_progress(Arc::clone(&context.live_progress))
+            .with_global_limiter(context.global_limiter.clone())
+            .run(context.cancellation.clone())
+            .await
+            .map_err(|error| error.to_failure()),
+            DownloadKind::Aria2 => {
+                let failure = DownloadFailure {
+                    kind: crate::download::FailureKind::Validation,
+                    message: "Aria2 downloads are not supported".to_owned(),
+                };
+                let mut item = context.item.clone();
+                item.status = DownloadStatus::Error;
+                item.failure = Some(failure.clone());
+                context
+                    .download_repo
+                    .update(&item)
+                    .await
+                    .map_err(|error| DownloadFailure {
+                        kind: crate::download::FailureKind::Disk,
+                        message: error.to_string(),
+                    })?;
+                Err(failure)
+            }
+        }
+    };
     tokio::pin!(job_future);
     let mut ticker = tokio::time::interval(JOB_PROGRESS_TICK);
     let mut last_progress = None;
+    let mut last_status = None;
     loop {
         tokio::select! {
             result = &mut job_future => return result,
-            _ = ticker.tick() => publish_progress_snapshot(context, &mut last_progress).await,
+            _ = ticker.tick() => publish_progress_snapshot(context, &mut last_progress, &mut last_status).await,
         }
     }
 }
@@ -914,9 +1025,17 @@ async fn run_http_job_task_inner(
 async fn publish_progress_snapshot(
     context: &JobTaskContext,
     last_progress: &mut Option<DownloadProgress>,
+    last_status: &mut Option<DownloadStatus>,
 ) {
     match context.download_repo.get(context.item.id).await {
         Ok(Some(item)) => {
+            if context.item.kind == DownloadKind::Hls && *last_status != Some(item.status) {
+                *last_status = Some(item.status);
+                publish_event(
+                    &context.events,
+                    DownloadEvent::DownloadChanged { item: item.clone() },
+                );
+            }
             let progress = progress_from_item(context, &item).await;
             if progress.active_part_count > 0 || last_progress.as_ref() != Some(&progress) {
                 *last_progress = Some(progress);
@@ -940,6 +1059,15 @@ async fn publish_progress_snapshot(
 
 async fn progress_from_item(context: &JobTaskContext, item: &DownloadItem) -> DownloadProgress {
     let (live_downloaded_bytes, live_active_part_count) = context.live_progress.snapshot();
+    if context.item.kind == DownloadKind::Hls {
+        return DownloadProgress {
+            downloaded_bytes: live_downloaded_bytes,
+            total_bytes: item.total_bytes,
+            speed: BytesPerSecond::ZERO,
+            eta_seconds: None,
+            active_part_count: live_active_part_count,
+        };
+    }
     if live_active_part_count > 0 {
         return DownloadProgress {
             downloaded_bytes: live_downloaded_bytes,
@@ -1017,7 +1145,18 @@ fn publish_event(events: &broadcast::Sender<DownloadEvent>, event: DownloadEvent
     }
 }
 
+async fn remove_segment_directory(item: &DownloadItem) -> std::io::Result<()> {
+    match fs::remove_dir_all(crate::download::hls::segment_directory(item)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 async fn delete_download_files(item: &DownloadItem) -> std::io::Result<()> {
+    if item.kind == DownloadKind::Hls {
+        remove_segment_directory(item).await?;
+    }
     remove_file_if_exists(&incomplete_path_for_item(item)).await?;
     remove_file_if_exists(&final_path_for_item(item)).await
 }
@@ -1101,6 +1240,42 @@ mod tests {
     use crate::db;
     use crate::download::PartId;
 
+    #[test]
+    fn hls_names_should_use_safe_ts_basenames() {
+        for (input, expected) in [
+            ("playlist.m3u8", "playlist.ts"),
+            ("Movie.mp4", "Movie.ts"),
+            ("video.ts", "video.ts"),
+            ("../../movie.m3u8", "movie.ts"),
+            ("", "video.ts"),
+        ] {
+            assert_eq!(hls_file_name(input), expected);
+        }
+    }
+
+    #[test]
+    fn hls_detection_should_use_url_path_not_query() {
+        assert!(is_hls_url("https://example.com/VIDEO.M3U8?token=secret"));
+        assert!(!is_hls_url("https://example.com/file.bin?name=video.m3u8"));
+        assert!(!is_hls_url("file:///video.m3u8"));
+    }
+
+    #[test]
+    fn legacy_requests_should_default_to_http() {
+        let request = NewDownload::http(
+            "https://example.com/file",
+            "file.bin",
+            PathBuf::from("downloads"),
+        );
+        let mut value = serde_json::to_value(&request).expect("request serialization");
+        value
+            .as_object_mut()
+            .expect("request object")
+            .remove("kind");
+        let decoded: NewDownload = serde_json::from_value(value).expect("legacy request");
+        assert_eq!(decoded.kind, DownloadKind::Http);
+    }
+
     struct TestDb {
         _dir: TempDir,
         repository: DownloadRepository,
@@ -1128,6 +1303,96 @@ mod tests {
         handle.shutdown().await?;
         task.await.map_err(|_| DownloadManagerError::Stopped)??;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_completion_should_not_remove_replacement_job() -> DownloadManagerResult<()> {
+        let db = test_db().await?;
+        let (commands, receiver) = mpsc::channel(4);
+        let (events, _) = broadcast::channel(4);
+        let mut manager = DownloadManager::new(
+            db.repository,
+            db.part_repository,
+            receiver,
+            events,
+            commands,
+        );
+        let id = DownloadId::new(1);
+        let identity = Arc::new(());
+        manager.active_jobs.insert(
+            id,
+            ActiveJob {
+                kind: DownloadKind::Hls,
+                identity: Arc::clone(&identity),
+                completion_cancellation: CancellationToken::new(),
+                cancellation: CancellationToken::new(),
+                live_progress: Arc::new(LiveDownloadProgress::default()),
+                task: tokio::spawn(async {}),
+            },
+        );
+        manager
+            .handle_command(DownloadCommand::JobFinished {
+                id,
+                identity: Arc::new(()),
+            })
+            .await?;
+        assert!(manager.active_jobs.contains_key(&id));
+        manager
+            .handle_command(DownloadCommand::JobFinished { id, identity })
+            .await?;
+        assert!(manager.active_jobs.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hls_reset_should_clear_plan_and_segment_files() -> DownloadManagerResult<()> {
+        let db = test_db().await?;
+        let folder = tempfile::tempdir()?;
+        let (handle, task) = DownloadManagerHandle::spawn(
+            db.repository.clone(),
+            db.part_repository,
+            DownloadManagerOptions::default(),
+        );
+        let added = handle
+            .add(NewDownload::hls(
+                "https://example.com/index.m3u8",
+                "index.m3u8",
+                folder.path().to_path_buf(),
+            ))
+            .await?;
+        assert_eq!(added.kind, DownloadKind::Hls);
+        assert_eq!(added.file_name, "index.ts");
+        let plan = crate::db::HlsPlanRecord {
+            playlist_url: added.url.clone(),
+            segments: vec![crate::db::HlsSegmentRecord {
+                index: 0,
+                sequence: 10,
+                url: "https://example.com/0.ts".to_owned(),
+                duration: 5.0,
+                length: None,
+                sha256: None,
+                etag: None,
+                last_modified: None,
+            }],
+        };
+        db.repository
+            .hls_repository()
+            .save_plan(added.id, &plan)
+            .await?;
+        let directory = crate::download::hls::segment_directory(&added);
+        fs::create_dir_all(&directory).await?;
+        fs::write(directory.join("0.tmp"), b"incomplete").await?;
+        let reset = handle.reset(added.id).await?;
+        assert_eq!(reset.status, DownloadStatus::Queued);
+        assert!(
+            db.repository
+                .hls_repository()
+                .load(added.id)
+                .await?
+                .is_none()
+        );
+        assert!(!directory.exists());
+        stop_manager(&handle, task).await
     }
 
     #[tokio::test]

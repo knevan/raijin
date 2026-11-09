@@ -2,7 +2,7 @@
 
 Status: **Active core engine (M2 complete, hardening ongoing)**.
 
-This document records the architectural invariants and design decisions for Raijin's native HTTP multi-part download engine.
+This document records the architectural invariants and design decisions for Raijin's native HTTP multi-part download engine. The separate native HLS VOD execution path and its supported media subset are documented in [Native HLS VOD downloads](hls-media.md).
 
 For the agreed, not-yet-implemented scheduling and hardening improvement plan, see [Dynamic Splitting: Smarter Scheduling and Hardening](dynamic-splitting-improvements.md).
 

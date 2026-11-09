@@ -314,7 +314,12 @@ impl std::fmt::Display for NewDownloadError {
 ///
 /// An empty file name falls back to the last URL path segment, then to
 /// `download.bin`. Only `http` and `https` URLs are accepted; the engine
-/// speaks plain HTTP and anything else would fail obscurely later.
+/// speaks plain HTTP and anything else would fail obscurely later. A `.m3u8`
+/// URL selects the native HLS engine and a `.ts` output name.
+///
+/// # Errors
+///
+/// Returns [`NewDownloadError::InvalidUrl`] when the URL is not `http(s)`.
 pub fn build_new_download(
     url: &str,
     file_name: &str,
@@ -330,6 +335,9 @@ pub fn build_new_download(
     } else {
         file_name.to_owned()
     };
+    if raijin_core::download::is_hls_url(url) {
+        return Ok(NewDownload::hls(url, file_name, folder));
+    }
     Ok(NewDownload::http(url, file_name, folder))
 }
 
@@ -352,7 +360,8 @@ pub fn is_http_url_str(url: &str) -> bool {
 /// Query strings and fragments are stripped, then percent-escapes are decoded
 /// like ABDM `FilenameDecoder` (keeps `+` literal, tolerant on bad escapes).
 /// Bare hosts, trailing slashes, and unusable segments fall back to
-/// `download.bin`.
+/// `download.bin`. An HLS playlist suggests its MPEG-TS output name instead,
+/// because the saved file is the video, not the playlist.
 #[must_use]
 pub fn suggest_filename(url: &str) -> String {
     let after_scheme = url.split("://").nth(1).unwrap_or(url);
@@ -368,7 +377,11 @@ pub fn suggest_filename(url: &str) -> String {
         return "download.bin".to_owned();
     }
     // Cap the suggestion so absurdly long segments cannot create hostile names.
-    decoded.chars().take(128).collect()
+    let suggestion: String = decoded.chars().take(128).collect();
+    if raijin_core::download::is_hls_url(url) {
+        return raijin_core::download::hls_file_name(&suggestion);
+    }
+    suggestion
 }
 
 #[cfg(test)]
@@ -403,6 +416,38 @@ mod tests {
 
         assert_eq!(request.url, "https://example.com/app.zip");
         assert_eq!(request.file_name, "custom-name.zip");
+    }
+
+    #[test]
+    fn build_should_select_the_hls_engine_for_playlist_urls() {
+        use raijin_core::download::DownloadKind;
+
+        let folder = PathBuf::from("C:/Downloads");
+        let request = build_new_download(
+            "https://example.com/show/episode.m3u8",
+            "My Show.mp4",
+            folder.clone(),
+        )
+        .expect("valid URL must build");
+        assert_eq!(request.kind, DownloadKind::Hls);
+        assert_eq!(request.file_name, "My Show.ts");
+
+        let plain = build_new_download("https://example.com/files/app.zip", "app.zip", folder)
+            .expect("valid URL must build");
+        assert_eq!(plain.kind, DownloadKind::Http);
+        assert_eq!(plain.file_name, "app.zip");
+    }
+
+    #[test]
+    fn suggest_should_return_the_ts_output_for_playlists() {
+        assert_eq!(
+            suggest_filename("https://example.com/show/episode.m3u8?token=1"),
+            "episode.ts"
+        );
+        assert_eq!(
+            suggest_filename("https://example.com/show/Master.M3U8"),
+            "Master.ts"
+        );
     }
 
     #[test]

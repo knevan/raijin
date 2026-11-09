@@ -62,12 +62,12 @@ impl LiveDownloadProgress {
         self.active_part_count.store(0, Ordering::Relaxed);
     }
 
-    fn set_downloaded(&self, downloaded_bytes: Bytes) {
+    pub(crate) fn set_downloaded(&self, downloaded_bytes: Bytes) {
         self.downloaded_bytes
             .store(downloaded_bytes.get(), Ordering::Relaxed);
     }
 
-    fn add_downloaded(&self, bytes: u64) {
+    pub(crate) fn add_downloaded(&self, bytes: u64) {
         let _ = self
             .downloaded_bytes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -75,7 +75,15 @@ impl LiveDownloadProgress {
             });
     }
 
-    fn add_active_part(&self) {
+    pub(crate) fn subtract_downloaded(&self, bytes: u64) {
+        let _ = self
+            .downloaded_bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes))
+            });
+    }
+
+    pub(crate) fn add_active_part(&self) {
         let _ =
             self.active_part_count
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -83,7 +91,7 @@ impl LiveDownloadProgress {
                 });
     }
 
-    fn remove_active_part(&self) {
+    pub(crate) fn remove_active_part(&self) {
         let _ =
             self.active_part_count
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {

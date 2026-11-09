@@ -5,8 +5,10 @@ use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{ConnectOptions, SqlitePool};
 
+pub mod hls;
 pub mod repositories;
 
+pub use hls::{HlsPlanRecord, HlsRepository, HlsSegmentRecord};
 pub use repositories::{
     DbError, DbResult, DownloadRepository, PartRepository, QueueRepository, SettingsRepository,
 };
